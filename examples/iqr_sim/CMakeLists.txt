@@ -18,8 +18,32 @@ else()
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../parcore/libstf/coyote/sw coyote)
 endif()
 
-# Pulls in libstf + parcore (and links them against whichever Coyote target is already defined).
+# Build libstf + parcore from source (not the installed packages under $HOME/opt -- those are linked
+# against the REAL Coyote and would clash with the sim cThread). Defining the targets here, at the
+# top level, makes them visible to this scope (so iqr_sim can link them) AND makes oasis's
+# `if(NOT TARGET libstf)` guard reuse them instead of find_package'ing the installed copies.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../parcore/libstf/software libstf)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../parcore/software parcore)
+
+# Pulls in the oasis library (reuses the Coyote/libstf/parcore targets already defined above).
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../software oasis)
 
 add_executable(iqr_sim src/main.cpp)
 target_link_libraries(iqr_sim PRIVATE Coyote libstf parcore oasis)
+
+# The oasis target only exports its own headers publicly (libstf/parcore/coyote are PRIVATE there),
+# so the executable needs the libstf/parcore/coyote include roots directly.
+set(PARCORE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../parcore)
+# Source roots FIRST (BEFORE) so the live oasis/libstf/parcore headers win over any stale copies
+# installed under $HOME/opt (CMAKE_PREFIX_PATH/include, which we still need for jemalloc).
+target_include_directories(iqr_sim BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../software
+    ${PARCORE_ROOT}/software
+    ${PARCORE_ROOT}/libstf/software)
+target_include_directories(iqr_sim PRIVATE
+    ${CMAKE_PREFIX_PATH}/include)   # jemalloc (installed under $HOME/opt)
+if(EN_SIMULATION)
+    target_include_directories(iqr_sim PRIVATE ${PARCORE_ROOT}/libstf/coyote/sim/sw/include)
+else()
+    target_include_directories(iqr_sim PRIVATE ${PARCORE_ROOT}/libstf/coyote/sw/include)
+endif()

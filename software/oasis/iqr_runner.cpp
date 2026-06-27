@@ -9,8 +9,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace oasis {
 
@@ -116,23 +119,13 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     result.bin_min = bin_min_;
     result.bin_shift = bin_shift_;
 
-    // 2. Allocate the packed flag (output) buffer. The device packs the flags into a dense bitmask
-    // (1 bit/element) emitted as full 512-bit (= NUM_TUPLES*64) beats, so the output is
-    // ceil(N/512) 64-byte beats -- 64x smaller than an INT64-per-flag column.
+    // 2. Flag output size. The device packs the flags into a dense bitmask (1 bit/element) emitted as
+    // full 512-bit (= NUM_TUPLES*64) beats, so the output is ceil(N/512) 64-byte beats -- 64x smaller
+    // than an INT64-per-flag column.
     static constexpr size_t FLAG_BITS_PER_BEAT  = 512; // CELERIS_NUM_TUPLES(8) * 64
     static constexpr size_t FLAG_BYTES_PER_BEAT = FLAG_BITS_PER_BEAT / 8; // 64
     size_t out_beats = (result.num_elements + FLAG_BITS_PER_BEAT - 1) / FLAG_BITS_PER_BEAT;
     size_t out_bytes = out_beats * FLAG_BYTES_PER_BEAT;
-
-    void *out_ptr = nullptr;
-    auto  status  = ctx_.memory_pool()->allocate(out_bytes, &out_ptr);
-    if (!status.ok()) {
-        throw std::runtime_error("IqrRunner: failed to allocate output buffer: " + status.message());
-    }
-    ctx_.tlb_manager()->ensure_tlb_mapping(out_ptr, out_bytes);
-    result.flags = libstf::make_buffer(ctx_.memory_pool(), out_ptr, out_bytes, out_bytes);
-
-    auto cthread = ctx_.cthread();
 
     // 3. Zero the histogram and FENCE the clear ahead of the input DMA. The clear is a posted CSR
     // write on the control plane; the input DMA travels the data plane with no mutual ordering. If
@@ -148,33 +141,44 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
         }
     }
 
-    // 4. Two-pass input (LOCAL_READ x2 via enqueue_stream_input) + one host-initiated LOCAL_WRITE
-    // that captures the FLAG output. The FPGA only drives axis_host_send during pass 2 (FLAG), so the
-    // LOCAL_WRITE collects exactly the N packed flags. The write is chunked to MAX_TRANSFER_SIZE.
+    // 4. Enqueue the flag output buffer BEFORE streaming the input. In oasis, output is FPGA-initiated:
+    // the buffer is enqueued to the IQR stream (the reserved stream past the decoders) and the
+    // OutputWriter fills it during the FLAG pass, signalling completion via an interrupt that the
+    // bypass receiver collects -- so the destination must already be enqueued when the flags emit.
+    // (This is the oasis output model, not celeris's host-initiated LOCAL_WRITE.)
+    auto handle = ctx_.bypass_receiver().acquire(out_bytes);
+
+    // 5. Two-pass input (LOCAL_READ x2 via enqueue_stream_input): pass 1 builds the histogram, pass 2
+    // re-streams the column and the operator emits the packed flags.
     stream_pass(inputs); // pass 1: HISTOGRAM
-    stream_pass(inputs); // pass 2: FLAG (input)
+    stream_pass(inputs); // pass 2: FLAG
 
-    size_t     n_writes = 0;
-    std::byte *obp      = static_cast<std::byte *>(out_ptr);
-    for (size_t off = 0; off < out_bytes; off += coyote::MAX_TRANSFER_SIZE) {
-        coyote::localSg sg;
-        sg.addr   = obp + off;
-        sg.len    = static_cast<uint32_t>(std::min<size_t>(out_bytes - off, coyote::MAX_TRANSFER_SIZE));
-        sg.stream = coyote::STRM_HOST;
-        sg.dest   = ctx_.iqrStream(); // flags come back on the IQR lane's output
-        bool last_w = (off + coyote::MAX_TRANSFER_SIZE >= out_bytes);
-        cthread->invoke(coyote::CoyoteOper::LOCAL_WRITE, sg, last_w);
-        ++n_writes;
+    // 6. Drain the flag buffer(s) the FPGA wrote. handle->next() blocks on the completion interrupt
+    // and returns nullptr once the transfer is fully drained.
+    std::vector<std::shared_ptr<libstf::Buffer>> chunks;
+    while (auto buffer = handle->next()) {
+        chunks.push_back(buffer);
     }
 
-    // 5. Poll until the FPGA has written the whole flag column (writes completing implies pass 2
-    // finished).
-    while (cthread->checkCompleted(coyote::CoyoteOper::LOCAL_WRITE) < n_writes) {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(50));
+    if (chunks.size() == 1) {
+        // Common case (the whole flag column fits one output-writer buffer): hand it back directly.
+        result.flags = chunks.front();
+    } else {
+        // Large column split across buffers: concatenate into one contiguous bitmask for the caller.
+        void *ptr    = nullptr;
+        auto  status = ctx_.memory_pool()->allocate(out_bytes, &ptr);
+        if (!status.ok()) {
+            throw std::runtime_error("IqrRunner: failed to allocate flag buffer: " + status.message());
+        }
+        size_t off = 0;
+        for (const auto &c : chunks) {
+            std::memcpy(static_cast<std::byte *>(ptr) + off, c->ptr, c->size);
+            off += c->size;
+        }
+        result.flags = libstf::make_buffer(ctx_.memory_pool(), ptr, out_bytes, out_bytes);
     }
-    cthread->clearCompleted();
 
-    // 6. Debug: read back the histogram grand total (== N iff the banks were zeroed).
+    // 7. Debug: read back the histogram grand total (== N iff the banks were zeroed).
     result.histogram_total = iqr_config_->histogram_total();
     return result;
 }

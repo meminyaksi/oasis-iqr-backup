@@ -192,7 +192,11 @@ void OasisContext::handle_interrupt(int value) {
                                   libstf::FPGA_INTERRUPT_TRANSFER_SIZE_BITS)) &
                        1) != 0;
 
-    if (rdma_enabled_ && stream_id == bypass_stream_) {
+    // The bypass receiver owns the extra stream past the decoders in BOTH RDMA builds (the RDMA
+    // bypass) and local IQR builds (the IQR_detection lane). bypass_stream_ already points at
+    // whichever it is, so route that stream's completion there; everything else is a decoder stream
+    // and goes to the scheduler.
+    if ((rdma_enabled_ || iqr_present_) && stream_id == bypass_stream_) {
         bypass_receiver_->handle_completion(bytes_written, last);
     } else {
         scheduler_->handle_completion(stream_id, bytes_written, last);
