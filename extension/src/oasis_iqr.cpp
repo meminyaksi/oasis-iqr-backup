@@ -1,13 +1,22 @@
 #include "oasis_iqr.hpp"
 
+#include "coalesced_fetcher.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "oasis/iqr_runner.hpp"
 #include "oasis/oasis_context.hpp"
+#include "oasis/operator.hpp"
+#include "oasis/query_splinter.hpp"
 #include "oasis_context_cache_entry.hpp"
+#include "parcore/metadata/metadata.hpp"
+#include "parcore_metadata_util.hpp"
 #include "parquet_reader.hpp"
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <mutex>
+#include <vector>
 
 namespace duckdb {
 
@@ -47,22 +56,120 @@ struct IqrFlagsGlobalState : public GlobalTableFunctionState {
     idx_t MaxThreads() const override { return 1; }
 };
 
+// Wraps one fetched compressed column-chunk slice as a LocalSourceOperator. Copies the bytes into a
+// fresh memory-pool buffer (the simple, always-correct path; the zero-copy aligned-slice path in
+// oasis_scan.cpp is an optimization we can adopt later).
+std::unique_ptr<oasis::SourceOperator> MakeHostSourceCopy(oasis::OasisContext &ctx,
+                                                          const CoalescedFetcher::RangeView &view) {
+    void *ptr = nullptr;
+    auto  st  = ctx.memory_pool()->allocate(view.size, &ptr);
+    if (!st.ok()) {
+        throw IOException("iqr_flags: could not allocate input buffer: " + st.message());
+    }
+    std::memcpy(ptr, view.data(), view.size);
+    auto buffer = libstf::make_buffer(ctx.memory_pool(), ptr, view.size, view.size);
+    return std::make_unique<oasis::LocalSourceOperator>(std::move(buffer));
+}
+
+// Decodes the target column across every row group via the ParCore decoder and concatenates the
+// decoded int64 values into one contiguous host buffer (DMA-mapped, so IqrRunner can stream it).
+// Each group is one QuerySplinter (source -> decode -> sink) submitted to the scheduler and drained
+// synchronously -- iqr_flags is a pipeline breaker, so we block for the whole column up front.
+std::shared_ptr<libstf::Buffer> DecodeColumnAllGroups(ClientContext &context, oasis::OasisContext &ctx,
+                                                      const IqrFlagsBindData &bind,
+                                                      size_t &num_values_out) {
+    auto &fs          = FileSystem::GetFileSystem(context);
+    auto  file_handle = fs.OpenFile(bind.filename, FileOpenFlags::FILE_FLAGS_READ);
+
+    ParquetOptions parquet_opts(context);
+    ParquetReader  reader(context, OpenFileInfo {bind.filename}, parquet_opts);
+    auto           meta = BuildParcoreMetadata(reader);
+
+    const size_t col = bind.column_id;
+
+    // Total values across all groups for this column.
+    size_t total = 0;
+    for (const auto &group : meta.groups) {
+        total += group.chunks[col].num_values;
+    }
+    num_values_out = total;
+    if (total == 0) {
+        return nullptr;
+    }
+
+    // One contiguous int64 destination buffer for the whole column.
+    size_t total_bytes = total * sizeof(int64_t);
+    void  *dst         = nullptr;
+    auto   st          = ctx.memory_pool()->allocate(total_bytes, &dst);
+    if (!st.ok()) {
+        throw IOException("iqr_flags: could not allocate value buffer: " + st.message());
+    }
+    ctx.tlb_manager()->ensure_tlb_mapping(dst, total_bytes);
+    auto values = libstf::make_buffer(ctx.memory_pool(), dst, total_bytes, total_bytes);
+
+    size_t off_elems = 0;
+    for (size_t gi = 0; gi < meta.groups.size(); gi++) {
+        const auto &group = meta.groups[gi];
+        const auto &cc    = group.chunks[col];
+        if (cc.num_values == 0) {
+            continue;
+        }
+        auto type = parcore::metadata::to_libstf_type(cc.type);
+
+        // Full byte span of the row group ([min chunk offset, max chunk end) over ALL chunks).
+        uint64_t span_begin = std::numeric_limits<uint64_t>::max();
+        uint64_t span_end   = 0;
+        for (const auto &c : group.chunks) {
+            span_begin = std::min<uint64_t>(span_begin, c.offset);
+            span_end   = std::max<uint64_t>(span_end, c.offset + c.total_compressed_size);
+        }
+        CoalescedFetcher fetcher(*file_handle, ctx.memory_pool(),
+                                 {span_begin, span_end - span_begin});
+        auto handle = fetcher.Register(cc.offset, cc.total_compressed_size);
+        fetcher.PrepareReads();
+        for (size_t i = 0; i < fetcher.num_reads(); i++) {
+            fetcher.ExecuteMergedRead(i);
+        }
+
+        // source -> decode -> sink, one flow.
+        oasis::QuerySplinter splinter;
+        oasis::OperatorFlow  flow;
+        flow.push_back(MakeHostSourceCopy(ctx, fetcher.Resolve(handle)));
+        flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
+        auto sink = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type));
+        flow.push_back(std::make_unique<oasis::LocalSinkOperator>(sink, 0));
+        splinter.streams.push_back(std::move(flow));
+
+        auto result = ctx.scheduler().submit(std::move(splinter));
+        auto batch  = result.get_next_batch(); // blocks until this group is decoded
+        if (!batch) {
+            throw InternalException("iqr_flags: decode of row group %llu produced no output",
+                                    (unsigned long long)gi);
+        }
+
+        std::memcpy(static_cast<int64_t *>(dst) + off_elems, batch->buffer->ptr,
+                    cc.num_values * sizeof(int64_t));
+        off_elems += cc.num_values;
+    }
+
+    return values;
+}
+
 // Computes the whole result once: decode the target column, run the IQR two passes, store the value
-// buffer + packed flag bitmask into `gstate`. Filled in M2b.
+// buffer + packed flag bitmask into `gstate`.
 void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlagsGlobalState &gstate) {
-    // M2b plan (the ParCore decode path + IqrRunner):
-    //   auto &ctx = GetOrCreateOasisContext(context);
-    //   gstate.values = DecodeColumnInt64(context, ctx, bind);   // decode all row groups -> host buffer
-    //   oasis::IqrRunner runner(ctx, bind.is_signed, /*auto_window=*/true);
-    //   auto res = runner.run({{ gstate.values->ptr, gstate.values->size }});
-    //   gstate.flags        = res.flags;
-    //   gstate.num_elements = res.num_elements;
-    (void)context;
-    (void)bind;
-    (void)gstate;
-    throw NotImplementedException(
-        "iqr_flags: the column-decode + IQR run is wired in M2b (needs the ParCore decode path and a "
-        "co-resident IQR bitstream). The function binds and the schema is final.");
+    auto &ctx = GetOrCreateOasisContext(context);
+
+    size_t n = 0;
+    gstate.values       = DecodeColumnAllGroups(context, ctx, bind, n);
+    gstate.num_elements = n;
+    if (n == 0) {
+        return; // empty column -> no rows, no flags
+    }
+
+    oasis::IqrRunner runner(ctx, bind.is_signed, /*auto_window=*/true);
+    auto             res = runner.run({{gstate.values->ptr, n * sizeof(int64_t)}});
+    gstate.flags         = res.flags;
 }
 
 unique_ptr<FunctionData> IqrFlagsBind(ClientContext &context, TableFunctionBindInput &input,
