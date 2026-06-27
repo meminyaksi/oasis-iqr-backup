@@ -1,6 +1,7 @@
 #include "oasis/oasis_context.hpp"
 
 #include "oasis/configuration.hpp"
+#include "oasis/iqr_config.hpp"
 #include "parcore/configuration.hpp"
 
 #include <libstf/profiling.hpp>
@@ -57,11 +58,24 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     }
 
     auto cc_config = config<parcore::ColumnChunkDecoderConfig>();
-    // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
-    // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
-    rdma_enabled_ = mem_config_->num_streams() != cc_config->num_decoders();
-    // ID of the RDMA bypass stream -- the last MemConfig stream, sitting past the decoders.
-    bypass_stream_ = cc_config->num_decoders();
+
+    // The hardware exposes one MemConfig stream per column-chunk decoder, plus (sometimes) one extra
+    // stream past the decoders. That extra stream is either the RDMA bypass (RDMA builds) or the
+    // IQR_detection lane (local IQR builds) -- tell them apart by which config block the bitstream
+    // advertises, so the IQR lane isn't mistaken for an RDMA bypass.
+    iqr_present_ = global_config_.has_config(IqrConfig::ID);
+    if (iqr_present_) {
+        iqr_stream_    = cc_config->num_decoders(); // the reserved last stream is IQR's
+        rdma_enabled_  = false;
+        // The IQR lane has no scheduler flow (IqrRunner drives it directly and polls cThread), just
+        // like an RDMA bypass -- point the bypass receiver at it so its interrupts stay off the
+        // scheduler and the decoder streams (0..num_decoders-1) route to the scheduler cleanly.
+        bypass_stream_ = iqr_stream_;
+    } else {
+        // If the stream/decoder counts match, RDMA wasn't synthesized into this shell.
+        rdma_enabled_  = mem_config_->num_streams() != cc_config->num_decoders();
+        bypass_stream_ = cc_config->num_decoders();
+    }
 
     // Pre-map huge pages to FPGA TLB
     auto *huge_pool = dynamic_cast<libstf::HugePageMemoryPool *>(memory_pool_.get());

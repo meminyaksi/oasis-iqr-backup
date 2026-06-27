@@ -26,11 +26,8 @@ IqrRunner::IqrRunner(OasisContext &ctx, bool is_signed, bool auto_window, int64_
     // written in run(), after it is (optionally) derived from the data.
     iqr_config_->set_signed(is_signed_);
 
-    // Configure stream 0's data type for the IQR datapath (8x64 ndata, so 64-bit values).
-    // NOTE (M3): this assumes the co-resident oasis IQR top exposes a libstf::StreamConfig and that
-    // IQR reads on stream 0 -- both are properties of how the IQR region's input stream is wired in
-    // the vFPGA top, which does not exist yet. Revisit when the co-resident top lands.
-    ctx_.config<libstf::StreamConfig>()->enqueue_stream_config(0, libstf::type_t::INT64_T, 0);
+    // No StreamConfig: the production IQR lane in vfpga_top.svh reinterprets the incoming bytes as
+    // data64 directly (8x64 ndata), so the input type is fixed at 64-bit in hardware.
 }
 
 size_t IqrRunner::count_elements(const std::vector<InputChunk> &inputs) {
@@ -98,7 +95,7 @@ void IqrRunner::stream_pass(const std::vector<InputChunk> &inputs) {
     for (size_t i = 0; i < inputs.size(); ++i) {
         bool is_last = (i == last);
         libstf::enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), inputs[i].first,
-                                     inputs[i].second, /*stream=*/0, is_last);
+                                     inputs[i].second, ctx_.iqrStream(), is_last);
     }
 }
 
@@ -164,7 +161,7 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
         sg.addr   = obp + off;
         sg.len    = static_cast<uint32_t>(std::min<size_t>(out_bytes - off, coyote::MAX_TRANSFER_SIZE));
         sg.stream = coyote::STRM_HOST;
-        sg.dest   = 0;
+        sg.dest   = ctx_.iqrStream(); // flags come back on the IQR lane's output
         bool last_w = (off + coyote::MAX_TRANSFER_SIZE >= out_bytes);
         cthread->invoke(coyote::CoyoteOper::LOCAL_WRITE, sg, last_w);
         ++n_writes;

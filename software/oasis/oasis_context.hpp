@@ -63,6 +63,13 @@ public:
 
     libstf::stream_t rdmaBypassStream() const { return bypass_stream_; }
 
+    // True when the bitstream includes the IQR_detection operator (its config block is present).
+    bool isIQRPresent() const { return iqr_present_; }
+
+    // The stream the IQR operator reads/writes on (the reserved last stream). Valid iff
+    // isIQRPresent(). IqrRunner uses this instead of assuming stream 0.
+    libstf::stream_t iqrStream() const { return iqr_stream_; }
+
     /**
      * Establishes the RDMA queue pair with the remote server and configures the read-request module
      * with the remote region's base vaddr (only known once the queue pair has been exchanged).
@@ -113,6 +120,9 @@ private:
 
     bool             rdma_enabled_;
     libstf::stream_t bypass_stream_;
+
+    bool             iqr_present_{false};
+    libstf::stream_t iqr_stream_{0};
 
     std::unique_ptr<BypassStreamReceiver> bypass_receiver_;
     std::unique_ptr<Scheduler> scheduler_;
