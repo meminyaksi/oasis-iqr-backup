@@ -3,6 +3,7 @@
 #include "oasis_extension.hpp"
 #include "oasis_profile.hpp"
 #include "oasis_scan.hpp"
+#include "oasis_iqr.hpp"
 #include "oasis_context_cache_entry.hpp"
 #include "oasis_settings.hpp"
 #include "oasis_log_sink.hpp"
@@ -46,6 +47,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
+
+	// IQR outlier-detection table function
+	RegisterOasisIqrFunction(loader);
 
 	// Stream profiler readout table function
 	RegisterOasisProfileFunction(loader);
