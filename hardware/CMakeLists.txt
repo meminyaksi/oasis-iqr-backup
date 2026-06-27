@@ -24,7 +24,8 @@ if(ENABLE_RDMA)
     set(N_STRM_AXI ${N_STREAMS})
 else()
     set(EN_RDMA 0)
-    set(N_STRM_AXI ${N_DECODERS})
+    # Local mode (sim): reserve one extra stream past the decoders for the IQR_detection lane.
+    math(EXPR N_STRM_AXI "${N_DECODERS} + 1")
 endif()
 
 # Build with optimization, since timing closure can be difficult
