@@ -41,6 +41,7 @@ add_library(oasis SHARED)
 target_sources(oasis PRIVATE
     oasis/bypass_receiver.cpp
     oasis/configuration.cpp
+    oasis/iqr_runner.cpp
     oasis/oasis_context.cpp
     oasis/operator.cpp
     oasis/scheduler.cpp
