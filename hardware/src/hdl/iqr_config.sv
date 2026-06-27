@@ -1,0 +1,89 @@
+`timescale 1ns / 1ps
+
+import libstf::*;
+import oasis::NUM_IQR_CONFIG_REGS;
+import oasis::IQR_CONFIG_ID;
+
+`include "libstf_macros.svh"
+`include "config_macros.svh"
+
+// Host CSR block for the IQR_detection operator (the HW half of software/oasis/iqr_config.hpp).
+//
+// Read side advertises IQR_CONFIG_ID at register 0 (so GlobalConfig binds it), then the StreamProfiler
+// cycle counters and the histogram debug counters. Write side holds the runtime window
+// (bin_min/bin_shift/is_signed) stable for a run and pulses a one-cycle clear_req.
+//
+//   read  0 = IQR_CONFIG_ID        write 0 = bin_min
+//   read  1 = handshake cycles     write 1 = bin_shift
+//   read  2 = starved cycles       write 2 = is_signed
+//   read  3 = stalled cycles       write 3 = clear pulse
+//   read  4 = idle cycles
+//   read  5 = dbg_total (histogram grand total of the last run)
+//   read  6 = clear_seq (clear-completion counter)
+module IqrConfig (
+    input logic clk,
+    input logic rst_n,
+
+    write_config_i.s write_config,
+    read_config_i.s  read_config,
+
+    // Profiler + debug inputs, driven from the IQR data path.
+    input logic [63:0] handshake_cycles,
+    input logic [63:0] starved_cycles,
+    input logic [63:0] stalled_cycles,
+    input logic [63:0] idle_cycles,
+    input logic [63:0] dbg_total,
+    input logic [63:0] clear_seq,
+
+    // Runtime window outputs, driven to IQR_detection.
+    output logic [63:0] bin_min,
+    output logic [63:0] bin_shift,
+    output logic        is_signed,
+    output logic        clear_req
+);
+
+`RESET_RESYNC // Reset pipelining
+
+// -- Read: ID + profiler + debug ------------------------------------------------------------------
+logic [AXIL_DATA_BITS - 1:0] values[NUM_IQR_CONFIG_REGS];
+assign values[0] = IQR_CONFIG_ID;
+assign values[1] = handshake_cycles;
+assign values[2] = starved_cycles;
+assign values[3] = stalled_cycles;
+assign values[4] = idle_cycles;
+assign values[5] = dbg_total;
+assign values[6] = clear_seq;
+
+ConfigReadRegisterFile #(
+    .NUM_REGS(NUM_IQR_CONFIG_REGS)
+) inst_read_regs (
+    .clk(clk),
+    .rst_n(reset_synced),
+
+    .in(read_config),
+    .values(values)
+);
+
+// -- Write: held window params --------------------------------------------------------------------
+ConfigWriteRegister #(0, logic [63:0]) inst_bin_min (
+    .clk(clk), .write_config(write_config), .data(bin_min)
+);
+ConfigWriteRegister #(1, logic [63:0]) inst_bin_shift (
+    .clk(clk), .write_config(write_config), .data(bin_shift)
+);
+logic [63:0] is_signed_reg;
+ConfigWriteRegister #(2, logic [63:0]) inst_is_signed (
+    .clk(clk), .write_config(write_config), .data(is_signed_reg)
+);
+assign is_signed = is_signed_reg[0];
+
+// reg 3 = clear pulse: assert clear_req for one cycle when written.
+always_ff @(posedge clk) begin
+    if (reset_synced == 1'b0) begin
+        clear_req <= 1'b0;
+    end else begin
+        clear_req <= write_config.valid && (write_config.addr == 3);
+    end
+end
+
+endmodule
