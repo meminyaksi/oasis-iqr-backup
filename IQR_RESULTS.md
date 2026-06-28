@@ -39,6 +39,19 @@ Findings: (1) FPGA fastest at every size, speedup **grows with data** (2.6→3.7
 histogram is **not** a fast path (≥ exact's time) — FPGA beats *both* CPU options; (3) ~110–125 M
 rows/s on one FPGA vs ~30–40 M/s on the server CPU.
 
+### TPC-H scale point (generated via DuckDB `dbgen`, no download)
+TPC-H has **no IQR outliers in any column** (uniform/bounded `dbgen` distributions → nothing beyond
+1.5×IQR), so it's a **throughput** benchmark, not an accuracy one (count=0, correct). `l_extendedprice`→cents:
+
+| dataset | rows | FPGA warm | exact(32t) warm | speedup | FPGA rows/s |
+|---|---|---|---|---|---|
+| TPC-H sf=10 l_extendedprice | 59,986,052 | **0.826s** | 2.06s | **2.5×** | 72.6 M/s |
+
+Throughput is **decode-bound**: 72.6 M/s here vs ~125 M/s on taxi, because `l_extendedprice` is
+high-cardinality (poorly compressible, 310 MB) while taxi `fare_cents` is dictionary-encoded (27 MB
+for 20M rows). FPGA throughput scales with **bytes decoded**, not just rows — but still 2.5× over
+32-thread DuckDB (which used ~3 cores: user 5.8s / real 2.08s). Parquets: `~/datasets/tpch_extprice{,_sf10}.parquet`.
+
 Caveats: DuckDB used only ~3–7 cores effectively (user/real ratio) — these light, bandwidth-bound
 queries don't scale to 32; "32-thread" = available, not utilized. Times are whole-query (FPGA
 decode + 2-pass IQR + flags), not the isolated kernel.
@@ -54,6 +67,22 @@ count. Replicated FPGA algorithm in Python on the 3M taxi column (gap = vs CPU-e
 | 1024 bins lower-edge | 317,554 | 8¢ | −1,247 |
 | 4096 bins lower-edge | 318,801 | 2¢ | 0 (exact) |
 | 1024 bins + midpoint | 318,751 | 8¢ | −50 |
+
+**Agreement vs CPU-exact across real columns** (faithful FPGA-algorithm model; silicon-verified == model
+at 256 on taxi/fare, 309,309). `count%` = outlier-count agreement, `row%` = per-row agreement:
+
+| column | rows | CPU outliers | 256 (row%/count%) | 1024 | 4096 |
+|---|---|---|---|---|---|
+| taxi/fare | 2.96M | 318,801 | 99.68 / 97.0 | 99.96 / 99.6 | 100.0 / 100.0 |
+| taxi/total | 2.96M | 363,621 | 99.74 / 97.8 | 99.94 / 99.5 | 99.98 / 99.9 |
+| taxi/trip_dist | 2.96M | 382,745 | 99.82 / 98.6 | 99.97 / 99.8 | 100.0 / 100.0 |
+| tpch/* (l_quantity, l_extprice, l_discount) | 6.0M | 0 | 100 / 100 | 100 / 100 | 100 / 100 |
+
+Real columns are 97–98.6% count-agreement at 256 → 99.5–99.8% at 1024 → ~100% at 4096; per-row
+agreement is already ~99.7% at 256 (the gap is a thin band of borderline rows at the fence). NOTE:
+1024/4096 are faithful software simulations of the exact FPGA algorithm (the only bin count built in
+silicon is 256, where model==hardware exactly); count-loss is the one unmodeled factor (benign on
+well-conditioned data). TPC-H is uniform → 0 outliers → trivially 100% (a scale, not accuracy, test).
 
 Levers (cheapest first): **1024 bins + bin-midpoint quantile** → ~exact, single-BRAM depth (no
 cascade), low timing risk — the recommended next bitstream. Why **1024 not 4096**: 1024 is the max
