@@ -88,6 +88,24 @@ Output is **FPGA-initiated**: the host pre-enqueues an output buffer (`MemConfig
 `OutputWriter` fills it and raises a completion **interrupt** (the `notify` path). This is the key
 difference from celeris (which used host `LOCAL_WRITE` + `checkCompleted`).
 
+**Parquet decode is split CPU/FPGA — the heavy part is on the FPGA.** This is the whole reason the
+accelerator exists: per-value decompress+decode is bit-twiddling work the FPGA is good at; the CPU
+keeps only cheap, branchy metadata parsing.
+- **CPU (light, structural):** `metadata.cpp` / `parcore_metadata_util.cpp` parse the Parquet footer
+  (schema, row groups, where each column chunk's bytes live, codec, encodings); `coalesced_fetcher.cpp`
+  reads the **raw still-compressed-and-encoded** column-chunk bytes into DMA buffers; host
+  `column_chunk_decoder.cpp` only configures/feeds the hardware decoder (it doesn't decode values).
+- **FPGA (heavy, per-value)**, in `parcore/hardware/src/hdl/`: `page_header_parser.sv` (page headers,
+  moved off the CPU), `vhsnunzip_wrapper.sv` (Snappy decompression), `run_decoder.sv` /
+  `expand_rle.sv` / `hybrid_page_decoder.sv` (RLE / bit-packing), `varint_decoder.sv` (varints),
+  `TypedDictionary` (dictionary encoding) — all chained by `column_chunk_decoder.sv`
+  (**raw bytes in → typed values out**, e.g. a stream of int64).
+
+For IQR this means `iqr_flags` runs **decode + IQR** on the FPGA. The `iqr_sim` test fed **raw int64**
+and bypassed the decoder, so the DuckDB run was the first time the **decode→IQR** path executed on
+silicon. In this first version the decoded data still **round-trips through the host** before IQR
+(the host streams it back twice); fusing decode→IQR on-chip is a later optimization.
+
 **The IQR lane** is the "reserved last stream" past the decoders, present only in local mode
 (`ifndef EN_RDMA`). In RDMA builds that slot is the RDMA bypass; in local IQR builds it's IQR — both
 owned by the **bypass receiver**, told apart by whether `IqrConfig::ID` is advertised.
