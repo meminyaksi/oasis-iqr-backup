@@ -35,3 +35,29 @@ set_property -dict [list \
     CONFIG.C_PROBE16_WIDTH {1} \
     CONFIG.C_PROBE17_WIDTH {1} \
 ] [get_ips ila_rdma_read]
+
+# IQR count-loss debug ILA: watches bank-0's histogram BRAM read-modify-write so the silicon
+# read-after-write hazard (which drops counts, invisible in sim) can be observed live. Only
+# instantiated when IQR_detection.sv defines IQR_DEBUG_ILA; created here unconditionally (an
+# unused IP is harmless, matching ila_rdma_read on --no-rdma builds). Probe widths MUST match
+# the ports in hardware/iqr_app/hdl/IQR_detection.sv (BIN_IDX_WIDTH=10 at NUM_BINS=1024,
+# COUNT_WIDTH=32). If you change NUM_BINS, update probe4/6/9 to the new $clog2(NUM_BINS).
+create_ip {*}$ila_create_args -module_name ila_iqr
+set_property -dict [list \
+    CONFIG.C_NUM_OF_PROBES {13} \
+    CONFIG.C_EN_STRG_QUAL {1} \
+    CONFIG.C_DATA_DEPTH {4096} \
+    CONFIG.C_PROBE0_WIDTH {2} \
+    CONFIG.C_PROBE1_WIDTH {1} \
+    CONFIG.C_PROBE2_WIDTH {1} \
+    CONFIG.C_PROBE3_WIDTH {8} \
+    CONFIG.C_PROBE4_WIDTH {10} \
+    CONFIG.C_PROBE5_WIDTH {1} \
+    CONFIG.C_PROBE6_WIDTH {10} \
+    CONFIG.C_PROBE7_WIDTH {32} \
+    CONFIG.C_PROBE8_WIDTH {1} \
+    CONFIG.C_PROBE9_WIDTH {10} \
+    CONFIG.C_PROBE10_WIDTH {32} \
+    CONFIG.C_PROBE11_WIDTH {32} \
+    CONFIG.C_PROBE12_WIDTH {1} \
+] [get_ips ila_iqr]

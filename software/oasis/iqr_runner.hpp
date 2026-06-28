@@ -50,6 +50,16 @@ class IqrRunner {
         // Debug: the device's histogram grand total for this run (== num_elements iff the banks were
         // zeroed; a short-fall exposes the silicon count-loss we documented).
         uint64_t histogram_total = 0;
+
+        // Count-loss diagnostics (per run). The chain  num_elements >= accepted >= committed >=
+        // histogram_total  localizes where pass-1 counts are lost: accepted < num_elements -> input/
+        // DMA; committed < accepted -> coalescing; histogram_total < committed -> BRAM RMW hazard.
+        // collisions counts flush-reads that hit a just-written bin (direct hazard evidence);
+        // flushes is the BRAM write count.
+        uint64_t accepted   = 0;
+        uint64_t committed  = 0;
+        uint64_t flushes    = 0;
+        uint64_t collisions = 0;
     };
 
     /**

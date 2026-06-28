@@ -78,7 +78,19 @@ int main() {
     IqrRunner runner(ctx, /*is_signed=*/false, /*auto_window=*/false, /*bin_min=*/0, /*bin_shift=*/0);
     auto      res = runner.run({{in, n * sizeof(int64_t)}});
 
-    std::cout << "histogram_total = " << res.histogram_total << "  (expect " << n << ")" << std::endl;
+    // Count-loss diagnostics: the chain N >= accepted >= committed >= total pinpoints any loss
+    // stage on silicon (input/DMA, coalescing, or the BRAM read-after-write hazard). On a clean
+    // run all four equal N and collisions == 0.
+    std::cout << "histogram_total = " << res.histogram_total << "  (expect " << n << ")\n"
+              << "diagnostics: accepted=" << res.accepted << " committed=" << res.committed
+              << " total=" << res.histogram_total << " (expect " << n << ")"
+              << "  flushes=" << res.flushes << " collisions=" << res.collisions << "\n";
+    if (res.accepted   < n)             std::cout << "  -> LOSS at input/DMA (accepted < N)\n";
+    if (res.committed  < res.accepted)  std::cout << "  -> LOSS in coalescing (committed < accepted)\n";
+    if (res.histogram_total < res.committed)
+        std::cout << "  -> LOSS in BRAM read-modify-write hazard (total < committed), collisions="
+                  << res.collisions << "\n";
+    std::cout << std::flush;
 
     // 5. Unpack the packed flag bitmask: element i -> byte i/8, bit i%8 (LSB-first).
     const uint8_t   *mask = static_cast<const uint8_t *>(res.flags->ptr);
@@ -87,8 +99,8 @@ int main() {
         dev[i] = (mask[i >> 3] >> (i & 7)) & 1u;
     }
 
-    // 6. Compare against the reference model (256 bins, the production NUM_BINS).
-    auto exp      = model_flags(data, 256, 0, 0);
+    // 6. Compare against the reference model (1024 bins, the production NUM_BINS).
+    auto exp      = model_flags(data, 1024, 0, 0);
     int  mismatch = 0;
     for (size_t i = 0; i < n; i++) {
         if (dev[i] != exp[i]) {

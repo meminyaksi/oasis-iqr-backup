@@ -9,15 +9,19 @@ import oasis::IQR_CONFIG_ID;
 
 // Host CSR block for the IQR_detection operator (the HW half of software/oasis/iqr_config.hpp).
 //
-// Read side advertises IQR_CONFIG_ID at register 0 (so GlobalConfig binds it), then the StreamProfiler
-// cycle counters and the histogram debug counters. Write side holds the runtime window
+// Read side advertises IQR_CONFIG_ID at register 0 (so GlobalConfig binds it), then the count-loss
+// diagnostic counters and the histogram debug counters. Write side holds the runtime window
 // (bin_min/bin_shift/is_signed) stable for a run and pulses a one-cycle clear_req.
 //
+// (Registers 1-4 originally held unwired StreamProfiler cycle counts -- tied to 0. They now carry
+//  the count-loss diagnostics from IQR_detection so the host can read N >= accepted >= committed >=
+//  total and pinpoint where pass-1 counts are lost. See software/oasis/iqr_config.hpp.)
+//
 //   read  0 = IQR_CONFIG_ID        write 0 = bin_min
-//   read  1 = handshake cycles     write 1 = bin_shift
-//   read  2 = starved cycles       write 2 = is_signed
-//   read  3 = stalled cycles       write 3 = clear pulse
-//   read  4 = idle cycles
+//   read  1 = dbg_accepted         write 1 = bin_shift
+//   read  2 = dbg_committed        write 2 = is_signed
+//   read  3 = dbg_flushes          write 3 = clear pulse
+//   read  4 = dbg_collisions
 //   read  5 = dbg_total (histogram grand total of the last run)
 //   read  6 = clear_seq (clear-completion counter)
 module IqrConfig (
@@ -27,11 +31,11 @@ module IqrConfig (
     write_config_i.s write_config,
     read_config_i.s  read_config,
 
-    // Profiler + debug inputs, driven from the IQR data path.
-    input logic [63:0] handshake_cycles,
-    input logic [63:0] starved_cycles,
-    input logic [63:0] stalled_cycles,
-    input logic [63:0] idle_cycles,
+    // Count-loss diagnostics + debug inputs, driven from the IQR data path.
+    input logic [63:0] dbg_accepted,
+    input logic [63:0] dbg_committed,
+    input logic [63:0] dbg_flushes,
+    input logic [63:0] dbg_collisions,
     input logic [63:0] dbg_total,
     input logic [63:0] clear_seq,
 
@@ -47,10 +51,10 @@ module IqrConfig (
 // -- Read: ID + profiler + debug ------------------------------------------------------------------
 logic [AXIL_DATA_BITS - 1:0] values[NUM_IQR_CONFIG_REGS];
 assign values[0] = IQR_CONFIG_ID;
-assign values[1] = handshake_cycles;
-assign values[2] = starved_cycles;
-assign values[3] = stalled_cycles;
-assign values[4] = idle_cycles;
+assign values[1] = dbg_accepted;
+assign values[2] = dbg_committed;
+assign values[3] = dbg_flushes;
+assign values[4] = dbg_collisions;
 assign values[5] = dbg_total;
 assign values[6] = clear_seq;
 

@@ -264,8 +264,9 @@ for (genvar K = 0; K < IQR_NUM_ELEMENTS; K++) begin : g_iqr_keep_in
     assign iqr_in.keep[K] = &iqr_bytes_in.keep[K * 8 +: 8];
 end
 
-// IQR config block (config 3): window CSRs in, profiler/debug out.
+// IQR config block (config 3): window CSRs in, count-loss diagnostics + debug out.
 logic [63:0] iqr_bin_min, iqr_bin_shift_w, iqr_dbg_total, iqr_dbg_clear_seq;
+logic [63:0] iqr_dbg_accepted, iqr_dbg_committed, iqr_dbg_flushes, iqr_dbg_collisions;
 logic        iqr_is_signed, iqr_clear_req;
 IqrConfig inst_iqr_config (
     .clk(clk),
@@ -274,10 +275,10 @@ IqrConfig inst_iqr_config (
     .write_config(write_configs[3]),
     .read_config(read_configs[3]),
 
-    .handshake_cycles(64'd0),   // TODO: wire a StreamProfiler on iqr_in for real counters
-    .starved_cycles(64'd0),
-    .stalled_cycles(64'd0),
-    .idle_cycles(64'd0),
+    .dbg_accepted(iqr_dbg_accepted),
+    .dbg_committed(iqr_dbg_committed),
+    .dbg_flushes(iqr_dbg_flushes),
+    .dbg_collisions(iqr_dbg_collisions),
     .dbg_total(iqr_dbg_total),
     .clear_seq(iqr_dbg_clear_seq),
 
@@ -303,6 +304,10 @@ IQR_detection #(
     .clear_req(iqr_clear_req),
     .dbg_total(iqr_dbg_total),
     .dbg_clear_seq(iqr_dbg_clear_seq),
+    .dbg_accepted(iqr_dbg_accepted),
+    .dbg_committed(iqr_dbg_committed),
+    .dbg_flushes(iqr_dbg_flushes),
+    .dbg_collisions(iqr_dbg_collisions),
 
     .in(iqr_in),
     .out(iqr_flags_nd)

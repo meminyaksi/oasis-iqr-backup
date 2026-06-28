@@ -2,6 +2,12 @@
 
 `include "libstf_macros.svh"
 
+// Uncomment to build the count-loss ILA (probes bank-0's BRAM read-modify-write path so the
+// read-after-write hazard can be watched live on silicon). Requires the ila_iqr IP from
+// hardware/src/init_ip.tcl and the probe widths there to match (BIN_IDX_WIDTH / COUNT_WIDTH).
+// Leave commented for production bitstreams -- the host-readable counters below need no ILA.
+//`define IQR_DEBUG_ILA
+
 module IQR_detection #(
     parameter type value_t,
     parameter      NUM_ELEMENTS,
@@ -35,6 +41,20 @@ module IQR_detection #(
     // applied (banks zeroed, core idle-ready) before pass-1 data is allowed to stream in.
     output logic [$bits(value_t) - 1:0]           dbg_clear_seq,
 
+    // -- Count-loss diagnostics (read back via the IQR CSR block; reset on clear_req each run) ---
+    // The host knows N (values streamed in pass-1) and compares the chain
+    //     N  >=  dbg_accepted  >=  dbg_committed  >=  dbg_total
+    // to localize WHERE pass-1 counts are lost on silicon (sim is hazard-free, so loss hides):
+    //   accepted  < N         -> loss at the input handshake / DMA (before binning)
+    //   committed < accepted  -> loss in the coalescing accumulator (runs not fully carried)
+    //   total     < committed -> loss in the BRAM read-modify-write (the read-after-write hazard)
+    // dbg_collisions counts flush-reads that hit a just-written bin -- direct hazard evidence;
+    // dbg_flushes is the BRAM write count (texture for how much coalescing happened).
+    output logic [63:0]                           dbg_accepted,
+    output logic [63:0]                           dbg_committed,
+    output logic [63:0]                           dbg_flushes,
+    output logic [63:0]                           dbg_collisions,
+
     ndata_i.s in,   // #(value_t, NUM_ELEMENTS) input values
     ndata_i.m out   // #(value_t, NUM_ELEMENTS) results (driven later)
 );
@@ -62,6 +82,11 @@ module IQR_detection #(
     // passes: Q_SUM computes the grand total, Q_SCAN walks the cumulative count
     // to locate Q1 (25%) and Q3 (75%).
     logic [COUNT_WIDTH - 1:0]  bank_q [NUM_ELEMENTS];   // per-bank read data (exposed by g_bank)
+
+    // -- Count-loss diagnostics: per-bank accumulators, summed into the CSR debug regs below ----
+    logic [63:0] bank_committed  [NUM_ELEMENTS];   // Σ delta each bank intended to write to BRAM
+    logic [63:0] bank_flushes    [NUM_ELEMENTS];   // # BRAM writes (flushes) per bank
+    logic [63:0] bank_collisions [NUM_ELEMENTS];   // # flush-reads that hit a just-written bin
 
     typedef enum logic {Q_SUM, Q_SCAN} q_phase_t;
     q_phase_t                   q_phase;
@@ -314,7 +339,106 @@ module IQR_detection #(
             else if (s1_we)
                 mem[s1_bin] <= rd_q + s1_delta;
         end
+
+        // -- Count-loss diagnostics for this bank (pure observation, NOT in the datapath) ----
+        // Track the last DIAG_HAZ committed write bins. A flush that READS a bin written within
+        // that window gets the stale (pre-write) value on real BRAM -> its add overwrites the
+        // recent write and a count is lost. hazard_hit flags exactly that read.
+        localparam int DIAG_HAZ = 2;
+        logic                       w_hist_v [DIAG_HAZ];
+        logic [BIN_IDX_WIDTH - 1:0] w_hist_b [DIAG_HAZ];
+        logic                       hazard_hit;
+        always_comb begin
+            hazard_hit = 1'b0;
+            if (fl_we)
+                for (int j = 0; j < DIAG_HAZ; j++)
+                    if (w_hist_v[j] && (fl_bin == w_hist_b[j])) hazard_hit = 1'b1;
+        end
+
+        logic [63:0] diag_committed;   // Σ delta this bank intended to write into its BRAM
+        logic [63:0] diag_flushes;     // # BRAM writes (flushes) for this bank
+        logic [63:0] diag_collisions;  // # flush-reads that hit a just-written bin (hazard)
+        always_ff @(posedge clk) begin
+            if (reset_synced == 1'b0) begin
+                for (int j = 0; j < DIAG_HAZ; j++) w_hist_v[j] <= 1'b0;
+                diag_committed  <= '0;
+                diag_flushes    <= '0;
+                diag_collisions <= '0;
+            end else begin
+                // Shift recent-write history (this cycle's BRAM write is s1_we -> mem[s1_bin]).
+                w_hist_v[0] <= s1_we && !clearing;
+                w_hist_b[0] <= s1_bin;
+                for (int j = 1; j < DIAG_HAZ; j++) begin
+                    w_hist_v[j] <= w_hist_v[j-1];
+                    w_hist_b[j] <= w_hist_b[j-1];
+                end
+                if (clear_req) begin               // host re-arms before each run -> per-run counts
+                    diag_committed  <= '0;
+                    diag_flushes    <= '0;
+                    diag_collisions <= '0;
+                end else begin
+                    if (s1_we && !clearing) begin
+                        diag_committed <= diag_committed + 64'(s1_delta);
+                        diag_flushes   <= diag_flushes   + 64'd1;
+                    end
+                    if (hazard_hit) diag_collisions <= diag_collisions + 64'd1;
+                end
+            end
+        end
+        assign bank_committed[K]  = diag_committed;
+        assign bank_flushes[K]    = diag_flushes;
+        assign bank_collisions[K] = diag_collisions;
+
+`ifdef IQR_DEBUG_ILA
+        // Live waveform of the BRAM read-modify-write on bank 0 -- captures the exact cycle a
+        // flush reads a just-written bin (hazard_hit=1) so the count drop is observed, not guessed.
+        // Probe widths MUST match hardware/src/init_ip.tcl.
+        if (K == 0) begin : g_iqr_ila
+            ila_iqr inst_ila_iqr (
+                .clk    (clk),
+                .probe0 (state),          // 2  : HISTOGRAM/QUARTILES/FLAG
+                .probe1 (clearing),       // 1
+                .probe2 (accept_q),       // 1  : a beat is being binned
+                .probe3 (keep_q),         // 8  : NUM_ELEMENTS lane-valid
+                .probe4 (lane_idx_q[0]),  // BIN_IDX_WIDTH : bin for this lane
+                .probe5 (fl_we),          // 1  : flush requested (BRAM read for RMW)
+                .probe6 (fl_bin),         // BIN_IDX_WIDTH
+                .probe7 (fl_delta),       // COUNT_WIDTH
+                .probe8 (s1_we),          // 1  : BRAM write commit
+                .probe9 (s1_bin),         // BIN_IDX_WIDTH
+                .probe10(s1_delta),       // COUNT_WIDTH
+                .probe11(rd_q),           // COUNT_WIDTH : value read back for the RMW
+                .probe12(hazard_hit)      // 1  : this flush read a just-written bin
+            );
+        end
+`endif
     end
+
+    // -- Count-loss diagnostics: input-accepted counter + bank sums (read via the CSR block) ---
+    // dbg_accepted counts the values that actually entered binning in pass-1 (compare to N).
+    // committed/flushes/collisions are the per-bank accumulators summed across all banks.
+    logic [63:0] accepted_r;
+    always_ff @(posedge clk) begin
+        if (reset_synced == 1'b0) accepted_r <= '0;
+        else if (clear_req)       accepted_r <= '0;                       // per-run reset
+        else if (accept_q)        accepted_r <= accepted_r + 64'($countones(keep_q));
+    end
+
+    logic [63:0] committed_sum, flushes_sum, collisions_sum;
+    always_comb begin
+        committed_sum  = '0;
+        flushes_sum    = '0;
+        collisions_sum = '0;
+        for (int k = 0; k < NUM_ELEMENTS; k++) begin
+            committed_sum  = committed_sum  + bank_committed[k];
+            flushes_sum    = flushes_sum    + bank_flushes[k];
+            collisions_sum = collisions_sum + bank_collisions[k];
+        end
+    end
+    assign dbg_accepted   = accepted_r;
+    assign dbg_committed  = committed_sum;
+    assign dbg_flushes    = flushes_sum;
+    assign dbg_collisions = collisions_sum;
 
     // -- Quartile-scan merge pipeline (timing) --------------------------------
     // The per-cycle quartile work -- the 8-way reduction of the bank counts, the

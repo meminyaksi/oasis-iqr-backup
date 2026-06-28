@@ -178,8 +178,14 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
         result.flags = libstf::make_buffer(ctx_.memory_pool(), ptr, out_bytes, out_bytes);
     }
 
-    // 7. Debug: read back the histogram grand total (== N iff the banks were zeroed).
+    // 7. Debug: read back the histogram grand total (== N iff the banks were zeroed) and the
+    // count-loss diagnostics. The host can now see WHERE counts were lost without guessing:
+    // num_elements >= accepted >= committed >= histogram_total (input / coalescing / BRAM hazard).
     result.histogram_total = iqr_config_->histogram_total();
+    result.accepted        = iqr_config_->accepted();
+    result.committed       = iqr_config_->committed();
+    result.flushes         = iqr_config_->flushes();
+    result.collisions      = iqr_config_->collisions();
     return result;
 }
 

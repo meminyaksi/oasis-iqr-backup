@@ -203,10 +203,10 @@ IqrConfig inst_iqr_config (
     .write_config(write_configs[3]),
     .read_config(read_configs[3]),
 
-    .handshake_cycles(64'd0),
-    .starved_cycles(64'd0),
-    .stalled_cycles(64'd0),
-    .idle_cycles(64'd0),
+    .dbg_accepted(64'd0),   // fallback top: diagnostics not wired (the production top does)
+    .dbg_committed(64'd0),
+    .dbg_flushes(64'd0),
+    .dbg_collisions(64'd0),
     .dbg_total(iqr_dbg_total),
     .clear_seq(iqr_dbg_clear_seq),
 

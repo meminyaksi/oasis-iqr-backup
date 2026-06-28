@@ -25,14 +25,17 @@ constexpr uint64_t IQR_CONFIG_ID = 0x4951524445544354ull;
  *
  * Register map (matches hardware/src/hdl/aggregation/IQR_detection.sv via its config block):
  *
- *   READ side (StreamProfiler counters + debug):
+ *   READ side (count-loss diagnostics + debug):
  *     reg 0 = config id (== IQR_CONFIG_ID, checked by GlobalConfig)
- *     reg 1 = handshake cycles (productive input beats)
- *     reg 2 = starved cycles   (input valid low mid-stream)
- *     reg 3 = stalled cycles   (input backpressured: QUARTILES + FLAG)
- *     reg 4 = idle cycles      (gap between the two passes)
+ *     reg 1 = accepted   (values that entered binning in pass-1; compare to N)
+ *     reg 2 = committed  (sum of deltas the RMW intended to write into the histogram BRAM)
+ *     reg 3 = flushes    (number of BRAM writes -- coalescing texture)
+ *     reg 4 = collisions (flush-reads that hit a just-written bin -- direct hazard evidence)
  *     reg 5 = histogram grand total of the last run (debug: == N iff banks were zeroed)
  *     reg 6 = clear-completion counter (advances once per finished host clear sweep)
+ *
+ *   The chain  N >= accepted >= committed >= total  localizes where pass-1 counts are lost:
+ *   accepted<N -> input/DMA; committed<accepted -> coalescing; total<committed -> BRAM RMW hazard.
  *
  *   WRITE side (runtime window + control):
  *     reg 0 = bin_min   (raw 64-bit pattern; HW interprets signed when set_signed(true))
@@ -42,18 +45,23 @@ constexpr uint64_t IQR_CONFIG_ID = 0x4951524445544354ull;
  *
  * The FPGA computes Q1/Q3 and the 1.5*IQR fences itself between the two passes -- the host never
  * touches the histogram. Its only jobs are: write the window (bin_min/bin_shift/is_signed), pulse
- * the clear, and read back the profiler/debug counters.
+ * the clear, and read back the diagnostic/debug counters.
  */
 class IqrConfig : public libstf::Config {
   public:
     IqrConfig(std::shared_ptr<coyote::cThread> cthread, uint32_t addr_offset, uint32_t num_regs)
         : libstf::Config(cthread, addr_offset, num_regs) {}
 
-    // -- read side: StreamProfiler cycle counters (free-running, cumulative since load) ----------
-    uint64_t handshake_cycles() { return read_register(1).value(); }
-    uint64_t starved_cycles()   { return read_register(2).value(); }
-    uint64_t stalled_cycles()   { return read_register(3).value(); }
-    uint64_t idle_cycles()      { return read_register(4).value(); }
+    // -- read side: count-loss diagnostics (reset per run by clear_histogram(), like dbg_total) ---
+    // accepted: values that entered binning in pass-1 (== N iff no input/DMA loss).
+    uint64_t accepted()   { return read_register(1).value(); }
+    // committed: Σ deltas the BRAM read-modify-write intended to store (== accepted iff coalescing
+    // carried every run; > total when the read-after-write hazard drops counts in the BRAM).
+    uint64_t committed()  { return read_register(2).value(); }
+    // flushes: number of BRAM writes (how often the coalescer hit a bin change).
+    uint64_t flushes()    { return read_register(3).value(); }
+    // collisions: flush-reads that hit a just-written bin -- direct evidence of the BRAM hazard.
+    uint64_t collisions() { return read_register(4).value(); }
 
     // Debug: histogram grand total of the last run (== element count iff the banks were properly
     // zeroed; > N reveals cross-run residue).
