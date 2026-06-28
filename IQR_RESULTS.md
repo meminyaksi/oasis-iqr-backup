@@ -45,12 +45,17 @@ TPC-H has **no IQR outliers in any column** (uniform/bounded `dbgen` distributio
 
 | dataset | rows | FPGA warm | exact(32t) warm | speedup | FPGA rows/s |
 |---|---|---|---|---|---|
+| TPC-H sf=1 l_extendedprice (high-card) | 6,001,215 | 0.095s | — | — | 63 M/s |
+| TPC-H sf=1 l_quantity (low-card) | 6,001,215 | 0.083s | — | — | 72 M/s |
 | TPC-H sf=10 l_extendedprice | 59,986,052 | **0.826s** | 2.06s | **2.5×** | 72.6 M/s |
 
-Throughput is **decode-bound**: 72.6 M/s here vs ~125 M/s on taxi, because `l_extendedprice` is
-high-cardinality (poorly compressible, 310 MB) while taxi `fare_cents` is dictionary-encoded (27 MB
-for 20M rows). FPGA throughput scales with **bytes decoded**, not just rows — but still 2.5× over
-32-thread DuckDB (which used ~3 cores: user 5.8s / real 2.08s). Parquets: `~/datasets/tpch_extprice{,_sf10}.parquet`.
+Throughput is **decode-bound**: 63–73 M/s on TPC-H vs ~125 M/s on taxi, because `l_extendedprice` is
+high-cardinality (poorly compressible, 310 MB at sf=10) while taxi `fare_cents` is dictionary-encoded
+(27 MB for 20M rows). Corroborated at fixed 6M rows: low-cardinality `l_quantity` (0.083s) decodes
+faster than high-cardinality `l_extendedprice` (0.095s). FPGA throughput scales with **bytes decoded**,
+not just rows — but still 2.5× over 32-thread DuckDB at sf=10 (which used ~3 cores: user 5.8s / real
+2.08s). Parquets: `~/datasets/tpch_{extprice,extprice_sf10,qty}.parquet`. (CPU baseline timed only at
+sf=10; sf=1 rows are FPGA-only throughput points.)
 
 Caveats: DuckDB used only ~3–7 cores effectively (user/real ratio) — these light, bandwidth-bound
 queries don't scale to 32; "32-thread" = available, not utilized. Times are whole-query (FPGA
