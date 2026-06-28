@@ -6,7 +6,7 @@
 // read-after-write hazard can be watched live on silicon). Requires the ila_iqr IP from
 // hardware/src/init_ip.tcl and the probe widths there to match (BIN_IDX_WIDTH / COUNT_WIDTH).
 // Leave commented for production bitstreams -- the host-readable counters below need no ILA.
-//`define IQR_DEBUG_ILA
+`define IQR_DEBUG_ILA
 
 module IQR_detection #(
     parameter type value_t,
