@@ -291,7 +291,7 @@ ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_flags_nd();
 IQR_detection #(
     .value_t(data64_t),
     .NUM_ELEMENTS(IQR_NUM_ELEMENTS),
-    .NUM_BINS(256),
+    .NUM_BINS(1024),
     .COUNT_WIDTH(32)
 ) inst_iqr_detection (
     .clk(clk),

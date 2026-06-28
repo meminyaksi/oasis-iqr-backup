@@ -80,7 +80,7 @@ class IqrRunner {
     uint64_t bin_shift_;
 
     // Histogram bin count baked into the bitstream (must match the vFPGA top's IQR_NUM_BINS).
-    static constexpr int64_t NUM_BINS      = 256;
+    static constexpr int64_t NUM_BINS      = 1024;
     static constexpr size_t  SAMPLE_TARGET = 8192;   // ~rows sampled to size the window
 
     // Counts total int64 elements across all chunks.
