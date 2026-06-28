@@ -125,16 +125,24 @@ Flags come back as a **packed bitmask** (1 bit/element, 64-byte beats) — eleme
 
 ### A. Simulation (software-in-the-loop co-sim)
 ```bash
-module load vivado/2025.2
+module load vivado/<ver> || source /tools/Xilinx/Vivado/2024.2/settings64.sh
+which vivado                                                    # MUST print a path (see gotcha 9)
 cd ~/oasis
 ./scripts/setup_simulation.sh                                   # builds hardware/build-sim
 cp hardware/src/vfpga_top.svh hardware/build-sim/sim/vfpga_top.svh   # put PRODUCTION top in the sim slot
+rm -rf hardware/build-sim/sim/xsim.dir hardware/build-sim/sim/coyote_sim.so   # force recompile (gotcha 10)
+make -C hardware/build-sim sim                                  # recompile coyote_sim.so with the new top
 export PATH=$HOME/.local/bin:$PATH
 cmake -S examples/iqr_sim -B examples/iqr_sim/build -DEN_SIMULATION=ON -DCMAKE_PREFIX_PATH=$HOME/opt
 cmake --build examples/iqr_sim/build -j
-COYOTE_SIM_DIR=$PWD/hardware/build-sim ./examples/iqr_sim/build/iqr_sim   # launches xsim, drives the RTL
+COYOTE_SIM_DIR=$PWD/hardware/build-sim ./examples/iqr_sim/build/iqr_sim   # spawns Vivado, runs RTL (takes MINUTES)
 ```
-Sim logs: `hardware/build-sim/sim/oasis.sim/sim_1/behav/xsim/{simulate,xvlog,elaborate}.log`.
+A real run takes minutes and updates `~/oasis/vivado.log` + creates `hardware/build-sim/sim/oasis.sim/`.
+An **instant** return with stale/garbage CSRs means the sim never launched — see gotchas 9 & 10.
+NOTE: the co-sim is zero-delay so it never reproduces the silicon count-loss (clean run = accepted ==
+committed == total == N, collisions == 0). To exercise the IQR diagnostics' loss path in sim, the
+hazard is modelled by the `IQR_BRAM_RAW_HAZARD_SIM=<depth>` define. The ILA (`IQR_DEBUG_ILA`) is a
+synthesis-only IP — comment it out for sim, re-enable for the bitstream.
 
 ### B. Bitstream (overnight)
 ```bash
@@ -191,7 +199,19 @@ cd ~/oasis/extension/build/release && export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_L
 7. **Build env:** CMake ≥3.25 needed (`pip install --user "cmake>=3.28"`, `PATH=$HOME/.local/bin:$PATH`).
    jemalloc + the stack install under `~/opt` (`-DCMAKE_PREFIX_PATH=$HOME/opt`, `LD_LIBRARY_PATH=$HOME/opt/lib`).
    Build on hacc-build-02 (build server), run on the alveo node (shared home).
-8. **Vivado:** `module load vivado/2025.2` (slash syntax). 2024.2 didn't help the t=0 crash; parcore did.
+8. **Vivado:** `module load vivado/<ver>` (slash syntax). 2024.2 didn't help the t=0 crash; parcore did.
+9. **`iqr_sim` needs `vivado` ON PATH; `make sim` does not.** The sim cThread (`VivadoRunner`) spawns
+   Vivado via `which vivado`, but `make sim` calls it by absolute path. So if the Vivado module isn't
+   loaded in your shell, `make sim` succeeds yet `iqr_sim` **silently returns instant garbage**
+   (e.g. `accepted=0 total=12`, no `~/oasis/vivado.log` update, no `oasis.sim/` dir). Symptom of this
+   exact trap: an *instant* run (a real co-sim takes minutes). Gate on `which vivado` before running.
+   (Cost: a full afternoon — the alveo node lacked the module; hacc-build-02 had it.)
+10. **Vivado won't recompile an `` `include ``'d file.** The sim DUT pulls `vfpga_top.svh` via
+   `` `include `` into `user_logic_c0_0.sv`, so after you copy a new top into the slot (or edit the
+   IQR RTL), Vivado/`make sim` sees the *project source* as unchanged and reuses the **stale**
+   `coyote_sim.so` / `xsim.dir`. Always `rm -rf hardware/build-sim/sim/{xsim.dir,coyote_sim.so}`
+   before `make sim` to force a real recompile. (`strings coyote_sim.so` is NOT a reliable check —
+   net names don't survive into the .so; verify by the *runtime* numbers instead.)
 
 ---
 
