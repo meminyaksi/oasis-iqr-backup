@@ -6,7 +6,7 @@
 // read-after-write hazard can be watched live on silicon). Requires the ila_iqr IP from
 // hardware/src/init_ip.tcl and the probe widths there to match (BIN_IDX_WIDTH / COUNT_WIDTH).
 // Leave commented for production bitstreams -- the host-readable counters below need no ILA.
-`define IQR_DEBUG_ILA
+//`define IQR_DEBUG_ILA
 
 module IQR_detection #(
     parameter type value_t,
@@ -84,6 +84,7 @@ module IQR_detection #(
     logic [COUNT_WIDTH - 1:0]  bank_q [NUM_ELEMENTS];   // per-bank read data (exposed by g_bank)
 
     // -- Count-loss diagnostics: per-bank accumulators, summed into the CSR debug regs below ----
+    logic [63:0] bank_accepted   [NUM_ELEMENTS];   // # values this bank saw at the input (beats)
     logic [63:0] bank_committed  [NUM_ELEMENTS];   // Σ delta each bank intended to write to BRAM
     logic [63:0] bank_flushes    [NUM_ELEMENTS];   // # BRAM writes (flushes) per bank
     logic [63:0] bank_collisions [NUM_ELEMENTS];   // # flush-reads that hit a just-written bin
@@ -355,12 +356,14 @@ module IQR_detection #(
                     if (w_hist_v[j] && (fl_bin == w_hist_b[j])) hazard_hit = 1'b1;
         end
 
+        logic [63:0] diag_accepted;    // # values this bank saw at the input (a beat per value)
         logic [63:0] diag_committed;   // Σ delta this bank intended to write into its BRAM
         logic [63:0] diag_flushes;     // # BRAM writes (flushes) for this bank
         logic [63:0] diag_collisions;  // # flush-reads that hit a just-written bin (hazard)
         always_ff @(posedge clk) begin
             if (reset_synced == 1'b0) begin
                 for (int j = 0; j < DIAG_HAZ; j++) w_hist_v[j] <= 1'b0;
+                diag_accepted   <= '0;
                 diag_committed  <= '0;
                 diag_flushes    <= '0;
                 diag_collisions <= '0;
@@ -373,10 +376,12 @@ module IQR_detection #(
                     w_hist_b[j] <= w_hist_b[j-1];
                 end
                 if (clear_req) begin               // host re-arms before each run -> per-run counts
+                    diag_accepted   <= '0;
                     diag_committed  <= '0;
                     diag_flushes    <= '0;
                     diag_collisions <= '0;
                 end else begin
+                    if (beat) diag_accepted <= diag_accepted + 64'd1;   // value entered binning
                     if (s1_we && !clearing) begin
                         diag_committed <= diag_committed + 64'(s1_delta);
                         diag_flushes   <= diag_flushes   + 64'd1;
@@ -385,6 +390,7 @@ module IQR_detection #(
                 end
             end
         end
+        assign bank_accepted[K]   = diag_accepted;
         assign bank_committed[K]  = diag_committed;
         assign bank_flushes[K]    = diag_flushes;
         assign bank_collisions[K] = diag_collisions;
@@ -414,28 +420,24 @@ module IQR_detection #(
 `endif
     end
 
-    // -- Count-loss diagnostics: input-accepted counter + bank sums (read via the CSR block) ---
-    // dbg_accepted counts the values that actually entered binning in pass-1 (compare to N).
-    // committed/flushes/collisions are the per-bank accumulators summed across all banks.
-    logic [63:0] accepted_r;
-    always_ff @(posedge clk) begin
-        if (reset_synced == 1'b0) accepted_r <= '0;
-        else if (clear_req)       accepted_r <= '0;                       // per-run reset
-        else if (accept_q)        accepted_r <= accepted_r + 64'($countones(keep_q));
-    end
-
-    logic [63:0] committed_sum, flushes_sum, collisions_sum;
+    // -- Count-loss diagnostics: sum the per-bank accumulators across all banks (read via CSR) ---
+    // accepted/committed/flushes/collisions are each Σ over the NUM_ELEMENTS banks. accepted counts
+    // input beats per bank (mirrors committed's structure so the two can only diverge on a real
+    // coalescing drop, not a counting artifact).
+    logic [63:0] accepted_sum, committed_sum, flushes_sum, collisions_sum;
     always_comb begin
+        accepted_sum   = '0;
         committed_sum  = '0;
         flushes_sum    = '0;
         collisions_sum = '0;
         for (int k = 0; k < NUM_ELEMENTS; k++) begin
+            accepted_sum   = accepted_sum   + bank_accepted[k];
             committed_sum  = committed_sum  + bank_committed[k];
             flushes_sum    = flushes_sum    + bank_flushes[k];
             collisions_sum = collisions_sum + bank_collisions[k];
         end
     end
-    assign dbg_accepted   = accepted_r;
+    assign dbg_accepted   = accepted_sum;
     assign dbg_committed  = committed_sum;
     assign dbg_flushes    = flushes_sum;
     assign dbg_collisions = collisions_sum;
