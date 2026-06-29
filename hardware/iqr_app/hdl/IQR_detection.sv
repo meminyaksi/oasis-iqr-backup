@@ -106,6 +106,13 @@ module IQR_detection #(
     logic signed [VALUE_WIDTH + 2:0] lower_fence;       // Q1 - 1.5*IQR
     logic signed [VALUE_WIDTH + 2:0] upper_fence;       // Q3 + 1.5*IQR
 
+    // Pipelined fence computation: the once-per-dataset fence math (wide variable shift +
+    // signed adds) was a single-cycle cloud that failed setup (upper_fence_i*/lower_fence_reg).
+    // Spread it over 4 registered steps; runs once per dataset so the extra cycles are free.
+    logic [1:0]                      fence_step;
+    logic [VALUE_WIDTH - 1:0]        q1v_r, q3v_r;
+    logic signed [VALUE_WIDTH + 2:0] q1e_r, q3e_r, iqrv_r;
+
     // -- BRAM clear sweep -----------------------------------------------------
     // A BRAM cannot be wiped in one cycle, so on entering HISTOGRAM we walk
     // address 0..NUM_BINS-1 writing zero to every bank before accepting data.
@@ -394,30 +401,6 @@ module IQR_detection #(
         assign bank_committed[K]  = diag_committed;
         assign bank_flushes[K]    = diag_flushes;
         assign bank_collisions[K] = diag_collisions;
-
-`ifdef IQR_DEBUG_ILA
-        // Live waveform of the BRAM read-modify-write on bank 0 -- captures the exact cycle a
-        // flush reads a just-written bin (hazard_hit=1) so the count drop is observed, not guessed.
-        // Probe widths MUST match hardware/src/init_ip.tcl.
-        if (K == 0) begin : g_iqr_ila
-            ila_iqr inst_ila_iqr (
-                .clk    (clk),
-                .probe0 (state),          // 2  : HISTOGRAM/QUARTILES/FLAG
-                .probe1 (clearing),       // 1
-                .probe2 (accept_q),       // 1  : a beat is being binned
-                .probe3 (keep_q),         // 8  : NUM_ELEMENTS lane-valid
-                .probe4 (lane_idx_q[0]),  // BIN_IDX_WIDTH : bin for this lane
-                .probe5 (fl_we),          // 1  : flush requested (BRAM read for RMW)
-                .probe6 (fl_bin),         // BIN_IDX_WIDTH
-                .probe7 (fl_delta),       // COUNT_WIDTH
-                .probe8 (s1_we),          // 1  : BRAM write commit
-                .probe9 (s1_bin),         // BIN_IDX_WIDTH
-                .probe10(s1_delta),       // COUNT_WIDTH
-                .probe11(rd_q),           // COUNT_WIDTH : value read back for the RMW
-                .probe12(hazard_hit)      // 1  : this flush read a just-written bin
-            );
-        end
-`endif
     end
 
     // -- Count-loss diagnostics: sum the per-bank accumulators across all banks (read via CSR) ---
@@ -443,25 +426,32 @@ module IQR_detection #(
     assign dbg_collisions = collisions_sum;
 
     // -- Quartile-scan merge pipeline (timing) --------------------------------
-    // The per-cycle quartile work -- the 8-way reduction of the bank counts, the
-    // cumulative add, the *4 and the >=total / >=3*total compares -- became the
-    // critical path once binning was pipelined. Split it: do the 8-way reduction
-    // combinationally and REGISTER it (bin_total_q), so the cumulative add and the
-    // compares run off a register the next cycle. This adds one more cycle of
-    // read->merge latency, so the scan below skips scan_cnt 0 AND 1 (instead of
-    // just 0), runs to NUM_BINS+1, and the located bin is scan_cnt-2 (instead of
-    // -1). The scan runs once per dataset (~NUM_BINS cycles), so the extra latency
-    // is free.
-    logic [COUNT_WIDTH + 2:0] bin_total;     // 8-way sum of the banks for the bin read last cycle
-    logic [COUNT_WIDTH + 2:0] bin_total_q;   // registered -> consumed by the FSM merge below
-    always_comb begin
-        bin_total = '0;
-        for (int k = 0; k < NUM_ELEMENTS; k++)
-            bin_total = bin_total + (COUNT_WIDTH + 3)'(bank_q[k]);
-    end
+    // The 8-way reduction of the per-bank counts is the path that fails setup on silicon
+    // (bin_total_q_reg/D, WNS -0.430): a single-cycle 8-input add silently latches a wrong
+    // partial sum, so the histogram is correct (committed == N) but `total` reads low -- the
+    // count-loss we root-caused. FIX: pipeline the reduction into THREE single-level adder
+    // stages (8 -> 4 -> 2 -> 1), each registered, so no stage is deeper than one add. This
+    // lengthens read->merge latency from 2 to SCAN_LAT cycles, so the scan skips scan_cnt <
+    // SCAN_LAT, runs to NUM_BINS+SCAN_LAT-1, and the located bin is scan_cnt-SCAN_LAT. The scan
+    // runs once per dataset (~NUM_BINS cycles) so the extra latency is free. (Assumes
+    // NUM_ELEMENTS == 8, the production geometry.)
+    localparam int SCAN_LAT = 4;               // 1 (BRAM read) + 3 (reduction register stages)
+
+    logic [COUNT_WIDTH + 2:0] red1 [4];        // stage 1: 8 banks -> 4 partial sums
+    logic [COUNT_WIDTH + 2:0] red2 [2];        // stage 2: 4 -> 2
+    logic [COUNT_WIDTH + 2:0] bin_total_q;     // stage 3: 2 -> 1  (consumed by the FSM merge below)
     always_ff @(posedge clk) begin
-        if (reset_synced == 1'b0) bin_total_q <= '0;
-        else                      bin_total_q <= bin_total;
+        if (reset_synced == 1'b0) begin
+            for (int i = 0; i < 4; i++) red1[i] <= '0;
+            red2[0] <= '0; red2[1] <= '0;
+            bin_total_q <= '0;
+        end else begin
+            for (int i = 0; i < 4; i++)        // stage 1: pair the 8 banks
+                red1[i] <= (COUNT_WIDTH + 3)'(bank_q[2*i]) + (COUNT_WIDTH + 3)'(bank_q[2*i + 1]);
+            red2[0]     <= red1[0] + red1[1];  // stage 2: pair the 4 partials
+            red2[1]     <= red1[2] + red1[3];
+            bin_total_q <= red2[0] + red2[1];  // stage 3: final per-bin sum
+        end
     end
 
     // -- Control FSM ----------------------------------------------------------
@@ -476,9 +466,6 @@ module IQR_detection #(
 
     always_ff @(posedge clk) begin
         logic [COUNT_WIDTH + 2:0]        cum4, tot1, tot3;
-        logic [VALUE_WIDTH - 1:0]        q1v, q3v;
-        logic signed [VALUE_WIDTH + 2:0] iqrv;
-        logic signed [VALUE_WIDTH + 2:0] q1e, q3e;   // sign/zero-extended quartile values
 
         if (reset_synced == 1'b0) begin
             state             <= HISTOGRAM;
@@ -543,6 +530,7 @@ module IQR_detection #(
                             cumulative <= '0;
                             q1_found   <= 1'b0;
                             q3_found   <= 1'b0;
+                            fence_step <= 2'd0;   // arm the pipelined fence computation
                         end else begin
                             drain_cnt <= drain_cnt - 3'd1;
                         end
@@ -551,35 +539,44 @@ module IQR_detection #(
 
                 QUARTILES: begin
                     if (q1_found && q3_found) begin
-                        // Both quartiles located. Derive their values and the
-                        // 1.5*IQR fences (1.5*IQR = IQR + IQR/2, no multiplier),
-                        // then hand over to FLAG.
-                        q1v  = bin_min + (VALUE_WIDTH'(q1_bin) << bin_shift);
-                        q3v  = bin_min + (VALUE_WIDTH'(q3_bin) << bin_shift);
-
-                        // Sign- or zero-extend the quartile values to the fence width
-                        // (matching the flag compare), so signed windows work.
-                        q1e  = is_signed ? $signed({{3{q1v[VALUE_WIDTH-1]}}, q1v}) : $signed({3'b0, q1v});
-                        q3e  = is_signed ? $signed({{3{q3v[VALUE_WIDTH-1]}}, q3v}) : $signed({3'b0, q3v});
-                        iqrv = q3e - q1e;
-
-                        q1_val      <= q1v;
-                        q3_val      <= q3v;
-                        iqr_val     <= iqrv;
-                        lower_fence <= q1e - iqrv - (iqrv >>> 1);
-                        upper_fence <= q3e + iqrv + (iqrv >>> 1);
-
-                        state <= FLAG;
+                        // Both quartiles located. Derive their values + the 1.5*IQR fences
+                        // (1.5*IQR = IQR + IQR/2, no multiplier) over 4 registered steps so the
+                        // wide variable-shift and signed adds each meet timing, then hand to FLAG.
+                        case (fence_step)
+                            2'd0: begin   // bin -> value (the wide variable shift, isolated)
+                                q1v_r <= bin_min + (VALUE_WIDTH'(q1_bin) << bin_shift);
+                                q3v_r <= bin_min + (VALUE_WIDTH'(q3_bin) << bin_shift);
+                                fence_step <= 2'd1;
+                            end
+                            2'd1: begin   // sign/zero-extend to fence width (signed windows)
+                                q1e_r <= is_signed ? $signed({{3{q1v_r[VALUE_WIDTH-1]}}, q1v_r}) : $signed({3'b0, q1v_r});
+                                q3e_r <= is_signed ? $signed({{3{q3v_r[VALUE_WIDTH-1]}}, q3v_r}) : $signed({3'b0, q3v_r});
+                                fence_step <= 2'd2;
+                            end
+                            2'd2: begin   // IQR = Q3 - Q1
+                                iqrv_r <= q3e_r - q1e_r;
+                                fence_step <= 2'd3;
+                            end
+                            2'd3: begin   // fences, then FLAG
+                                q1_val      <= q1v_r;
+                                q3_val      <= q3v_r;
+                                iqr_val     <= iqrv_r;
+                                lower_fence <= q1e_r - iqrv_r - (iqrv_r >>> 1);
+                                upper_fence <= q3e_r + iqrv_r + (iqrv_r >>> 1);
+                                state       <= FLAG;
+                            end
+                        endcase
                     end else begin
                         case (q_phase)
                             Q_SUM: begin
                                 // Pass 1: grand total = sum of every bin.
-                                // bin_total_q holds bin scan_cnt-2 (read + reduction latency),
-                                // so accumulate bins 0..NUM_BINS-1 over scan_cnt 2..NUM_BINS+1.
-                                if (scan_cnt >= 2)
+                                // bin_total_q holds bin scan_cnt-SCAN_LAT (BRAM read + 3-stage
+                                // reduction), so accumulate bins 0..NUM_BINS-1 over scan_cnt
+                                // SCAN_LAT..NUM_BINS+SCAN_LAT-1.
+                                if (scan_cnt >= SCAN_LAT)
                                     total <= total + bin_total_q[COUNT_WIDTH - 1:0];
 
-                                if (scan_cnt == NUM_BINS + 1) begin
+                                if (scan_cnt == NUM_BINS + SCAN_LAT - 1) begin
                                     q_phase  <= Q_SCAN;
                                     scan_cnt <= '0;
                                 end else begin
@@ -591,8 +588,8 @@ module IQR_detection #(
                                 // Pass 2: cumulative count locates the quartiles.
                                 // Q1 = first bin with 4*cumulative >= total,
                                 // Q3 = first bin with 4*cumulative >= 3*total.
-                                // bin_total_q is bin scan_cnt-2, so the located bin is scan_cnt-2.
-                                if (scan_cnt >= 2) begin
+                                // bin_total_q is bin scan_cnt-SCAN_LAT, so the located bin is too.
+                                if (scan_cnt >= SCAN_LAT) begin
                                     cum4 = ((COUNT_WIDTH + 3)'(cumulative) + bin_total_q) << 2;
                                     tot1 = (COUNT_WIDTH + 3)'(total);
                                     tot3 = ((COUNT_WIDTH + 3)'(total) << 1) + (COUNT_WIDTH + 3)'(total);
@@ -601,15 +598,15 @@ module IQR_detection #(
 
                                     if (!q1_found && cum4 >= tot1) begin
                                         q1_found <= 1'b1;
-                                        q1_bin   <= scan_cnt[BIN_IDX_WIDTH - 1:0] - 2'd2;
+                                        q1_bin   <= scan_cnt[BIN_IDX_WIDTH - 1:0] - BIN_IDX_WIDTH'(SCAN_LAT);
                                     end
                                     if (!q3_found && cum4 >= tot3) begin
                                         q3_found <= 1'b1;
-                                        q3_bin   <= scan_cnt[BIN_IDX_WIDTH - 1:0] - 2'd2;
+                                        q3_bin   <= scan_cnt[BIN_IDX_WIDTH - 1:0] - BIN_IDX_WIDTH'(SCAN_LAT);
                                     end
                                 end
 
-                                if (scan_cnt != NUM_BINS + 1)
+                                if (scan_cnt != NUM_BINS + SCAN_LAT - 1)
                                     scan_cnt <= scan_cnt + 1'b1;
                             end
                         endcase
@@ -670,6 +667,40 @@ module IQR_detection #(
             end
         end
     end
+
+`ifdef IQR_DEBUG_ILA
+    // -- Count-loss diagnostic ILA: the FULL life of `total` -------------------------------------
+    // Traces every stage so the count-loss never needs another bitgen to localize:
+    //   per-bank reads (bank_q) -> 3-stage reduction (red1->red2->bin_total_q) -> accumulator
+    //   (total) -> quartiles (q1_bin/q3_bin/cumulative) -> fences (lower/upper_fence) -> host
+    //   (dbg_total), with state/q_phase/scan_cnt/fence_step context + one write-side tap.
+    // Probe widths MUST match hardware/src/init_ip.tcl. Synthesis-only (breaks xsim) -> comment
+    // the `define for co-sim. Trigger on accept_q to capture the whole pass; the scan is long
+    // (~NUM_BINS*2 cycles) so to see total accumulate you may trigger on state==QUARTILES instead.
+    ila_iqr inst_ila_iqr (
+        .clk    (clk),
+        .probe0 (state),               // 2  HISTOGRAM/QUARTILES/FLAG
+        .probe1 (q_phase),             // 1  Q_SUM / Q_SCAN
+        .probe2 (scan_cnt),            // BIN_IDX_WIDTH+1  which bin the scan is on
+        .probe3 (clearing),            // 1
+        .probe4 (accept_q),            // 1  a beat is being binned (pass-1)
+        .probe5 (fence_step),          // 2  pipelined-fence sub-step
+        .probe6 (bank_q[0]),           // COUNT_WIDTH  per-bank read (scan: mem[scan_cnt])
+        .probe7 (bank_q[1]),           // COUNT_WIDTH
+        .probe8 (bank_q[2]),           // COUNT_WIDTH
+        .probe9 (red1[0]),             // COUNT_WIDTH+3  reduction stage 1 (8->4)
+        .probe10(red2[0]),             // COUNT_WIDTH+3  reduction stage 2 (4->2)
+        .probe11(bin_total_q),         // COUNT_WIDTH+3  reduction stage 3 = per-bin sum
+        .probe12(total),               // COUNT_WIDTH    running grand total (the suspect)
+        .probe13(cumulative),          // COUNT_WIDTH    Q_SCAN cumulative
+        .probe14(q1_bin),              // BIN_IDX_WIDTH
+        .probe15(q3_bin),              // BIN_IDX_WIDTH
+        .probe16(lower_fence),         // VALUE_WIDTH+3
+        .probe17(upper_fence),         // VALUE_WIDTH+3
+        .probe18(dbg_total),           // VALUE_WIDTH    what is shipped to the host CSR
+        .probe19(g_bank[0].s1_we)      // 1  write-side tap (BRAM commit on bank 0)
+    );
+`endif
 
 endmodule
 
