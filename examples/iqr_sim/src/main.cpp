@@ -4,6 +4,7 @@
 // added to vfpga_top.svh (S2).
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -40,7 +41,7 @@ static std::vector<int> model_flags(const std::vector<int64_t> &d, int nb, int b
     return f;
 }
 
-int main() {
+int main(int argc, char **argv) {
     using namespace oasis;
 
     // 1. Context. In sim use a SimpleMemoryPool (host/card memory is simulated); on hardware the
@@ -60,9 +61,21 @@ int main() {
         return 2;
     }
 
-    // 2. Test column: a tight cluster (7..9) with two clear outliers (0 and 15).
-    std::vector<int64_t> data = {0, 7, 8, 8, 9, 7, 8, 9, 8, 7, 9, 8, 7, 8, 9, 15};
+    // 2. SCALING dataset, configurable via argv so sizes can be swept WITHOUT rebuilding:
+    //      ./iqr_sim [N] [MOD]    (defaults N=8192, MOD=10)
+    //    data[i] = i % MOD -> no adjacent same-bin per lane (no coalescing) -> every value is its
+    //    own flush. bin == value (bin_shift=0), so MOD must keep values in-window (small). With the
+    //    LUTRAM fix the histogram is exact: expect total == N for every size.
+    size_t N   = (argc > 1) ? std::strtoul(argv[1], nullptr, 10) : 8192;
+    int    MOD = (argc > 2) ? std::atoi(argv[2]) : 10;
+    if (N == 0) N = 8192;
+    if (MOD <= 0) MOD = 10;
+    std::vector<int64_t> data;
+    data.reserve(N);
+    for (size_t i = 0; i < N; ++i) data.push_back((int64_t)(i % (size_t)MOD));
     const size_t         n    = data.size();
+    std::cout << "dataset: N=" << N << " values, value range 0.." << (MOD - 1)
+              << " (expect total=" << N << ")" << std::endl;
 
     // 3. DMA-mapped input buffer holding the column.
     void *in  = nullptr;

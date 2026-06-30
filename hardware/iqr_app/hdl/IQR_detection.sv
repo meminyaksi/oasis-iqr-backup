@@ -2,8 +2,8 @@
 
 `include "libstf_macros.svh"
 
-// Uncomment to build the count-loss ILA (probes bank-0's BRAM read-modify-write path so the
-// read-after-write hazard can be watched live on silicon). Requires the ila_iqr IP from
+// Uncomment to build the count-loss ILAs (ila_iqr = all-8-bank scan/readback+total; ila_iqr_rmw
+// = all-8-bank BRAM read-modify-write path + wdata_dbg, to watch the drain-commit loss live). From
 // hardware/src/init_ip.tcl and the probe widths there to match (BIN_IDX_WIDTH / COUNT_WIDTH).
 // Leave commented for production bitstreams -- the host-readable counters below need no ILA.
 `define IQR_DEBUG_ILA
@@ -238,10 +238,15 @@ module IQR_detection #(
     // pushes every bank's last run into the BRAM before the quartile scan reads it.
     logic flush_final;   // FSM pulse: commit each bank's pending run at end of pass-1
     for (genvar K = 0; K < NUM_ELEMENTS; K++) begin : g_bank
-        // Force BRAM: at NUM_BINS=256 Vivado otherwise infers distributed LUTRAM
-        // (~2.5k LUTs across 8 banks), which congests the fabric near the shell.
-        (* ram_style = "block" *)
-        logic [COUNT_WIDTH - 1:0]   mem [NUM_BINS];   // histogram bank (BRAM)
+        // Force DISTRIBUTED LUTRAM (not BRAM). Root-caused on silicon (build-06, 2026-06-30):
+        // with ram_style="block" Vivado split the 8 banks into 4 LUTRAM (banks 0-3) + 4 true-dual-
+        // port RAMB36 (banks 4-7). The LUTRAM banks had ZERO count-loss in every test; the BRAM
+        // banks lost ~9% of writes (per-write, proportional, wandering, collisions=0, STA-clean) to
+        // the synchronous-read read-during-write collision that STA can't see. LUTRAM's async read
+        // reads the current value every cycle, so the RMW has no read-latency hazard -> correct.
+        // Forcing all 8 banks to LUTRAM makes every bank behave like the proven-good 0-3.
+        (* ram_style = "distributed" *)
+        logic [COUNT_WIDTH - 1:0]   mem [NUM_BINS];   // histogram bank (distributed LUTRAM)
         logic [COUNT_WIDTH - 1:0]   rd_q;             // registered read data
 
         // Coalescing accumulator: the run currently being counted for this bank.
@@ -258,6 +263,16 @@ module IQR_detection #(
         logic                       s1_we = 1'b0;
         logic [BIN_IDX_WIDTH - 1:0] s1_bin;
         logic [COUNT_WIDTH - 1:0]   s1_delta;
+
+`ifdef IQR_DEBUG_ILA
+        // DEBUG: the literal value driven onto the BRAM DI pin on a commit, `rd_q + s1_delta` -- the
+        // exact net the setup-violation hypothesis is about. Probed by ila_iqr_rmw. If this 32-bit
+        // add violates setup into the BRAM, this value (as the ILA samples it) will DISAGREE with
+        // what the quartile scan later reads back from mem[s1_bin] (bank_q during QUARTILES): the
+        // adder computed the right number, but the BRAM latched a corrupted one.
+        logic [COUNT_WIDTH - 1:0]   wdata_dbg;
+        assign wdata_dbg = rd_q + s1_delta;
+`endif
 
 `ifdef IQR_BRAM_RAW_HAZARD_SIM
         // -- SIM-ONLY: model the silicon BRAM read-after-write hazard ----------------
@@ -456,13 +471,21 @@ module IQR_detection #(
 
     // -- Control FSM ----------------------------------------------------------
     logic       last_seen;
-    logic [2:0] drain_cnt;
+    logic [3:0] drain_cnt;
 
-    // One-cycle pulse during the end-of-pass drain that tells every g_bank to commit
-    // its pending coalesced run to the BRAM. Timed so the last input beat has already
-    // reached the coalescers (2-stage bin-index pipe) and so the resulting RMW commits
-    // a couple cycles before the quartile scan starts (drain_cnt reaches 0).
-    assign flush_final = (state == HISTOGRAM) && last_seen && (drain_cnt == 3'd5);
+    // Drain timing. DRAIN_START set on the last beat; flush_final fires DRAIN_START-2
+    // later (so the 2-stage bin-index pipe has delivered the last beats to the
+    // coalescers), then drain_cnt counts down to 0 before QUARTILES starts reading.
+    // The gap from flush_final->0 is the SETTLE window: it must be long enough that
+    // every bank's final RMW commit has fully landed in BRAM and the read port has
+    // switched off the write address BEFORE the quartile scan reads bin 0. Silicon
+    // (build-06 dual-ILA, 2026-06-30) showed the OLD 5-cycle drain lost the upper
+    // banks' final (drain) commit to a write-vs-first-read TDP collision at the
+    // HISTOGRAM->QUARTILES boundary (bank7 every run, bank5 borderline; bin-independent,
+    // wandering total 12-15/16). Widened to a ~10-cycle settle to clear that collision.
+    localparam logic [3:0] DRAIN_START = 4'd12;
+    localparam logic [3:0] DRAIN_FLUSH = DRAIN_START - 4'd2;   // 2 cycles after the last beat
+    assign flush_final = (state == HISTOGRAM) && last_seen && (drain_cnt == DRAIN_FLUSH);
 
     always_ff @(posedge clk) begin
         logic [COUNT_WIDTH + 2:0]        cum4, tot1, tot3;
@@ -513,14 +536,14 @@ module IQR_detection #(
                         if (in.valid && in.ready && in.last) begin
                             last_seen <= 1'b1;
                             // Drain: let the 2-stage bin-index pipe deliver the last beats to
-                            // the coalescers, then flush_final (at drain_cnt==5) pushes every
-                            // bank's final run into the BRAM, then the RMW commits -- all before
-                            // the quartile scan reads the histogram.
-                            drain_cnt <= 3'd7;
+                            // the coalescers, then flush_final (at DRAIN_FLUSH) pushes every
+                            // bank's final run into the BRAM, then a ~10-cycle settle lets the
+                            // RMW commits fully land before the quartile scan reads the histogram.
+                            drain_cnt <= DRAIN_START;
                         end
                     end else begin
                         // Drain the RMW pipeline before reading the histogram.
-                        if (drain_cnt == 3'd0) begin
+                        if (drain_cnt == 4'd0) begin
                             state      <= QUARTILES;
                             last_seen  <= 1'b0;
                             // Arm the quartile scan.
@@ -532,7 +555,7 @@ module IQR_detection #(
                             q3_found   <= 1'b0;
                             fence_step <= 2'd0;   // arm the pipelined fence computation
                         end else begin
-                            drain_cnt <= drain_cnt - 3'd1;
+                            drain_cnt <= drain_cnt - 4'd1;
                         end
                     end
                 end
@@ -677,28 +700,190 @@ module IQR_detection #(
     // Probe widths MUST match hardware/src/init_ip.tcl. Synthesis-only (breaks xsim) -> comment
     // the `define for co-sim. Trigger on accept_q to capture the whole pass; the scan is long
     // (~NUM_BINS*2 cycles) so to see total accumulate you may trigger on state==QUARTILES instead.
+    // ILA #1 -- SCAN / SUM path: the FULL 8->4->2->1 reduction (every bank read + every
+    // reduction node) so the per-bin grand total can be reconstructed by hand from the probes,
+    // plus the quartile/fence context. (Was 3-of-8 banks + 1-of-4 red1; now all 8 + all of them.)
     ila_iqr inst_ila_iqr (
         .clk    (clk),
         .probe0 (state),               // 2  HISTOGRAM/QUARTILES/FLAG
         .probe1 (q_phase),             // 1  Q_SUM / Q_SCAN
-        .probe2 (scan_cnt),            // BIN_IDX_WIDTH+1  which bin the scan is on
+        .probe2 (scan_cnt),            // 11 which scan step (bin = scan_cnt-SCAN_LAT)
         .probe3 (clearing),            // 1
         .probe4 (accept_q),            // 1  a beat is being binned (pass-1)
         .probe5 (fence_step),          // 2  pipelined-fence sub-step
-        .probe6 (bank_q[0]),           // COUNT_WIDTH  per-bank read (scan: mem[scan_cnt])
-        .probe7 (bank_q[1]),           // COUNT_WIDTH
-        .probe8 (bank_q[2]),           // COUNT_WIDTH
-        .probe9 (red1[0]),             // COUNT_WIDTH+3  reduction stage 1 (8->4)
-        .probe10(red2[0]),             // COUNT_WIDTH+3  reduction stage 2 (4->2)
-        .probe11(bin_total_q),         // COUNT_WIDTH+3  reduction stage 3 = per-bin sum
-        .probe12(total),               // COUNT_WIDTH    running grand total (the suspect)
-        .probe13(cumulative),          // COUNT_WIDTH    Q_SCAN cumulative
-        .probe14(q1_bin),              // BIN_IDX_WIDTH
-        .probe15(q3_bin),              // BIN_IDX_WIDTH
-        .probe16(lower_fence),         // VALUE_WIDTH+3
-        .probe17(upper_fence),         // VALUE_WIDTH+3
-        .probe18(dbg_total),           // VALUE_WIDTH    what is shipped to the host CSR
-        .probe19(g_bank[0].s1_we)      // 1  write-side tap (BRAM commit on bank 0)
+        .probe6 (q_raddr),             // 10 scan read address presented to every bank
+        .probe7 (flush_final),         // 1  end-of-pass drain pulse
+        .probe8 (clear_addr),          // 10 CLEAR sweep address
+        .probe9 (bank_q[0]),           // 32 per-bank scan read mem[q_raddr]
+        .probe10(bank_q[1]),           // 32
+        .probe11(bank_q[2]),           // 32
+        .probe12(bank_q[3]),           // 32
+        .probe13(bank_q[4]),           // 32
+        .probe14(bank_q[5]),           // 32
+        .probe15(bank_q[6]),           // 32
+        .probe16(bank_q[7]),           // 32
+        .probe17(red1[0]),             // 35 reduction stage 1 (8->4)
+        .probe18(red1[1]),             // 35
+        .probe19(red1[2]),             // 35
+        .probe20(red1[3]),             // 35
+        .probe21(red2[0]),             // 35 reduction stage 2 (4->2)
+        .probe22(red2[1]),             // 35
+        .probe23(bin_total_q),         // 35 reduction stage 3 = per-bin 8-bank sum
+        .probe24(total),               // 32 running grand total (the suspect)
+        .probe25(cumulative),          // 32 Q_SCAN cumulative
+        .probe26(q1_bin),              // 10
+        .probe27(q3_bin),              // 10
+        .probe28(lower_fence),         // 67
+        .probe29(upper_fence),         // 67
+        .probe30(dbg_total)            // 64 what is shipped to the host CSR
+    );
+
+    // ILA #2 -- per-bank READ-MODIFY-WRITE path, banks 0..3. Follows a value the whole way:
+    //   lane_idx_q (binned value) -> coalescer (acc_bin/acc_cnt/acc_valid) -> flush request
+    //   (fl_we/fl_bin/fl_delta) -> RMW commit (s1_we/s1_bin/s1_delta) -> BRAM read-back (rd_q)
+    //   at read address (raddr); the value actually written on a commit is rd_q + s1_delta, so the
+    //   write data is reconstructable. hazard_hit flags a flush that read a just-written bin.
+    // Banks 0..3 cover (for the {0,7,8,8,9,...} dataset) the bin-8 lost banks 0 & 3, the bin-8
+    // survived bank 2, and bank 1 (bin-7) as a non-bin8 control. Trigger on flush_final or
+    // g_bank[K].s1_we to catch the drain commits; on accept_q to catch pass-1 binning.
+    ila_iqr_rmw inst_ila_iqr_rmw (
+        .clk    (clk),
+        .probe0 (state),
+        .probe1 (clearing),
+        .probe2 (flush_final),
+        .probe3 (accept_q),
+        .probe4 (last_seen),
+        .probe5 (drain_cnt),
+        .probe6 (scan_cnt),
+        // -- bank 0 --
+        .probe7(g_bank[0].beat),
+        .probe8(lane_idx_q[0]),
+        .probe9(g_bank[0].acc_bin),
+        .probe10(g_bank[0].acc_cnt),
+        .probe11(g_bank[0].acc_valid),
+        .probe12(g_bank[0].fl_we),
+        .probe13(g_bank[0].fl_bin),
+        .probe14(g_bank[0].fl_delta),
+        .probe15(g_bank[0].s1_we),
+        .probe16(g_bank[0].s1_bin),
+        .probe17(g_bank[0].s1_delta),
+        .probe18(g_bank[0].rd_q),
+        .probe19(g_bank[0].raddr),
+        .probe20(g_bank[0].hazard_hit),
+        // -- bank 1 --
+        .probe21(g_bank[1].beat),
+        .probe22(lane_idx_q[1]),
+        .probe23(g_bank[1].acc_bin),
+        .probe24(g_bank[1].acc_cnt),
+        .probe25(g_bank[1].acc_valid),
+        .probe26(g_bank[1].fl_we),
+        .probe27(g_bank[1].fl_bin),
+        .probe28(g_bank[1].fl_delta),
+        .probe29(g_bank[1].s1_we),
+        .probe30(g_bank[1].s1_bin),
+        .probe31(g_bank[1].s1_delta),
+        .probe32(g_bank[1].rd_q),
+        .probe33(g_bank[1].raddr),
+        .probe34(g_bank[1].hazard_hit),
+        // -- bank 2 --
+        .probe35(g_bank[2].beat),
+        .probe36(lane_idx_q[2]),
+        .probe37(g_bank[2].acc_bin),
+        .probe38(g_bank[2].acc_cnt),
+        .probe39(g_bank[2].acc_valid),
+        .probe40(g_bank[2].fl_we),
+        .probe41(g_bank[2].fl_bin),
+        .probe42(g_bank[2].fl_delta),
+        .probe43(g_bank[2].s1_we),
+        .probe44(g_bank[2].s1_bin),
+        .probe45(g_bank[2].s1_delta),
+        .probe46(g_bank[2].rd_q),
+        .probe47(g_bank[2].raddr),
+        .probe48(g_bank[2].hazard_hit),
+        // -- bank 3 --
+        .probe49(g_bank[3].beat),
+        .probe50(lane_idx_q[3]),
+        .probe51(g_bank[3].acc_bin),
+        .probe52(g_bank[3].acc_cnt),
+        .probe53(g_bank[3].acc_valid),
+        .probe54(g_bank[3].fl_we),
+        .probe55(g_bank[3].fl_bin),
+        .probe56(g_bank[3].fl_delta),
+        .probe57(g_bank[3].s1_we),
+        .probe58(g_bank[3].s1_bin),
+        .probe59(g_bank[3].s1_delta),
+        .probe60(g_bank[3].rd_q),
+        .probe61(g_bank[3].raddr),
+        .probe62(g_bank[3].hazard_hit),
+        // -- bank 4 --
+        .probe63(g_bank[4].beat),
+        .probe64(lane_idx_q[4]),
+        .probe65(g_bank[4].acc_bin),
+        .probe66(g_bank[4].acc_cnt),
+        .probe67(g_bank[4].acc_valid),
+        .probe68(g_bank[4].fl_we),
+        .probe69(g_bank[4].fl_bin),
+        .probe70(g_bank[4].fl_delta),
+        .probe71(g_bank[4].s1_we),
+        .probe72(g_bank[4].s1_bin),
+        .probe73(g_bank[4].s1_delta),
+        .probe74(g_bank[4].rd_q),
+        .probe75(g_bank[4].raddr),
+        .probe76(g_bank[4].hazard_hit),
+        // -- bank 5 --
+        .probe77(g_bank[5].beat),
+        .probe78(lane_idx_q[5]),
+        .probe79(g_bank[5].acc_bin),
+        .probe80(g_bank[5].acc_cnt),
+        .probe81(g_bank[5].acc_valid),
+        .probe82(g_bank[5].fl_we),
+        .probe83(g_bank[5].fl_bin),
+        .probe84(g_bank[5].fl_delta),
+        .probe85(g_bank[5].s1_we),
+        .probe86(g_bank[5].s1_bin),
+        .probe87(g_bank[5].s1_delta),
+        .probe88(g_bank[5].rd_q),
+        .probe89(g_bank[5].raddr),
+        .probe90(g_bank[5].hazard_hit),
+        // -- bank 6 --
+        .probe91(g_bank[6].beat),
+        .probe92(lane_idx_q[6]),
+        .probe93(g_bank[6].acc_bin),
+        .probe94(g_bank[6].acc_cnt),
+        .probe95(g_bank[6].acc_valid),
+        .probe96(g_bank[6].fl_we),
+        .probe97(g_bank[6].fl_bin),
+        .probe98(g_bank[6].fl_delta),
+        .probe99(g_bank[6].s1_we),
+        .probe100(g_bank[6].s1_bin),
+        .probe101(g_bank[6].s1_delta),
+        .probe102(g_bank[6].rd_q),
+        .probe103(g_bank[6].raddr),
+        .probe104(g_bank[6].hazard_hit),
+        // -- bank 7 --
+        .probe105(g_bank[7].beat),
+        .probe106(lane_idx_q[7]),
+        .probe107(g_bank[7].acc_bin),
+        .probe108(g_bank[7].acc_cnt),
+        .probe109(g_bank[7].acc_valid),
+        .probe110(g_bank[7].fl_we),
+        .probe111(g_bank[7].fl_bin),
+        .probe112(g_bank[7].fl_delta),
+        .probe113(g_bank[7].s1_we),
+        .probe114(g_bank[7].s1_bin),
+        .probe115(g_bank[7].s1_delta),
+        .probe116(g_bank[7].rd_q),
+        .probe117(g_bank[7].raddr),
+        .probe118(g_bank[7].hazard_hit),
+        // -- BRAM write-data taps (rd_q+s1_delta on the DI pin) banks 0..7 --
+        .probe119(g_bank[0].wdata_dbg),
+        .probe120(g_bank[1].wdata_dbg),
+        .probe121(g_bank[2].wdata_dbg),
+        .probe122(g_bank[3].wdata_dbg),
+        .probe123(g_bank[4].wdata_dbg),
+        .probe124(g_bank[5].wdata_dbg),
+        .probe125(g_bank[6].wdata_dbg),
+        .probe126(g_bank[7].wdata_dbg)
     );
 `endif
 
