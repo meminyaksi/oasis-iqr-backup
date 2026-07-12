@@ -18,13 +18,14 @@
 namespace oasis {
 
 IqrRunner::IqrRunner(OasisContext &ctx, bool is_signed, bool auto_window, int64_t bin_min,
-                     uint64_t bin_shift)
+                     uint64_t bin_shift, bool use_card)
     : ctx_(ctx),
       iqr_config_(ctx.config<IqrConfig>()),
       is_signed_(is_signed),
       auto_window_(auto_window),
       bin_min_(bin_min),
-      bin_shift_(bin_shift) {
+      bin_shift_(bin_shift),
+      use_card_(use_card) {
     // Signedness follows the column type and can be set now. The window (bin_min/bin_shift) is
     // written in run(), after it is (optionally) derived from the data.
     iqr_config_->set_signed(is_signed_);
@@ -93,13 +94,43 @@ void IqrRunner::derive_window(const std::vector<InputChunk> &inputs) {
     bin_shift_ = shift;
 }
 
-void IqrRunner::stream_pass(const std::vector<InputChunk> &inputs) {
+void IqrRunner::stream_pass(const std::vector<InputChunk> &inputs, uint32_t strm_kind, int64_t dest) {
     size_t last = inputs.size() - 1;
     for (size_t i = 0; i < inputs.size(); ++i) {
         bool is_last = (i == last);
         libstf::enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), inputs[i].first,
-                                     inputs[i].second, ctx_.iqrStream(), is_last);
+                                     inputs[i].second, static_cast<libstf::stream_t>(dest), is_last,
+                                     strm_kind);
     }
+}
+
+std::shared_ptr<libstf::Buffer> IqrRunner::stage_to_card(const std::vector<InputChunk> &inputs) {
+    // One contiguous host buffer holding the whole decoded column...
+    size_t total = 0;
+    for (const auto &c : inputs) {
+        total += c.second;
+    }
+    void *ptr    = nullptr;
+    auto  status = ctx_.memory_pool()->allocate(total, &ptr);
+    if (!status.ok()) {
+        throw std::runtime_error("IqrRunner: card staging allocation failed: " + status.message());
+    }
+    size_t off = 0;
+    for (const auto &c : inputs) {
+        std::memcpy(static_cast<std::byte *>(ptr) + off, c.first, c.second);
+        off += c.second;
+    }
+
+    // ...migrated to HBM. After LOCAL_OFFLOAD the vaddr `ptr` is card-resident, so both passes read
+    // it with STRM_CARD (no host round-trip). The caller's original host buffers are untouched and
+    // still back the value-column output.
+    ctx_.tlb_manager()->ensure_tlb_mapping(ptr, total);
+    coyote::syncSg sg;
+    sg.addr = ptr;
+    sg.len  = total;
+    ctx_.cthread()->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, sg);
+
+    return libstf::make_buffer(ctx_.memory_pool(), ptr, total, total);
 }
 
 IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
@@ -118,6 +149,22 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     iqr_config_->set_bin_shift(bin_shift_);
     result.bin_min = bin_min_;
     result.bin_shift = bin_shift_;
+
+    // 1b. Choose the input source for the two passes. Card mode stages the decoded column into HBM
+    // ONCE (derive_window above already read it on the host, so this must come after) and both passes
+    // then read it locally at ~HBM bandwidth instead of re-DMAing it from the host twice. The device
+    // mux is switched via the use_card CSR; host mode is the unchanged legacy path.
+    std::shared_ptr<libstf::Buffer> card_buf;
+    std::vector<InputChunk>         card_inputs;
+    const std::vector<InputChunk>  *pass_inputs = &inputs;
+    if (use_card_) {
+        card_buf    = stage_to_card(inputs);
+        card_inputs = {{card_buf->ptr, card_buf->size}};
+        pass_inputs = &card_inputs;
+    }
+    iqr_config_->set_use_card(use_card_);
+    const uint32_t strm_kind = use_card_ ? coyote::STRM_CARD : coyote::STRM_HOST;
+    const int64_t  dest      = use_card_ ? CARD_STREAM : static_cast<int64_t>(ctx_.iqrStream());
 
     // 2. Flag output size. The device packs the flags into a dense bitmask (1 bit/element) emitted as
     // full 512-bit (= NUM_TUPLES*64) beats, so the output is ceil(N/512) 64-byte beats -- 64x smaller
@@ -150,8 +197,8 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
 
     // 5. Two-pass input (LOCAL_READ x2 via enqueue_stream_input): pass 1 builds the histogram, pass 2
     // re-streams the column and the operator emits the packed flags.
-    stream_pass(inputs); // pass 1: HISTOGRAM
-    stream_pass(inputs); // pass 2: FLAG
+    stream_pass(*pass_inputs, strm_kind, dest); // pass 1: HISTOGRAM
+    stream_pass(*pass_inputs, strm_kind, dest); // pass 2: FLAG
 
     // 6. Drain the flag buffer(s) the FPGA wrote. handle->next() blocks on the completion interrupt
     // and returns nullptr once the transfer is fully drained.

@@ -17,6 +17,12 @@ option(ENABLE_RDMA "Enable RDMA stack" ON)
 set(N_REGIONS 1)
 set(EN_STRM 1)
 
+# Enable card-memory (HBM) streams so the IQR passes can read the decoded column from HBM instead
+# of re-DMAing it from the host each pass. Adds axis_card_recv/send to the vFPGA + the HBM DMA path
+# to the shell (and the EN_MEM-gated card model to the co-sim). N_CARD_AXI defaults to 1.
+set(EN_MEM 1)
+set(N_CARD_AXI 1)
+
 if(ENABLE_RDMA)
     math(EXPR N_STREAMS "${N_DECODERS} + 1")
     set(EN_RDMA 1)

@@ -98,6 +98,11 @@ class IqrConfig : public libstf::Config {
     // Re-arm the histogram clear sweep so the next run starts from a zeroed histogram.
     void clear_histogram()             { write_register(libstf::ConfigRegister(3, 1u)); }
 
+    // Select the IQR input source for both passes: false = host DMA (legacy), true = card/HBM.
+    // When true, the host must first stage the decoded column into HBM (LOCAL_OFFLOAD) so the
+    // device reads it locally instead of re-DMAing from the host each pass.
+    void set_use_card(bool use_card)   { write_register(libstf::ConfigRegister(4, use_card ? 1u : 0u)); }
+
     static constexpr uint64_t ID = IQR_CONFIG_ID;
 };
 

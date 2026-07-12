@@ -21,7 +21,7 @@ import oasis::IQR_CONFIG_ID;
 //   read  1 = dbg_accepted         write 1 = bin_shift
 //   read  2 = dbg_committed        write 2 = is_signed
 //   read  3 = dbg_flushes          write 3 = clear pulse
-//   read  4 = dbg_collisions
+//   read  4 = dbg_collisions       write 4 = use_card (0=host DMA, 1=card/HBM input)
 //   read  5 = dbg_total (histogram grand total of the last run)
 //   read  6 = clear_seq (clear-completion counter)
 //   read  7..10 = input  StreamProfiler: handshakes / starved / stalled / idle cycles
@@ -57,7 +57,12 @@ module IqrConfig (
     output logic [63:0] bin_min,
     output logic [63:0] bin_shift,
     output logic        is_signed,
-    output logic        clear_req
+    output logic        clear_req,
+
+    // Data source select for the IQR input passes: 0 = host DMA (axis_host_recv, legacy),
+    // 1 = card/HBM (axis_card_recv). The host stages the decoded column into HBM (LOCAL_OFFLOAD)
+    // and sets this so both passes read from HBM instead of re-DMAing from the host.
+    output logic        use_card
 );
 
 `RESET_RESYNC // Reset pipelining
@@ -102,6 +107,13 @@ ConfigWriteRegister #(2, logic [63:0]) inst_is_signed (
     .clk(clk), .write_config(write_config), .data(is_signed_reg)
 );
 assign is_signed = is_signed_reg[0];
+
+// reg 4 = use_card: input data source select (0 = host DMA, 1 = card/HBM). Held stable for a run.
+logic [63:0] use_card_reg;
+ConfigWriteRegister #(4, logic [63:0]) inst_use_card (
+    .clk(clk), .write_config(write_config), .data(use_card_reg)
+);
+assign use_card = use_card_reg[0];
 
 // reg 3 = clear pulse: assert clear_req for one cycle when written.
 always_ff @(posedge clk) begin

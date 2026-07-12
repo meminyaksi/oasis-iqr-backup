@@ -165,10 +165,13 @@ end
 localparam int IQR_LANE         = NUM_STREAMS - 1;
 localparam int IQR_NUM_ELEMENTS = DATABEAT_SIZE / 8;   // 8 int64 per 512-bit beat
 
+// IQR input source: host DMA (legacy) or card/HBM (axis_card_recv), selected by the use_card CSR.
+logic iqr_use_card;  // driven by inst_iqr_config.use_card
+
 AXI4S iqr_axi_in (.aclk(clk), .aresetn(rst_n));
 `AXIS_ASSIGN(axis_host_recv[IQR_LANE], iqr_axi_in)
 
-ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_in();
+ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_host();
 LocalRead #(
     .AXI_STRM_ID(IQR_LANE),
     .DATABEAT_SIZE(DATABEAT_SIZE)
@@ -180,8 +183,47 @@ LocalRead #(
     .sq_rd(sq_rd_strm[IQR_LANE]),
 
     .in(iqr_axi_in),
-    .out(iqr_bytes_in)
+    .out(iqr_bytes_host)
 );
+
+ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_in();
+
+`ifdef EN_MEM
+// Card/HBM source: staged column arrives on axis_card_recv[0] (receive only, no sq_rd).
+AXI4S iqr_card_axi (.aclk(clk), .aresetn(rst_n));
+`AXIS_ASSIGN(axis_card_recv[0], iqr_card_axi)
+
+ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_card();
+AXIToNData #(
+    .data_t(data8_t),
+    .NUM_ELEMENTS(DATABEAT_SIZE)
+) inst_iqr_card_recv (
+    .clk(clk),
+    .rst_n(rst_n),
+    .in(iqr_card_axi),
+    .out(iqr_bytes_card)
+);
+
+for (genvar C = 0; C < N_CARD_AXI; C++) begin : g_iqr_card_send_tie
+    always_comb axis_card_send[C].tie_off_m();
+end
+for (genvar C = 1; C < N_CARD_AXI; C++) begin : g_iqr_card_recv_tie
+    always_comb axis_card_recv[C].tie_off_s();
+end
+
+assign iqr_bytes_in.data    = iqr_use_card ? iqr_bytes_card.data  : iqr_bytes_host.data;
+assign iqr_bytes_in.keep    = iqr_use_card ? iqr_bytes_card.keep  : iqr_bytes_host.keep;
+assign iqr_bytes_in.last    = iqr_use_card ? iqr_bytes_card.last  : iqr_bytes_host.last;
+assign iqr_bytes_in.valid   = iqr_use_card ? iqr_bytes_card.valid : iqr_bytes_host.valid;
+assign iqr_bytes_host.ready = iqr_use_card ? 1'b0 : iqr_bytes_in.ready;
+assign iqr_bytes_card.ready = iqr_use_card ? iqr_bytes_in.ready : 1'b0;
+`else
+assign iqr_bytes_in.data    = iqr_bytes_host.data;
+assign iqr_bytes_in.keep    = iqr_bytes_host.keep;
+assign iqr_bytes_in.last    = iqr_bytes_host.last;
+assign iqr_bytes_in.valid   = iqr_bytes_host.valid;
+assign iqr_bytes_host.ready = iqr_bytes_in.ready;
+`endif
 
 // data8 ndata (64 lanes) -> data64 ndata (8 lanes): same 512 bits; regroup keep (8 bytes -> 1 elem).
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_in();
@@ -237,7 +279,8 @@ IqrConfig inst_iqr_config (
     .bin_min(iqr_bin_min),
     .bin_shift(iqr_bin_shift_w),
     .is_signed(iqr_is_signed),
-    .clear_req(iqr_clear_req)
+    .clear_req(iqr_clear_req),
+    .use_card(iqr_use_card)
 );
 
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_flags_nd();

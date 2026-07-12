@@ -88,7 +88,14 @@ int main(int argc, char **argv) {
     std::memcpy(in, data.data(), n * sizeof(int64_t));
 
     // 4. Run IQR: explicit window (bin_min=0, bin_shift=0), unsigned -- matches the model below.
-    IqrRunner runner(ctx, /*is_signed=*/false, /*auto_window=*/false, /*bin_min=*/0, /*bin_shift=*/0);
+    // OASIS_IQR_USE_CARD=1 exercises the HBM path: stage the column in card memory and read both
+    // passes with STRM_CARD (needs an EN_MEM sim/bitstream). Default off = legacy host path.
+    const char *card_env = std::getenv("OASIS_IQR_USE_CARD");
+    const bool  use_card = card_env && (card_env[0] == '1' || card_env[0] == 't' || card_env[0] == 'T');
+    std::cout << "input source: " << (use_card ? "card/HBM (STRM_CARD)" : "host (STRM_HOST)") << "\n";
+
+    IqrRunner runner(ctx, /*is_signed=*/false, /*auto_window=*/false, /*bin_min=*/0, /*bin_shift=*/0,
+                     use_card);
     auto      res = runner.run({{in, n * sizeof(int64_t)}});
 
     // Count-loss diagnostics: the chain N >= accepted >= committed >= total pinpoints any loss

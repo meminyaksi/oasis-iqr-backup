@@ -13,6 +13,7 @@
 #include "parquet_reader.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -167,7 +168,15 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
         return; // empty column -> no rows, no flags
     }
 
-    oasis::IqrRunner runner(ctx, bind.is_signed, /*auto_window=*/true);
+    // OASIS_IQR_USE_CARD=1 stages the decoded column in HBM and reads both passes from card memory
+    // instead of re-DMAing from the host (needs an EN_MEM bitstream). Off by default (legacy host path).
+    static const bool use_card = [] {
+        const char *e = std::getenv("OASIS_IQR_USE_CARD");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+
+    oasis::IqrRunner runner(ctx, bind.is_signed, /*auto_window=*/true, /*bin_min=*/0, /*bin_shift=*/0,
+                            use_card);
     auto             res = runner.run({{gstate.values->ptr, n * sizeof(int64_t)}});
     gstate.flags         = res.flags;
 }

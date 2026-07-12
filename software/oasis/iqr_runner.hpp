@@ -77,7 +77,7 @@ class IqrRunner {
      * @param bin_shift    explicit bin width = 2**bin_shift     (used only when auto_window == false).
      */
     IqrRunner(OasisContext &ctx, bool is_signed, bool auto_window, int64_t bin_min = 0,
-              uint64_t bin_shift = 0);
+              uint64_t bin_shift = 0, bool use_card = false);
 
     /**
      * Streams `inputs` through both passes and returns the packed outlier bitmask. The chunks are
@@ -94,10 +94,13 @@ class IqrRunner {
     bool     auto_window_;
     int64_t  bin_min_;
     uint64_t bin_shift_;
+    bool     use_card_;   // read the two passes from card/HBM instead of re-DMAing from the host
 
     // Histogram bin count baked into the bitstream (must match the vFPGA top's IQR_NUM_BINS).
     static constexpr int64_t NUM_BINS      = 1024;
     static constexpr size_t  SAMPLE_TARGET = 8192;   // ~rows sampled to size the window
+    // Card stream index the HBM-staged column is read on (matches axis_card_recv[0] in vfpga_top).
+    static constexpr int64_t CARD_STREAM   = 0;
 
     // Counts total int64 elements across all chunks.
     static size_t count_elements(const std::vector<InputChunk> &inputs);
@@ -106,8 +109,14 @@ class IqrRunner {
     // stray outlier cannot blow up the bin width. Port of celeris::IqrOperator::derive_window.
     void derive_window(const std::vector<InputChunk> &inputs);
 
-    // Streams every chunk once on stream 0, asserting `last` exactly on the final chunk.
-    void stream_pass(const std::vector<InputChunk> &inputs);
+    // Streams every chunk once, asserting `last` exactly on the final chunk. `strm_kind`/`dest`
+    // select host vs card (STRM_HOST + iqrStream, or STRM_CARD + CARD_STREAM).
+    void stream_pass(const std::vector<InputChunk> &inputs, uint32_t strm_kind, int64_t dest);
+
+    // Card mode: copy the decoded chunks into one host buffer and migrate it to HBM (LOCAL_OFFLOAD),
+    // leaving the caller's original host buffers intact (they still back the value-column output).
+    // Returns the staged buffer (its ptr is the card-resident vaddr the passes read).
+    std::shared_ptr<libstf::Buffer> stage_to_card(const std::vector<InputChunk> &inputs);
 };
 
 } // namespace oasis
