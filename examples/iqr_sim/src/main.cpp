@@ -103,6 +103,21 @@ int main(int argc, char **argv) {
     if (res.histogram_total < res.committed)
         std::cout << "  -> LOSS in BRAM read-modify-write hazard (total < committed), collisions="
                   << res.collisions << "\n";
+
+    // StreamProfiler cycle breakdown (new). input aggregates both passes; output is the flag emit.
+    // starved dominating the input => host/DMA-bound (the round-trip HBM staging targets).
+    auto pct = [](uint64_t part, uint64_t whole) { return whole ? (100.0 * part / whole) : 0.0; };
+    const auto &pi = res.input_profile, &po = res.output_profile;
+    uint64_t in_tot  = pi.handshakes + pi.starved + pi.stalled + pi.idle;
+    uint64_t out_tot = po.handshakes + po.starved + po.stalled + po.idle;
+    std::cout << "stream profile [input ]: handshakes=" << pi.handshakes
+              << " starved="  << pi.starved  << " (" << pct(pi.starved, in_tot)  << "%)"
+              << " stalled="  << pi.stalled  << " (" << pct(pi.stalled, in_tot)  << "%)"
+              << " idle="     << pi.idle     << "\n"
+              << "stream profile [output]: handshakes=" << po.handshakes
+              << " starved="  << po.starved  << " (" << pct(po.starved, out_tot) << "%)"
+              << " stalled="  << po.stalled  << " (" << pct(po.stalled, out_tot) << "%)"
+              << " idle="     << po.idle     << "\n";
     std::cout << std::flush;
 
     // 5. Unpack the packed flag bitmask: element i -> byte i/8, bit i%8 (LSB-first).

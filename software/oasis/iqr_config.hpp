@@ -33,6 +33,8 @@ constexpr uint64_t IQR_CONFIG_ID = 0x4951524445544354ull;
  *     reg 4 = collisions (flush-reads that hit a just-written bin -- direct hazard evidence)
  *     reg 5 = histogram grand total of the last run (debug: == N iff banks were zeroed)
  *     reg 6 = clear-completion counter (advances once per finished host clear sweep)
+ *     reg  7..10 = input  StreamProfiler cycles: handshakes / starved / stalled / idle
+ *     reg 11..14 = output StreamProfiler cycles: handshakes / starved / stalled / idle
  *
  *   The chain  N >= accepted >= committed >= total  localizes where pass-1 counts are lost:
  *   accepted<N -> input/DMA; committed<accepted -> coalescing; total<committed -> BRAM RMW hazard.
@@ -70,6 +72,22 @@ class IqrConfig : public libstf::Config {
     // Clear-completion counter: advances once per completed host clear sweep. Used to fence the
     // posted clear write ahead of the input DMA (see IqrRunner::run).
     uint64_t clear_seq()        { return read_register(6).value(); }
+
+    // -- read side: StreamProfiler cycle counters ------------------------------------------------
+    // Free-running per-stream profilers on the IQR input and output. Counters accumulate across a
+    // run's two passes and are re-zeroed by the next run's first input beat, so read them AFTER the
+    // passes complete (IqrRunner::run does). Reading: handshakes = productive (valid && ready);
+    // starved = ready && !valid (waiting on host/DMA -- the round-trip we target with HBM); stalled
+    // = valid && !ready (back-pressured); idle = cycles between the two passes.
+    struct StreamProfile { uint64_t handshakes, starved, stalled, idle; };
+    StreamProfile input_profile() {
+        return {read_register(7).value(),  read_register(8).value(),
+                read_register(9).value(),  read_register(10).value()};
+    }
+    StreamProfile output_profile() {
+        return {read_register(11).value(), read_register(12).value(),
+                read_register(13).value(), read_register(14).value()};
+    }
 
     // -- write side: runtime window parameters + control -----------------------------------------
     // bin_min is sent as its raw 64-bit pattern (the HW interprets it signed when set_signed(true)).

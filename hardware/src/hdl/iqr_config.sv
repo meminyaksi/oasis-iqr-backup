@@ -24,6 +24,10 @@ import oasis::IQR_CONFIG_ID;
 //   read  4 = dbg_collisions
 //   read  5 = dbg_total (histogram grand total of the last run)
 //   read  6 = clear_seq (clear-completion counter)
+//   read  7..10 = input  StreamProfiler: handshakes / starved / stalled / idle cycles
+//   read 11..14 = output StreamProfiler: handshakes / starved / stalled / idle cycles
+// The profiler counters accumulate across both passes of a run and are re-zeroed by the next run's
+// first input beat, so the host reads them after the passes complete (see iqr_runner / iqr_config.hpp).
 module IqrConfig (
     input logic clk,
     input logic rst_n,
@@ -38,6 +42,16 @@ module IqrConfig (
     input logic [63:0] dbg_collisions,
     input logic [63:0] dbg_total,
     input logic [63:0] clear_seq,
+
+    // StreamProfiler cycle counters for the IQR input and output streams (tapped in the top).
+    input logic [63:0] prof_in_handshakes,
+    input logic [63:0] prof_in_starved,
+    input logic [63:0] prof_in_stalled,
+    input logic [63:0] prof_in_idle,
+    input logic [63:0] prof_out_handshakes,
+    input logic [63:0] prof_out_starved,
+    input logic [63:0] prof_out_stalled,
+    input logic [63:0] prof_out_idle,
 
     // Runtime window outputs, driven to IQR_detection.
     output logic [63:0] bin_min,
@@ -57,6 +71,14 @@ assign values[3] = dbg_flushes;
 assign values[4] = dbg_collisions;
 assign values[5] = dbg_total;
 assign values[6] = clear_seq;
+assign values[7]  = prof_in_handshakes;
+assign values[8]  = prof_in_starved;
+assign values[9]  = prof_in_stalled;
+assign values[10] = prof_in_idle;
+assign values[11] = prof_out_handshakes;
+assign values[12] = prof_out_starved;
+assign values[13] = prof_out_stalled;
+assign values[14] = prof_out_idle;
 
 ConfigReadRegisterFile #(
     .NUM_REGS(NUM_IQR_CONFIG_REGS)

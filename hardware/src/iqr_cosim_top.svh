@@ -193,6 +193,21 @@ for (genvar K = 0; K < IQR_NUM_ELEMENTS; K++) begin : g_iqr_keep_in
     assign iqr_in.keep[K] = &iqr_bytes_in.keep[K * 8 +: 8];
 end
 
+// -- StreamProfiler taps (mirror of the production top so co-sim exercises them) -------------------
+stream_profile_i iqr_profile_in();
+stream_profile_i iqr_profile_out();
+assign iqr_profile_in.stop  = 1'b0;
+assign iqr_profile_out.stop = 1'b0;
+
+StreamProfiler inst_iqr_profile_in (
+    .clk(clk),
+    .rst_n(rst_n),
+    .last (iqr_in.last),
+    .valid(iqr_in.valid),
+    .ready(iqr_in.ready),
+    .profile(iqr_profile_in)
+);
+
 // IQR config block (config 3): window CSRs in, profiler/debug out.
 logic [63:0] iqr_bin_min, iqr_bin_shift_w, iqr_dbg_total, iqr_dbg_clear_seq;
 logic        iqr_is_signed, iqr_clear_req;
@@ -209,6 +224,15 @@ IqrConfig inst_iqr_config (
     .dbg_collisions(64'd0),
     .dbg_total(iqr_dbg_total),
     .clear_seq(iqr_dbg_clear_seq),
+
+    .prof_in_handshakes (iqr_profile_in.counters.handshakes_cycles),
+    .prof_in_starved    (iqr_profile_in.counters.starved_cycles),
+    .prof_in_stalled    (iqr_profile_in.counters.stalled_cycles),
+    .prof_in_idle       (iqr_profile_in.counters.idle_cycles),
+    .prof_out_handshakes(iqr_profile_out.counters.handshakes_cycles),
+    .prof_out_starved   (iqr_profile_out.counters.starved_cycles),
+    .prof_out_stalled   (iqr_profile_out.counters.stalled_cycles),
+    .prof_out_idle      (iqr_profile_out.counters.idle_cycles),
 
     .bin_min(iqr_bin_min),
     .bin_shift(iqr_bin_shift_w),
@@ -247,6 +271,15 @@ FlagBitPacker #(
 
     .in(iqr_flags_nd),
     .out(iqr_packed)
+);
+
+StreamProfiler inst_iqr_profile_out (
+    .clk(clk),
+    .rst_n(rst_n),
+    .last (iqr_packed.last),
+    .valid(iqr_packed.valid),
+    .ready(iqr_packed.ready),
+    .profile(iqr_profile_out)
 );
 
 ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_out();

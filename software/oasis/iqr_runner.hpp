@@ -60,6 +60,12 @@ class IqrRunner {
         uint64_t committed  = 0;
         uint64_t flushes    = 0;
         uint64_t collisions = 0;
+
+        // StreamProfiler cycle breakdown (read after both passes). input_* aggregates the histogram
+        // + flag input streams; output_* is the flag emission. starved dominating input => the path
+        // is host/DMA-bound (the round-trip HBM staging targets); stalled dominating => back-pressured.
+        IqrConfig::StreamProfile input_profile  = {};
+        IqrConfig::StreamProfile output_profile = {};
     };
 
     /**

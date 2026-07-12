@@ -264,6 +264,24 @@ for (genvar K = 0; K < IQR_NUM_ELEMENTS; K++) begin : g_iqr_keep_in
     assign iqr_in.keep[K] = &iqr_bytes_in.keep[K * 8 +: 8];
 end
 
+// -- StreamProfiler taps on the IQR input (both passes) and output (flag emission) ----------------
+// Free-running (stop tied low): counters accumulate over a run and re-zero on the next run's first
+// beat. Host reads them via the IQR CSRs after the passes. starved => waiting on host/DMA (the
+// round-trip we are optimizing); stalled => back-pressured by the output writer.
+stream_profile_i iqr_profile_in();
+stream_profile_i iqr_profile_out();
+assign iqr_profile_in.stop  = 1'b0;
+assign iqr_profile_out.stop = 1'b0;
+
+StreamProfiler inst_iqr_profile_in (
+    .clk(clk),
+    .rst_n(rst_n),
+    .last (iqr_in.last),
+    .valid(iqr_in.valid),
+    .ready(iqr_in.ready),
+    .profile(iqr_profile_in)
+);
+
 // IQR config block (config 3): window CSRs in, count-loss diagnostics + debug out.
 logic [63:0] iqr_bin_min, iqr_bin_shift_w, iqr_dbg_total, iqr_dbg_clear_seq;
 logic [63:0] iqr_dbg_accepted, iqr_dbg_committed, iqr_dbg_flushes, iqr_dbg_collisions;
@@ -281,6 +299,15 @@ IqrConfig inst_iqr_config (
     .dbg_collisions(iqr_dbg_collisions),
     .dbg_total(iqr_dbg_total),
     .clear_seq(iqr_dbg_clear_seq),
+
+    .prof_in_handshakes (iqr_profile_in.counters.handshakes_cycles),
+    .prof_in_starved    (iqr_profile_in.counters.starved_cycles),
+    .prof_in_stalled    (iqr_profile_in.counters.stalled_cycles),
+    .prof_in_idle       (iqr_profile_in.counters.idle_cycles),
+    .prof_out_handshakes(iqr_profile_out.counters.handshakes_cycles),
+    .prof_out_starved   (iqr_profile_out.counters.starved_cycles),
+    .prof_out_stalled   (iqr_profile_out.counters.stalled_cycles),
+    .prof_out_idle      (iqr_profile_out.counters.idle_cycles),
 
     .bin_min(iqr_bin_min),
     .bin_shift(iqr_bin_shift_w),
@@ -324,6 +351,16 @@ FlagBitPacker #(
 
     .in(iqr_flags_nd),
     .out(iqr_packed)
+);
+
+// Profile the packed-flag output stream (back-pressure from the output writer / host DMA).
+StreamProfiler inst_iqr_profile_out (
+    .clk(clk),
+    .rst_n(rst_n),
+    .last (iqr_packed.last),
+    .valid(iqr_packed.valid),
+    .ready(iqr_packed.ready),
+    .profile(iqr_profile_out)
 );
 
 // data64 ndata -> data8 ndata for the output writer.

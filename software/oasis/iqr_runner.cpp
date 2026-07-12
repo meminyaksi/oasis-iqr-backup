@@ -186,6 +186,10 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     result.committed       = iqr_config_->committed();
     result.flushes         = iqr_config_->flushes();
     result.collisions      = iqr_config_->collisions();
+
+    // Stream-utilization breakdown (read now, before the next run's first beat re-zeroes them).
+    result.input_profile  = iqr_config_->input_profile();
+    result.output_profile = iqr_config_->output_profile();
     return result;
 }
 
