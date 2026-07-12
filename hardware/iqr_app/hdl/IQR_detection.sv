@@ -6,7 +6,7 @@
 // = all-8-bank BRAM read-modify-write path + wdata_dbg, to watch the drain-commit loss live). From
 // hardware/src/init_ip.tcl and the probe widths there to match (BIN_IDX_WIDTH / COUNT_WIDTH).
 // Leave commented for production bitstreams -- the host-readable counters below need no ILA.
-`define IQR_DEBUG_ILA
+// `define IQR_DEBUG_ILA   // ILAs OFF for the lean production bitstream (re-enable to debug)
 
 module IQR_detection #(
     parameter type value_t,

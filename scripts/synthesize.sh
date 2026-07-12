@@ -15,6 +15,9 @@ Options:
   --decoders N         Number of ColumnChunkDecoders (default: 1).
   --device NAME        Target FPGA device: u55c, v80, ... (default: u55c).
   --v80                Shortcut for --device v80 (Alveo V80).
+  --cores N            Parallel synthesis jobs / Vivado COMP_CORES (default: 32).
+                       Speeds the (parallel) synthesis phase; place&route is a
+                       single ~8-thread run and is NOT sped up by this.
   -h, --help           Show this help message and exit.
 
 Examples:
@@ -27,6 +30,7 @@ EOF
 cmake_args=()
 decoders=1
 device=u55c
+cores=32
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
@@ -36,11 +40,13 @@ while [ $# -gt 0 ]; do
         --v80) device=v80 ;;
         --device) device="$2"; shift ;;
         --device=*) device="${1#*=}" ;;
+        --cores) cores="$2"; shift ;;
+        --cores=*) cores="${1#*=}" ;;
         *) echo "Unknown argument: $1" >&2; echo "" >&2; usage >&2; exit 1 ;;
     esac
     shift
 done
-cmake_args+=(-DN_DECODERS="$decoders" -DFDEV_NAME="$device")
+cmake_args+=(-DN_DECODERS="$decoders" -DFDEV_NAME="$device" -DCOMP_CORES="$cores")
 
 pushd hardware
 
