@@ -268,6 +268,17 @@ the very outliers being detected). See `IQR_OPTIMIZATION_PLAN.md`.
    defaults*; a plain `set(X ...)` in our `CMakeLists.txt` shadows them. **Check the generated
    `base.tcl`** (`cfg(en_mem)`, `cfg(tlbl_bits)`, `cfg(hclk_f)`) for the truth.
 7. **`build-10` is a dead failed dir** (cmake configure died). Ignore/delete it.
+8. **Build Coyote's `sw/` and `examples/*/sw/` ON the alveo node, not the build node.**
+   `coyote/sw/CMakeLists.txt:138` does `add_compile_options("-march=native")`, and the two nodes have
+   **different ISAs**:
+   | node | CPU | AVX-512 |
+   |---|---|---|
+   | `hacc-build-02` (build) | Intel Xeon Gold 6234 | yes |
+   | `alveo-u55c-07` (run)   | AMD EPYC 7302P (Zen 2) | **no** |
+   Compiling on the Intel node emits AVX-512, which the AMD node cannot execute → the binary dies with
+   **`Illegal instruction` (SIGILL)** the moment it hits one, typically right after the CLI banner and
+   *before* any FPGA work. It looks like an FPGA/driver failure and is not. Same rule as the kernel
+   module. (Our `iqr_sim` is unaffected — it does not inherit that flag.)
 
 ---
 

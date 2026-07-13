@@ -3,6 +3,7 @@
 # Add -w to block until one of them produces a bitstream.
 B11="$HOME/oasis/hardware/build-11"
 HW="$HOME/oasis/parcore/libstf/coyote/examples/01_hello_world/hw/build_hw"
+HW1G="$HOME/oasis/parcore/libstf/coyote/examples/01_hello_world/hw/build_hw_1g"
 
 status() {
     local name="$1" dir="$2"
@@ -26,9 +27,10 @@ status() {
 
 while :; do
     echo "--- $(date '+%H:%M:%S') ---"
-    status "hello_world" "$HW"; h=$?
-    status "build-11"    "$B11"; b=$?
+    status "hw_1GB_pages" "$HW1G"; g=$?    # the open experiment: TLBL_BITS=30
+    status "hw_2MB_ref"   "$HW";   h=$?    # done: 10.3 GB/s card reads
+    status "build-11"     "$B11";  b=$?    # done: timing closed, still 8 MB/s
     [ "$1" != "-w" ] && break
-    { [ $h -eq 0 ] || [ $b -eq 0 ]; } && { echo; echo ">>> A BITSTREAM IS READY <<<"; break; }
+    [ $g -eq 0 ] && { echo; echo ">>> 1GB-PAGE BITSTREAM IS READY <<<"; break; }
     sleep 120
 done
