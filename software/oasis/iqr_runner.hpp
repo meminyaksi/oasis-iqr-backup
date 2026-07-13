@@ -64,8 +64,21 @@ class IqrRunner {
         // StreamProfiler cycle breakdown (read after both passes). input_* aggregates the histogram
         // + flag input streams; output_* is the flag emission. starved dominating input => the path
         // is host/DMA-bound (the round-trip HBM staging targets); stalled dominating => back-pressured.
+        // NOTE: these device counters are NEVER cleared between processes -- they accumulate for the
+        // life of the bitstream. Only differences between consecutive runs are meaningful. Prefer the
+        // wall-clock split below.
         IqrConfig::StreamProfile input_profile  = {};
         IqrConfig::StreamProfile output_profile = {};
+
+        // Wall-clock split of run(), which is what actually settles host-vs-card:
+        //   stage_ms  = host->HBM staging (memcpy + LOCAL_OFFLOAD). Zero in host mode. This is the
+        //               Coyote migration path (4 KB/command, sleep-throttled) -- expected to dominate.
+        //   passes_ms = both input passes + draining the flags, i.e. the time the FPGA spends reading
+        //               the column (from HBM in card mode, from the host in host mode) and emitting.
+        // Dividing 2*N*8 bytes by passes_ms gives the achieved INPUT bandwidth of each source, which
+        // is the number the whole HBM question hinges on.
+        double stage_ms  = 0.0;
+        double passes_ms = 0.0;
     };
 
     /**

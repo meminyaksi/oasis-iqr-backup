@@ -158,7 +158,11 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     std::vector<InputChunk>         card_inputs;
     const std::vector<InputChunk>  *pass_inputs = &inputs;
     if (use_card_) {
-        card_buf    = stage_to_card(inputs);
+        auto t_stage0 = std::chrono::steady_clock::now();
+        card_buf      = stage_to_card(inputs);
+        result.stage_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stage0)
+                .count();
         card_inputs = {{card_buf->ptr, card_buf->size}};
         pass_inputs = &card_inputs;
     }
@@ -196,7 +200,10 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     auto handle = ctx_.bypass_receiver().acquire(out_bytes);
 
     // 5. Two-pass input (LOCAL_READ x2 via enqueue_stream_input): pass 1 builds the histogram, pass 2
-    // re-streams the column and the operator emits the packed flags.
+    // re-streams the column and the operator emits the packed flags. Timed as one block with the
+    // drain below: together they are the time the FPGA spends actually reading the column, which is
+    // what we compare between the host and card sources.
+    auto t_pass0 = std::chrono::steady_clock::now();
     stream_pass(*pass_inputs, strm_kind, dest); // pass 1: HISTOGRAM
     stream_pass(*pass_inputs, strm_kind, dest); // pass 2: FLAG
 
@@ -206,6 +213,9 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     while (auto buffer = handle->next()) {
         chunks.push_back(buffer);
     }
+    result.passes_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pass0)
+            .count();
 
     if (chunks.size() == 1) {
         // Common case (the whole flag column fits one output-writer buffer): hand it back directly.

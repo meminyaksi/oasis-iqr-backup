@@ -111,8 +111,21 @@ int main(int argc, char **argv) {
         std::cout << "  -> LOSS in BRAM read-modify-write hazard (total < committed), collisions="
                   << res.collisions << "\n";
 
-    // StreamProfiler cycle breakdown (new). input aggregates both passes; output is the flag emit.
-    // starved dominating the input => host/DMA-bound (the round-trip HBM staging targets).
+    // Wall-clock split: this is what settles host-vs-card. `staging` is the Coyote migration DMA
+    // (host->HBM, card mode only); `passes` is the FPGA reading the column twice + emitting flags.
+    // The passes bandwidth is the ACHIEVED input bandwidth of the source (host DMA vs HBM) -- the
+    // number the whole HBM design hinges on. Host is expected around 12.8 GB/s (PCIe Gen3 x16).
+    const double pass_bytes = 2.0 * n * sizeof(int64_t); // both passes re-read the column
+    std::cout << "timing: staging=" << res.stage_ms << " ms  passes=" << res.passes_ms << " ms\n"
+              << "input bandwidth (passes): "
+              << (res.passes_ms > 0 ? pass_bytes / (res.passes_ms * 1e6) : 0.0) << " GB/s"
+              << "  [" << (use_card ? "HBM" : "host DMA") << ", " << pass_bytes / (1 << 20)
+              << " MiB over 2 passes]\n";
+
+    // StreamProfiler cycle breakdown. input aggregates both passes; output is the flag emit.
+    // WARNING: these device counters are NEVER cleared between processes -- they accumulate for the
+    // life of the bitstream, so the absolute values (and percentages) are meaningless. Only the
+    // DIFFERENCE between two consecutive runs means anything. Trust the wall-clock split above.
     auto pct = [](uint64_t part, uint64_t whole) { return whole ? (100.0 * part / whole) : 0.0; };
     const auto &pi = res.input_profile, &po = res.output_profile;
     uint64_t in_tot  = pi.handshakes + pi.starved + pi.stalled + pi.idle;
