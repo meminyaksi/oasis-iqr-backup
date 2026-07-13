@@ -1,251 +1,321 @@
-# IQR + HBM (card memory): what we learned — 2026-07-13
+# IQR + HBM (card memory): learnings & open experiment — 2026-07-13
 
-Session goal: cut the IQR operator's PCIe traffic by keeping the decoded column in the FPGA's HBM
-instead of re-streaming it from the host for each of the two passes ("Option A"), on build-09 — the
-first bitstream ever built with `EN_MEM=1`.
+**READ THIS FIRST before touching HBM / card memory / `EN_MEM` in oasis or celeris.**
 
-**Verdict: Option A is dead. Card mode is 4–20× SLOWER than host mode and gets worse with size.**
-The HBM *read* path is correct and bit-exact; the killer is how Coyote *gets data into* HBM.
-Everything below is the evidence, the five driver bugs we had to fix to even get that answer, and
-what it means for the next design.
+Goal: the IQR operator is **PCIe-bandwidth-bound**. Cut the number of times the decoded column
+crosses PCIe (today: 3) by keeping it in the FPGA's HBM.
+
+**Status: HBM card reads run at 8–11 MB/s (vs 12 GB/s host DMA), bit-exact but ~1200x too slow.**
+Two bitstreams are in flight (§7) to find out why. Until they land, `OASIS_IQR_USE_CARD=0` (host) is
+the default and the system works correctly and at full PCIe speed.
 
 ---
 
-## 1. Headline numbers
+## 1. The measurements (all on U55C / alveo-u55c-07, build-09)
 
-`examples/iqr_sim` on `alveo-u55c-07`, build-09, wall clock:
+`examples/iqr_sim`, wall clock, split into staging vs passes (`IqrRunner::Result.stage_ms/passes_ms`):
 
-| dataset | host (`USE_CARD=0`) | card/HBM (`USE_CARD=1`) | |
+|  | staging (host→HBM) | passes (FPGA reading) | achieved read BW |
 |---|---|---|---|
-| 8 MB (N=1048576) | **0.67 s** | 2.74 s | 4× slower |
-| 64 MB (N=8388608) | **0.86 s** | 17.29 s | **20× slower** |
+| **host** 16 MiB | 0 ms | 1.65 ms | **10.2 GB/s** ✅ |
+| **card** 16 MiB | 549 ms | 1 513 ms | **0.011 GB/s** ❌ |
+| **host** 128 MiB | 0 ms | 11.07 ms | **12.1 GB/s** ✅ |
+| **card** 128 MiB | 553 ms | 15 938 ms | **0.008 GB/s** ❌ |
 
-Both produce `Mismatches: 0` and `histogram_total == N`. Correctness is not the problem;
-**throughput is**, and the gap widens with data size.
+Everything is `Mismatches: 0` / `histogram_total == N`. **Correctness is fine; throughput is not.**
 
-Also from the profiler (host mode, and this is the number that justified the whole effort):
+Three facts fall out:
 
-```
-stream profile [input]: handshakes=262144  starved=66819 (20.2%)  stalled=1056 (0.3%)
-```
-
-The input stream is **80% busy / 20% starved** → the FPGA is being fed at ~12.8 GB/s
-(64 B/beat × 250 MHz × 0.8), i.e. **essentially PCIe Gen3 x16 line rate.** The operator is
-PCIe-bandwidth-bound, so reducing PCIe crossings is still the right goal — just not this way.
-
----
-
-## 2. Why Option A loses (the root cause)
-
-To stage data in HBM, Coyote uses `LOCAL_OFFLOAD` → `offload_user_pages` → `migrate_to_card` →
-`trigger_dma_offload` (`driver/src/vfpga/vfpga_hw.c`):
-
-```c
-void trigger_dma_offload(..., uint32_t n_pages, bool huge) {   // `huge` is accepted and NEVER USED
-    for (int i = 0; i < n_pages; i++) {                        // 262,144 iterations for a 1 GiB page
-        while (cmd_sent >= DMA_THRSH) {                        // DMA_THRSH = 32
-            usleep_range(DMA_MIN_SLEEP_CMD, DMA_MAX_SLEEP_CMD);// 10–50 us sleep!
-        }
-        device->cnfg_regs->offl_ctrl = (bus_data->stlb_meta->page_size << 32) | ...;  // ALWAYS 4 KB
-    }
-}
-```
-
-Two compounding disasters:
-
-1. **The migration granule is 4 KB.** One DMA command per 4 KB, with a sleep every 32 commands.
-   Moving one 1 GiB huge page = 262,144 commands + ~8,192 sleeps ≈ **1 second of pure overhead.**
-2. **It always migrates the WHOLE huge page.** Our memory pool hands out **1 GiB** pages, and the
-   driver's mapping granule is the whole page — so staging an 8 MB buffer migrates **1 GiB**.
-
-And structurally, even with a perfect offload Option A is weak: you pay a **PCIe crossing to push the
-data into HBM** in order to save a PCIe crossing later. At 1 GiB granularity that's a wash at best.
-
-> **Key architectural lesson: Coyote has two DMA paths, and they are not equal.**
-> - **`OutputWriter` / `sq_wr` / `LOCAL_READ`** — the normal streaming path. Fast, full line rate.
->   This is what host mode uses.
-> - **`LOCAL_OFFLOAD` / `LOCAL_SYNC` (migration)** — 4 KB at a time, sleep-throttled. **Avoid.**
->
-> **Any future HBM design must move data with the first path and never the second.**
+1. **Host DMA hits PCIe Gen3 x16 line rate** (~12 GB/s). Confirms the StreamProfiler reading:
+   `input: handshakes=262144 starved=20% stalled=0.3%` → the FPGA is *never* the bottleneck (0.3%
+   stalled) and waits on data 20% of the time. **The operator is PCIe-bound. Reducing PCIe crossings
+   is the right goal.**
+2. **Staging is a flat ~550 ms regardless of size** → it always migrates a whole 1 GiB huge page.
+3. **HBM reads are ~1200x slower than PCIe**, and the slowdown is ~7.6 µs per 64-byte beat — a
+   *software/round-trip* timescale, not a plausible hardware bandwidth limit.
 
 ---
 
-## 3. The five Coyote driver bugs (all fixed locally, all in `parcore/libstf/coyote/driver/`)
+## 2. Coyote has TWO DMA paths and they are NOT equal
 
-`EN_MEM=1` + **1 GiB huge pages** is a combination nobody has ever run. Coyote defaults to **2 MB**
-huge pages (`cmake/FindCoyoteHW.cmake`: `set(TLBL_BITS 21 ...)`); this project overrides it to
-**1 GiB** (`hardware/CMakeLists.txt:45`: `set(TLBL_BITS 30)`) because `HugePageMemoryPool` uses
-1 GiB pages. Every bug below falls out of that combination — the HBM examples work fine at 2 MB.
+| path | how it moves data | speed |
+|---|---|---|
+| **streaming**: `OutputWriter` / `sq_wr` / `LOCAL_READ` | large chunks | **PCIe line rate** |
+| **migration**: `LOCAL_OFFLOAD` / `LOCAL_SYNC` | **one DMA command per 4 KB, `usleep(10–50 µs)` every 32 commands**, and always the whole huge page | glacial |
 
-### (a) Card-memory budget too small — `include/coyote_defs.h`
-With `en_mem`, the driver **mirrors every host mapping with an equal-sized card allocation**, whether
-or not you ever read from the card. At 1 GiB per host page, 4 buffers = 4 GiB. The stock huge region
-is only 4 GB → 4th map fails `-ENOMEM` (`insufficient memory on card to store buffer`).
-*This is why even `USE_CARD=0` failed.*
+`trigger_dma_offload` (`driver/src/vfpga/vfpga_hw.c`) takes a `bool huge` parameter and **never uses
+it** — it always issues `stlb_meta->page_size` (4 KB) commands. Offloading one 1 GiB page = 262 144
+commands + ~8 192 sleeps ≈ 1 s.
 
-### (b) Misaligned card base → **silent data corruption** — `include/coyote_defs.h`
-`create_tlb_mapping` stores `physical_address >> page_shift`, truncating the card address to the lTLB
-granule. With `TLBL_BITS=30` that granule is **1 GiB**, but the huge region started at
-`MEM_START(256 MB) + card_huge_offs(4 GB)` = **4.25 GB — not 1 GiB-aligned.** The low 256 MB was
-silently discarded: the driver wrote the data to one place and the FPGA read from another.
-(256 MB *is* 2 MB-aligned, which is exactly why nobody ever hit this.)
+> **Never put bulk data through the migration path.** This killed "Option A" (host stages the column
+> into HBM, both passes read it back): 4x slower at 8 MB, 20x slower at 64 MB.
 
-**Fix (both a and b):**
-```c
-#define MEM_START      (256UL * 1024UL * 1024UL)
-#define N_SMALL_CHUNKS (458752UL)                  // 1.75 GB -> huge region based at EXACTLY 2 GB
-#define N_LARGE_CHUNKS (3UL * 1024UL * 1024UL)     // 12 GB   (mirrors all 8 host 1 GiB pages)
-// total = 0.25 + 1.75 + 12 = 14 GB, inside the U55C's 16 GB HBM
-```
-Verify in dmesg: allocations must land on clean 1 GiB steps —
-`@ 80000000, c0000000, 100000000, 140000000, ...`
-
-### (c) Kernel infinite loop (soft lockup) — `src/vfpga/vfpga_gup.c`
-`offload_user_pages` / `sync_user_pages` looked the buffer up by its **raw address** with
-`hash_for_each_possible`, but entries are keyed on the **huge-page-aligned base**. Any buffer not
-starting exactly on a 1 GiB boundary (i.e. anything jemalloc returns) was never found — and
-`vaddr_tmp` is only advanced *inside* the match branch, so the `while` loop spun forever:
-
-```
-watchdog: BUG: soft lockup - CPU#8 stuck for 366s! [iqr_sim:56693]
-RIP: offload_user_pages+0xe2 [coyote_driver]
-```
-**Unkillable process, 8 GiB of huge pages pinned, node needed a reboot** (`sudo hdev reboot`).
-**Fix:** scan the whole (tiny) map with `hash_for_each`, and always advance past the matched
-mapping; return `-EINVAL` on a miss instead of looping.
-
-### (d) Card chunk allocator re-issues in-use chunks → permanent leak — `src/vfpga/vfpga_hw.c`
-`alloc_card_memory` bumped a ring cursor **without testing `->used`**, so it could hand the same
-chunk to two mappings. The second free then hits the `used == false` branch, which **does not return
-the chunk** (`pr_warn("likely bug: freeing card memory with used=false")` — Coyote's own warning
-about its own bug). The pool bled away run after run; symptom was the card appearing to *shrink*
-even after we tripled its size.
-**Fix:** allocate a **contiguous, granule-aligned run of free chunks**. Contiguity is mandatory —
-`tlb_map_gup` programs ONE lTLB entry per huge page from `cpages[0]`, so the card pages behind it
-must be contiguous.
-
-### (e) Deadlock + off-by-one — `src/vfpga/vfpga_hw.c`
-Both `-ENOMEM` returns inside `alloc_card_memory` returned **while holding `card_lock`** (never
-unlocked → the next `free_card_memory` would spin forever). Also the block search tested
-`free_chunks > n_pages` (strict), rejecting an allocation that exactly fits.
-**Fix:** unlock before returning; use `>=`.
+**BUT** — the migration cost is a **one-time setup cost, not a per-query cost.** To write into HBM the
+FPGA only needs a *card-resident vaddr*. Allocate a scratch buffer **once**, `LOCAL_OFFLOAD` it once
+(it migrates garbage — irrelevant), and from then on the FPGA writes/reads that range with **zero
+migration**. Option A only lost because it re-staged every query.
 
 ---
 
-## 4. Still-open bug (not chased — Option A was already dead)
+## 3. THE key configuration difference: 1 GiB vs 2 MB pages
 
-**Segfault on exit in card mode only.** Host memory corruption: it dies inside jemalloc's own heap
-metadata while freeing a buffer.
-```
-#0  edata_list_active_remove ... jemalloc/internal/edata.h
-#8  libstf::BufferDeleter::operator()(libstf::Buffer const*)
-#11 main ()
-```
-Something in the card path writes outside its region. If HBM is revisited, this must be found.
+Coyote defaults to **2 MB** huge pages (`cmake/FindCoyoteHW.cmake`: `set(TLBL_BITS 21 ...)`).
+**This project overrides to 1 GiB** (`hardware/CMakeLists.txt:45`: `set(TLBL_BITS 30)`), because
+libstf's `HugePageMemoryPool` uses 1 GiB pages (`HUGE_PAGE_BITS = 30`).
+
+**Why celeris chose 1 GiB — it is a GOOD reason, not an accident.** The driver caps TLB entries per
+mapping at `MAX_N_MAP_PAGES = 256`:
+
+| page size | max data mappable in one call |
+|---|---|
+| 2 MB | 256 × 2 MB = **512 MB** |
+| 1 GiB | 256 × 1 GiB = 256 GB |
+
+Our largest dataset (SF10) is **480 MB decoded — right at the 512 MB ceiling.** With 2 MB pages we'd
+be scraping the limit and anything bigger page-faults constantly. With 1 GiB pages a whole dataset is
+**one TLB entry**.
+
+**Every problem we hit today traces to this one flag.** It is also the **only** Coyote config
+difference vs the working `hello_world` example (§5).
 
 ---
 
-## 5. Traps that cost us hours (don't re-pay)
+## 4. The five Coyote driver bugs (ALL FIXED, committed — `parcore/libstf/coyote/driver/`)
 
-1. **The FPGA's profiler counters DO NOT RESET between processes.** They accumulate for the life of
-   the bitstream. `handshakes=264192` on a run that should show `2048` is the previous run's total
-   plus this one's. **Always take differences between consecutive runs, or better: use wall clock.**
-   (I misread these once and drew a wrong conclusion — don't repeat it.)
-2. **Build the kernel module ON the alveo node**, not on hacc-build-02 — it must match the running
-   kernel (`6.8.0-134-generic`).
-3. **The whole stack must be rebuilt bottom-up: libstf → oasis → extension.** `parcore`'s CMake does
-   `find_package(libstf QUIET)`, so with `CMAKE_PREFIX_PATH=$HOME/opt` it happily reuses the **stale
-   installed libstf** and never rebuilds it. Install libstf first, on its own:
+All five exist *only* at 1 GiB pages. Coyote's card memory is written and tested for 2 MB.
+
+| # | file | bug |
+|---|---|---|
+| a | `coyote_defs.h` | **Card budget too small.** With `en_mem` the driver mirrors *every* host mapping with an equal-sized card allocation — whether or not you ever read the card. At 1 GiB/page, 4 buffers = 4 GiB; the stock huge region is 4 GB → 4th map fails `-ENOMEM`. *(This is why even `USE_CARD=0` failed.)* |
+| b | `coyote_defs.h` | **Misaligned card base → SILENT DATA CORRUPTION.** `create_tlb_mapping` stores `physical_address >> page_shift`; with a 1 GiB granule the huge region's base (`MEM_START 256 MB + card_huge_offs 4 GB` = 4.25 GB) is **not 1 GiB-aligned**, so the low 256 MB is truncated — driver writes to one card address, FPGA reads another. (4.25 GB *is* 2 MB-aligned → invisible at the default page size.) |
+| c | `vfpga_gup.c` | **Kernel infinite loop / soft lockup.** `offload_user_pages`/`sync_user_pages` looked buffers up by their *raw* address, but entries are keyed on the *huge-page-aligned base*. Any jemalloc pointer (never page-start-aligned) was never found, and `vaddr_tmp` only advances inside the match branch → `while` loop spins forever. `watchdog: BUG: soft lockup - CPU#8 stuck for 366s!` — **unkillable process, huge pages pinned, node needs `sudo hdev reboot`.** |
+| d | `vfpga_hw.c` | **Card chunk allocator re-issues in-use chunks → permanent leak.** The ring cursor was bumped without testing `->used`; the double-free then hits the `used == false` branch which never returns the chunk (`pr_warn("likely bug: freeing card memory with used=false")` — Coyote's own warning about its own bug). Pool bled away run after run; the card appeared to *shrink* even after we tripled it. |
+| e | `vfpga_hw.c` | Both `-ENOMEM` paths returned **holding `card_lock`** (next `free_card_memory` would spin forever); block search used `>` instead of `>=`. |
+
+**Fixes:** huge region based at exactly **2 GB** (1 GiB-aligned) and grown to 12 GB
+(`N_SMALL_CHUNKS 458752`, `N_LARGE_CHUNKS 3M`; total 0.25+1.75+12 = 14 GB < 16 GB HBM); full-map scan
+with guaranteed forward progress; contiguous granule-aligned chunk runs (contiguity is **mandatory** —
+`tlb_map_gup` programs ONE lTLB entry per huge page from `cpages[0]`); unlock before `-ENOMEM`.
+
+**Verify after any driver rebuild:** card allocations must land on clean 1 GiB steps —
+```
+sudo dmesg | grep alloc_card_memory     # @ 80000000, c0000000, 100000000, 140000000, ...
+```
+
+---
+
+## 5. `hello_world` IS a working card-memory reference (I was wrong to say otherwise)
+
+`examples/01_hello_world` has `set(EN_MEM 1)` and exercises **both directions**:
+```systemverilog
+perf_local inst_card_link ( .axis_in(axis_card_recv[0]), .axis_out(axis_card_send[0]) );
+```
+and its software is a **bandwidth benchmark with a host/card switch** (`-s 1` host, `-s 0` card).
+Its README confirms card mode "repeatedly read[s] the data from HBM" — so **its card number IS the
+HBM read bandwidth**, i.e. exactly our missing reference.
+
+It also documents that **host-in / card-out is supported**: *"in Coyote it's absolutely possible to
+have source and destination streams being distinct as long as the vFPGA is implemented to reflect
+this requirement."* → the 1-pass design (§8) is blessed.
+
+Note: hello_world never calls `LOCAL_OFFLOAD`. Coyote **migrates automatically on page fault** when
+you mark an sg `stream = CARD`; `LOCAL_OFFLOAD` is just the explicit trigger for the same thing.
+
+**Full config diff (this is the whole list):**
+
+| | hello_world (card works) | us (8 MB/s) |
+|---|---|---|
+| `EN_MEM`, `EN_STRM`, `N_CARD_AXI` | 1, 1, 1 | 1, 1, 1 — **same** |
+| **`TLBL_BITS`** | **21 (2 MB)** | **30 (1 GiB)** ← **only difference** |
+| allocator | `getMem(HPF)` → page-**aligned** | jemalloc → arbitrary offset in a 1 GiB page |
+| design size | two tiny `perf_local` blocks | decoder + Snappy + IQR + HBM stack (congested) |
+
+---
+
+## 6. Hypotheses — none proven; be honest about this
+
+| | hypothesis | evidence / status |
+|---|---|---|
+| **H1** | HBM AXI timing fails (our chip is congested) | build-09: WNS **−0.342 ns, 6 434 failing endpoints**, worst path `HBM_SNGLBLI_INTF_AXI/ARREADY_PIPE` (the read-address handshake), 66% routing delay + an SLR crossing. **Story is WEAK**: a *systematic* setup miss makes a flop latch last cycle's value (a 1-cycle lag), not a 99.9% handshake failure. Tested by **build-11**. |
+| **H3** | 1 GiB pages break the card path | The **only** config difference vs hello_world, and the root of all five driver bugs. **But I searched the MMU RTL (`hw/hdl/mmu/tlb_fsm.sv`) for a width overflow and found NO mechanism** — `LEN_BITS = 28` (256 MB max request) vs `PG_L_SIZE = 1<<30`, but the truncating branch only fires when a read *crosses* a page boundary, and ours (8–128 MB) sit inside one 1 GiB page. Tested by a `TLBL_BITS=21` build if needed. |
+| **H2** | Coyote's card-read DMA is misconfigured (bursts / outstanding requests) | **Unexplored.** |
+
+The 7.6 µs/beat figure smells like a per-transfer round trip, not a wire delay — which is why I no
+longer favour H1. **Page faults are ruled out** (dmesg would flood; it doesn't).
+
+---
+
+## 7. THE OPEN EXPERIMENT (both bitstreams started 2026-07-13, running in parallel)
+
+Both run at **350 MHz HBM clock**, so **the clock is eliminated as a variable** between them.
+
+| build | HBM clk | pages | design | dir | started |
+|---|---|---|---|---|---|
+| build-09 (done) | 450 | 1 GiB | ours | `hardware/build-09` | ❌ 8 MB/s |
+| **build-11** | **350** | 1 GiB | ours | `hardware/build-11` | 14:53 (~5 h) |
+| **hello_world** | **350** | **2 MB** | tiny | `parcore/libstf/coyote/examples/01_hello_world/hw/build_hw` | 15:42 (~1–2 h) |
+
+**Watch:** `bash scripts/build_status.sh` (or `-w` to block until one lands).
+
+### Interpretation matrix
+
+| hello_world `-s 0` | build-11 | conclusion |
+|---|---|---|
+| fast | fast | Clock was it. Build the 1-pass design (§8). |
+| **fast** | **slow** | **Platform is fine — OUR design is at fault.** Next: rebuild with `TLBL_BITS=21` + `HugePageMemoryPool HUGE_PAGE_BITS 21` (H3). |
+| slow | slow | **HBM cannot do fast card reads here. STOP.** Keep host mode; it is correct and full-speed. |
+
+### Commands when they land
+
+```bash
+# --- build-11: did the HBM domain close? (was -0.342 ns / 6434 failing) ---
+grep -A6 "Intra Clock Table" hardware/build-11/reports/shell_timing_summary.rpt | grep hbm
+
+# --- hello_world: THE reference number (NB: replaces the IQR bitstream; reflash after) ---
+cd ~/oasis
+bash parcore/libstf/coyote/util/program_hacc_local.sh \
+     parcore/libstf/coyote/examples/01_hello_world/hw/build_hw/bitstreams/cyt_top.bit \
+     parcore/libstf/coyote/driver/build/coyote_driver.ko 1
+sudo hdev set hugepages --size 1G --pages 8
+cd parcore/libstf/coyote/examples/01_hello_world/sw/build_sw
+./test -s 1     # HOST -- sanity, expect ~10-12 GB/s
+./test -s 0     # CARD -- THE ANSWER  (GB/s => platform fine, bug is ours;  ~10 MB/s => HBM dead here)
+
+# --- our design on build-11 ---
+export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
+OASIS_IQR_USE_CARD=0 ./examples/iqr_sim/build_hw/iqr_sim 1048576 10   # must still PASS
+OASIS_IQR_USE_CARD=1 ./examples/iqr_sim/build_hw/iqr_sim 8388608 10 | grep bandwidth
+```
+
+### The HBM clock change (a trap worth knowing)
+
+`HCLK_F` in cmake fed **only** the HBM IP's `USER_AXI_CLK_FREQ`; the MMCM was **hardcoded to 450 MHz**
+in `hw/bd/ultrascale_plus/cr_hbm.tcl`. Changing `HCLK_F` alone would have told the controller "350"
+while the clock stayed 450 — a silent desync that would have made things *worse*. Now the divider is
+**derived** from `HCLK_F` (fixed VCO 1181.25 MHz ⇒ `2.625` = 450 MHz, `3.375` = 350 MHz; 450
+reproduces the original exactly). Confirm in the log:
+```
+Coyote: HBM AXI clock = 350 MHz (VCO 1181.25, CLKOUT0_DIVIDE_F = 3.375)
+```
+Bandwidth given up is irrelevant: the HBM AXI port is 512-bit → 350 MHz still ≈ **22 GB/s**, far above
+the ~12 GB/s PCIe ceiling we're actually bound by.
+
+---
+
+## 8. The target design (1 pass) — for when/if HBM is proven fast
+
+**The insight:** after decoding, the data is **already inside the FPGA**, right next to HBM. Writing
+it to HBM from there costs **zero PCIe**. Option A's mistake was shipping it to the host and back.
+
+```
+1. compressed parquet ──▶ FPGA                  (small, compressed)
+2. FPGA decodes ──▶ writes to HBM                ← ON-CHIP. Zero PCIe.
+3. FPGA sends a small SAMPLE ──▶ host            (~8192 values ≈ 64 KB, negligible)
+     host derives the PERCENTILE window, writes bin_min / bin_shift
+4. pass 1: HBM ──▶ histogram ──▶ fences          (on-chip, free)
+5. pass 2: HBM ──▶ flags + values ──▶ host       ← the ONE unavoidable PCIe trip (highway)
+```
+PCIe crossings of the decoded column: **3 today → 1.** We're PCIe-bound ⇒ **~3x**.
+The sample (step 3) also solves the window chicken-and-egg **without** the host ever seeing the full
+column.
+
+**Most of the mechanism already exists:**
+- `StreamWriter` **already** has `parameter STRM = STRM_HOST` and documents `STRM_CARD`
+  (`sq_wr.data.strm = STRM`). `OutputWriter` simply never passes it → everything defaults to host.
+- `OutputWriter` **already** contains an `sq_wr` arbiter for multiple writers.
+- `axis_card_send[]` already exists in our vFPGA — we currently just **tie it off**
+  (`vfpga_top.svh:286`).
+- The HBM **read** path is **proven bit-exact on silicon**.
+- `axis_card_send` **is** exercised upstream by hello_world → not virgin territory.
+
+**Work items:** (1) give the decoder lane a `StreamWriter #(.STRM(STRM_CARD))` → `axis_card_send[0]`
++ `sq_wr` arbitration in `vfpga_top.svh`; (2) SW: allocate a **persistent** HBM scratch buffer,
+`LOCAL_OFFLOAD` once at init (§2); (3) point the decoder's `mem_config` vaddr at it; (4) IQR passes
+read it with `STRM_CARD` (already works); (5) sample tap → host → window.
+
+**NON-NEGOTIABLE:** keep the **percentile** window (1st/99th of a stride-sample). Measured: min/max
+windows give **90% disagreement** on taxi_d2/d3/d4 (bin width blows up 2048x because min/max is set by
+the very outliers being detected). See `IQR_OPTIMIZATION_PLAN.md`.
+
+---
+
+## 9. Traps that cost hours — do not re-pay
+
+1. **FPGA profiler counters NEVER reset between processes.** They accumulate for the life of the
+   bitstream. A run that should show `handshakes=2048` prints `264192` (previous total + this run).
+   **Take differences between consecutive runs, or just use wall clock** (`stage_ms`/`passes_ms`).
+   *I misread these once and drew a wrong conclusion. The code now warns about it.*
+2. **Build the kernel module ON the alveo node** (must match the running kernel, `6.8.0-134-generic`).
+3. **Rebuild the stack bottom-up: libstf → oasis → extension.** `parcore`'s CMake does
+   `find_package(libstf QUIET)`, so with `CMAKE_PREFIX_PATH=$HOME/opt` it silently reuses the **stale
+   installed libstf**. Install libstf first, on its own:
    ```bash
    cmake -S parcore/libstf/software -B parcore/libstf/software/build \
          -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_PREFIX_PATH=$HOME/opt
    cmake --build parcore/libstf/software/build -j && cmake --install parcore/libstf/software/build
    ```
-   Symptom of skipping it: `undefined symbol: _ZN5oasis9IqrRunnerC1ERNS_12OasisContextEbblmb`
-   (the new `use_card` ctor) or `too many arguments to function enqueue_stream_input`.
-   `parcore` itself does **not** need rebuilding — it never calls `libstf::enqueue_stream_input`.
-4. **The driver's `pr_warn` messages don't contain the word "coyote".** `dmesg | grep -i coyote`
-   hides every actual error. Use `sudo dmesg | head -60` (HEAD, not tail — the failure is at the
-   *start*; the tail is teardown spam).
-5. **A soft-locked process cannot be killed and holds its huge pages until reboot.** `free_hugepages
-   = 0` with `nr_hugepages = 8` means a dead process is still holding them. `sudo hdev reboot` is on
-   the sudo allowlist (`sudo -l` to confirm); `sudo reboot` is not. The node may take 5–15 min and
-   may need an admin power-cycle if it doesn't come back.
+   Symptoms of skipping it: `undefined symbol: _ZN5oasis9IqrRunnerC1ERNS_12OasisContextEbblmb`, or
+   `too many arguments to function enqueue_stream_input`. `parcore` itself does **not** need
+   rebuilding (it never calls `libstf::enqueue_stream_input`).
+4. **Driver `pr_warn`s don't contain the word "coyote"** → `dmesg | grep -i coyote` hides every real
+   error. Use `sudo dmesg | head -60` (**HEAD**, not tail — failures are at the *start*; the tail is
+   teardown spam).
+5. **A soft-locked process cannot be killed and holds its huge pages until reboot.**
+   `free_hugepages = 0` with `nr_hugepages = 8` ⇒ a dead process still owns them.
+   `sudo hdev reboot` **is** on the sudo allowlist (`sudo -l`); `sudo reboot` is not. Node takes
+   5–15 min; may need an admin power-cycle if it doesn't return.
+6. **CMake cache lies.** `EN_MEM:STRING=0` / `TLBL_BITS:STRING=21` in `CMakeCache.txt` are the *Coyote
+   defaults*; a plain `set(X ...)` in our `CMakeLists.txt` shadows them. **Check the generated
+   `base.tcl`** (`cfg(en_mem)`, `cfg(tlbl_bits)`, `cfg(hclk_f)`) for the truth.
+7. **`build-10` is a dead failed dir** (cmake configure died). Ignore/delete it.
 
 ---
 
-## 6. Where the code stands
+## 10. Code state
 
-**Keep (all committed, all still valuable):**
-- Driver fixes (a)–(e) — **prerequisites for any HBM work**, and worth reporting upstream to the
-  Coyote maintainers.
+**Default: `OASIS_IQR_USE_CARD=0` (host).** Card mode is a documented performance loss — do not enable
+it without the redesign in §8. **The old 3-pass host behaviour IS the default** — nothing needs
+reverting.
+
+**Restore tags:** `iqr-preopt-checkpoint` (pre-everything), `iqr-profiler-checkpoint`,
+`iqr-hbm-optionA`.
+
+**Keep (all committed, all valuable regardless of the HBM outcome):**
+- Driver fixes (a)–(e) — one is a **silent corruption** bug. Worth upstreaming to Coyote.
 - `StreamProfiler` on the IQR lane (`vfpga_top.svh`, `iqr_config.sv` regs 7–14, `iqr_config.hpp`).
-  This is what proved we're PCIe-bound.
-- The card-receive path + `use_card` mux in `vfpga_top.svh` / `iqr_cosim_top.svh`, and
-  `IqrRunner::stage_to_card`. **The HBM read path is proven bit-exact on silicon** — every future
-  option needs it.
-- `libstf::enqueue_stream_input(..., strm_kind)` (`STRM_HOST` / `STRM_CARD`).
+  It is what proved we're PCIe-bound.
+- Wall-clock split (`IqrRunner::Result.stage_ms/passes_ms`) + bandwidth print in `iqr_sim`.
+- Card-receive path + `use_card` mux in `vfpga_top.svh`/`iqr_cosim_top.svh`; `IqrRunner::stage_to_card`;
+  `libstf::enqueue_stream_input(..., strm_kind)`.
+- HBM clock derivation fix in `cr_hbm.tcl`.
+- `scripts/build_status.sh`.
 
-**Default:** `OASIS_IQR_USE_CARD=0` (host). Card mode is a documented performance loss — do not
-enable it without the redesign below.
-
-**build-09 timing:** WNS **−0.429 ns** (vs build-08's −0.076). Neither failing path is ours: 6,434
-endpoints are in the **HBM clock domain** (Xilinx HBM IP + Coyote's RAMA — a domain that didn't exist
-before `EN_MEM=1`), and the worst path (−0.429) is the **parquet decoder → host-read credit FIFO**,
-85% routing delay = congestion from the HBM stack, not logic depth. **Host mode is bit-exact anyway**
-— the violation is not corrupting results.
-
----
-
-## 7. What to do next (options, best first)
-
-The goal is unchanged: **get the decoded column into HBM without paying a PCIe crossing for it.**
-The data is *already on the FPGA* after decoding — that's the whole insight. The mistake in Option A
-was shipping it to the host and back.
-
-**Option B-fork — decode tees to host AND HBM simultaneously.**
-Decode output goes to the host through the existing (fast) `OutputWriter` *and* to HBM through a new
-card `StreamWriter`. Zero migration-path involvement. Requires: a card `StreamWriter` (`STRM_CARD` →
-`axis_card_send`) + `sq_wr` arbitration in the IQR top. The tee needs dual backpressure (both
-consumers ready).
-PCIe: 1 crossing of the decoded column (the host copy) — half of today's 2.
-
-**Option B-sequential (Mehmet's idea) — decode → HBM, then HBM → host.**
-Simpler hardware (redirect, not tee). **BUT its HBM→host step is `LOCAL_SYNC` = the same broken 4 KB
-migration path.** Only viable if `trigger_dma_sync`/`trigger_dma_offload` are first fixed to use the
-`huge` granule they already accept-and-ignore (would cut ~262,144 commands → ~512).
-
-**Option C — one pass, values+flags out (most PCIe-efficient).**
-1. Decoder writes to HBM (FPGA-side, no PCIe) **and** ships a small **sample** (~8192 values) to the
-   host — a tiny transfer.
-2. Host derives the percentile window from the sample, sets `bin_min`/`bin_shift`.
-3. Pass 1 (histogram) reads HBM. Pass 2 reads HBM and emits **(value, flag)** to the host through the
-   normal `OutputWriter`.
-PCIe: compressed in, one values+flags stream out. **No migration path at all.** Solves the
-window chicken-and-egg (the sample) *and* gives DuckDB its value column. Most RTL work, best payoff.
-
-**Non-negotiable:** the **percentile** window (1st/99th of a stride-sample) must stay. We measured
-min/max windows: **90% disagreement** on taxi_d2/d3/d4 (bin width blows up 2048× because min/max is
-set by the very outliers we're detecting). See `IQR_OPTIMIZATION_PLAN.md`.
-
----
-
-## 8. Reproduce / re-verify
-
-```bash
-# on alveo-u55c-07 (driver MUST be built here -- kernel must match)
-cd ~/oasis/parcore/libstf/coyote/driver && make clean && make
-cd ~/oasis
-bash parcore/libstf/coyote/util/program_hacc_local.sh \
-     hardware/build-09/bitstreams/cyt_top.bit \
-     parcore/libstf/coyote/driver/build/coyote_driver.ko 1
-sudo hdev set hugepages --size 1G --pages 8
-cat /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages   # must be 8
-
-export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
-OASIS_IQR_USE_CARD=0 ./examples/iqr_sim/build_hw/iqr_sim 1048576 10   # PASSES, ~0.67 s
-OASIS_IQR_USE_CARD=1 ./examples/iqr_sim/build_hw/iqr_sim 1048576 10   # PASSES but ~2.74 s + segfault
-
-# card allocations must be 1 GiB-aligned:
-sudo dmesg | grep alloc_card_memory     # @ 80000000, c0000000, 100000000, ...
+**Commits (local only — read-only push on celeris-labs):**
 ```
+coyote   deea9d62  driver: fix card memory (en_mem) for 1 GiB huge pages
+coyote   a96c46c5  hbm: drop the u55c HBM AXI clock 450 -> 350 MHz to close timing
+libstf   26097ef   coyote: bump
+parcore  dafc19b   libstf: bump
+oasis    7fef9e8   IQR/HBM: bank the Option-A result + Coyote card-memory fixes
+oasis    1ccc87e   IQR: measure the HBM read path, and lower the HBM clock to close its timing
+```
+
+**build-09 timing:** WNS −0.429 ns (build-08 was −0.076). Neither failing path is ours: 6 434
+endpoints in the **HBM clock domain** (Xilinx HBM IP + Coyote RAMA — a domain that didn't exist before
+`EN_MEM=1`), and the worst path is **parquet decoder → host-read credit FIFO**, 85% routing =
+congestion from the HBM stack. **Host mode is bit-exact and full-speed anyway.**
+
+---
+
+## 11. Questions for the supervisor (still unanswered — could save days)
+
+1. **What card bandwidth does `hello_world -s 0` report on a U55C?** (If a colleague already has this,
+   it short-circuits the whole experiment.)
+2. **Is the 450 MHz HBM AXI clock known to fail timing in large designs? Is there a pblock/floorplan
+   constraint** to keep the HBM interconnect in SLR0? That would close timing *without* giving up
+   clock speed — a better fix than mine.
+3. **Why does libstf use `TLBL_BITS=30` (1 GiB) rather than Coyote's default 21 (2 MB)?** Coyote's card
+   memory is only built/tested for 2 MB. Would 2 MB be acceptable for our workloads (SF10 = 480 MB,
+   just under the 512 MB single-mapping cap)? **This is the highest-leverage question** — if the answer
+   is "no strong reason", switching removes this entire class of problem.
+4. Has anyone driven `axis_card_send` (vFPGA → HBM writes) beyond `hello_world`?
