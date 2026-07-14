@@ -14,6 +14,40 @@ Raw data: `bench/perf_results.csv`, `bench/perf_fpga.csv`, `bench/correctness_ou
 
 ## 1. Correctness — 1024-bin histogram vs exact IQR
 
+**Re-verified 2026-07-14 on build-11** (`bench/correctness_build11.txt`): all 7 datasets pass, row
+counts exact, and **every disagreement figure is identical to the build-08 reference below** — none of
+the host-path optimizations of §3a changed a single outlier decision.
+
+| dataset | rows | FPGA outliers | exact | disagreeing rows | ppm |
+|---|--:|--:|--:|--:|--:|
+| tpch_qty | 6,001,215 | 0 | 0 | **0** | **0** |
+| tpch_extprice SF1 | 6,001,215 | 0 | 0 | **0** | **0** |
+| tpch_extprice SF10 | 59,986,052 | 0 | 0 | **0** | **0** |
+| taxi_d3 | 13,069,067 | 1,328,108 | 1,328,270 | 162 | 12 |
+| taxi_d1 | 2,964,624 | 317,554 | 318,801 | 1,247 | 421 |
+| taxi_d2 | 5,972,150 | 625,445 | 628,322 | 2,877 | 482 |
+| taxi_d4 | 20,332,093 | 2,112,164 | 2,057,243 | 54,921 | **2701** |
+
+### taxi_d4's 2701 ppm is bin-edge quantization, NOT the window sample (measured)
+
+The window sample size was made tunable (`OASIS_IQR_SAMPLE`) and swept **8192 → 524288 (64×)**.
+`n_out`, `lo_eff` and `hi_eff` are **bit-identical at every size** (2,112,164 / −934 / 4048) while the
+`iqr` phase goes 27 → 56 ms and the query 0.064 → 0.090 s. **A larger sample is pure cost with zero
+accuracy benefit — do not raise it.**
+
+That isolates the cause. CPU-hist with the *same* 1024 bins but *exact* quartiles disagrees by only
+24 ppm, so the bins are fine; the FPGA reports each quartile at its bin's **lower edge** (bin width 16
+here), so Q1 and Q3 both land low, both fences shift down, and the 4048–4080 band is over-flagged —
+exactly the 54,921 rows observed.
+
+**Fix: a bin-MIDPOINT quartile.** One adder on the quartile output — no latency, no resources, no
+timing risk. Simulated in §3 below: gap −1247 → −50, **~25× more accurate**. This is the bitstream
+worth building. (The tap of §3b is not: it buys 18% speed *at the cost of* accuracy.)
+
+---
+
+### Original build-08 correctness detail
+
 Three models: **CPU-exact** (no binning, ground truth), **CPU-hist-1024** (the operator's algorithm
 on CPU, isolates approximation error), **FPGA** (`iqr_flags` on silicon). Outlier decision compared
 row-for-row (FPGA effective fences recovered from the flag column; valid because the IQR decision is
