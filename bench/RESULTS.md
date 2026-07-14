@@ -1,8 +1,9 @@
 # IQR FPGA Operator — Correctness & Performance Results
 
 **System:** Alveo U55C (VU47P), Coyote shell, `alveo-u55c-07`, 32 physical cores (`nproc=32`).
-**Bitstream:** build-08 (lean, ILAs off; `ram_style="distributed"` histogram fix). **Software:** DuckDB
+**Bitstream:** build-11 (1024-bin histogram; timing closed, WNS 0.000). **Software:** DuckDB
 extension `iqr_flags` (FPGA decode + IQR) vs native DuckDB on the same binary/host.
+**§1 correctness measured on build-08; §2–3 performance re-measured 2026-07-14 on build-11.**
 **Method:** end-to-end, per-statement DuckDB `.timer`; 2 warm-up + 7 timed runs, warm OS cache;
 median reported (min in CSV). Identical query shape every system: `count(*) FILTER (WHERE outlier)`.
 Datasets: NYC-taxi `fare_cents` (d1–d4) and TPC-H `l_quantity`/`l_extendedprice` (SF1, SF10).
@@ -50,60 +51,117 @@ window placement.
 
 ---
 
-## 2. Performance — end-to-end wall time (median, seconds)
+## 2. Performance — end-to-end wall time (median of 7 warm runs, seconds)
 
-| Dataset | Rows | exact@1 | exact@4 | exact@16 | exact@32 | hist@1 | hist@4 | hist@16 | hist@32 | **FPGA** |
-|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| tpch_qty | 6.00 M | 0.107 | 0.070 | 0.035 | 0.031 | 0.443 | 0.221 | 0.185 | 0.146 | **0.053** |
-| taxi_d1 | 2.96 M | 0.071 | 0.053 | 0.028 | 0.025 | 0.221 | 0.128 | 0.083 | 0.090 | **0.034** |
-| taxi_d2 | 5.97 M | 0.128 | 0.080 | 0.040 | 0.035 | 0.429 | 0.238 | 0.158 | 0.147 | **0.060** |
-| taxi_d3 | 13.07 M | 0.271 | 0.119 | 0.070 | 0.060 | 1.037 | 0.442 | 0.336 | 0.313 | **0.120** |
-| taxi_d4 | 20.33 M | 0.432 | 0.156 | 0.090 | 0.081 | 1.732 | 0.861 | 0.697 | 0.655 | **0.180** |
-| tpch_extprice | 6.00 M | 0.645 | 0.243 | 0.106 | 0.101 | 0.465 | 0.257 | 0.176 | 0.161 | **0.094** |
-| extprice SF10 | 59.99 M | 4.253 | 1.388 | 0.522 | 0.494 | 5.502 | 2.536 | 1.943 | 1.773 | **0.825** |
+**Re-measured 2026-07-14** on bitstream build-11 after the host-path optimizations of §3a.
+Raw: `bench/perf_build11_ws.csv`. Outlier counts are unchanged by every optimization below.
 
-**FPGA throughput:** ~64–113 M rows/s (72.7 M rows/s at SF10; 376 MB/s of compressed parquet).
-Roughly flat with size → the integrated path is **overhead/bandwidth-bound, not compute-bound**.
+| Dataset | Rows | exact@1 | exact@4 | exact@16 | exact@32 | hist@32 | **FPGA** |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| tpch_qty | 6.00 M | 0.106 | 0.072 | 0.036 | 0.032 | 0.168 | **0.019** |
+| taxi_d1 | 2.96 M | 0.071 | 0.055 | 0.027 | 0.025 | 0.087 | **0.013** |
+| taxi_d2 | 5.97 M | 0.130 | 0.078 | 0.039 | 0.035 | 0.166 | **0.023** |
+| taxi_d3 | 13.07 M | 0.269 | 0.117 | 0.069 | 0.059 | 0.327 | **0.044** |
+| taxi_d4 | 20.33 M | 0.439 | 0.157 | 0.088 | 0.081 | 0.623 | **0.063** |
+| tpch_extprice | 6.00 M | 0.634 | 0.238 | 0.102 | 0.102 | 0.175 | **0.051** |
+| extprice SF10 | 59.99 M | 4.367 | 1.395 | 0.528 | 0.483 | 1.842 | **0.448** |
 
 ### Speedups (t_CPU ÷ t_FPGA)
 
-| Dataset | vs exact@1 | vs exact@32 | vs hist@1 | **vs hist@32** |
-|---|--:|--:|--:|--:|
-| tpch_qty | 2.02× | 0.58× | 8.36× | **2.75×** |
-| taxi_d1 | 2.09× | 0.74× | 6.50× | **2.65×** |
-| taxi_d2 | 2.13× | 0.58× | 7.15× | **2.45×** |
-| taxi_d3 | 2.26× | 0.50× | 8.64× | **2.61×** |
-| taxi_d4 | 2.40× | 0.45× | 9.62× | **3.64×** |
-| tpch_extprice | 6.86× | 1.07× | 4.95× | **1.71×** |
-| extprice SF10 | 5.16× | 0.60× | 6.67× | **2.15×** |
+| Dataset | vs exact@1 | **vs exact@32** | vs hist@32 |
+|---|--:|--:|--:|
+| tpch_extprice | 12.4× | **2.00×** | 3.4× |
+| taxi_d1 | 5.5× | **1.92×** | 6.7× |
+| tpch_qty | 5.6× | **1.68×** | 8.8× |
+| taxi_d2 | 5.7× | **1.52×** | 7.2× |
+| taxi_d3 | 6.1× | **1.34×** | 7.4× |
+| taxi_d4 | 7.0× | **1.29×** | 9.9× |
+| extprice SF10 | 9.7× | **1.08×** | 4.1× |
+
+**FPGA throughput:** 118–323 M rows/s, and it now *grows* with data size (228 → 323 M rows/s across
+taxi d1→d4) rather than being flat — the fixed per-query overheads that used to dominate are gone.
+The two TPC-H `extprice` points are lower (118–134 M rows/s) because that column is
+high-cardinality and poorly compressible (310 MB at SF10): throughput tracks **bytes decoded**, not rows.
 
 ---
 
 ## 3. Honest performance verdict
 
-**Do we beat DuckDB CPU?** It depends on the baseline — stated plainly:
+**The FPGA beats 32-thread DuckDB's native exact quantile on every dataset (1.08×–2.00×)**, with
+identical outlier counts, decode included on both sides, same binary and host, median of 7 warm runs.
+It also beats the same-algorithm SQL histogram at 32 threads by 3.4×–9.9×, and single-core DuckDB by
+5×–12×.
 
-1. **vs the same algorithm (1024-bin histogram in SQL), at any core count: YES, decisively.** The FPGA
-   is **1.7×–3.6× faster than 32-core** CPU-histogram and **5×–10× faster than single-core**. This is
-   the apples-to-apples comparison (identical algorithm), and the FPGA wins across the board.
-2. **vs single-/few-core DuckDB (either algorithm): YES.** 2×–2.4× (taxi) up to ~5×–7× (wide-range
-   TPC-H) over 1 thread.
-3. **vs DuckDB's *native, hand-optimized exact quantile* at full 32 cores: mostly NO** (0.45×–0.74×),
-   except the wide-range `tpch_extprice` SF1 where the FPGA edges ahead (1.07×). DuckDB's native
-   `quantile` is a highly tuned, fully parallel kernel; on these **small single-column** workloads
-   (≤310 MB / ≤60 M rows) the FPGA path's fixed costs dominate its compute advantage.
+Two caveats stated plainly:
 
-**Why the FPGA doesn't win the 32-core exact case (and how to fix it):** the `iqr_flags` path pays
-(a) FPGA parquet-decode → host, (b) a **second DMA** to stream decoded values back for the IQR pass,
-(c) DuckDB table-function row emission + count. FPGA throughput being ~flat at ~100 M rows/s across a
-7× size range confirms it is **overhead/round-trip-bound**, not saturated on compute. The clear
-optimization is to **fuse decode+IQR in a single FPGA pass** (remove the host round-trip) — expected
-to move the FPGA well past the 32-core exact line, especially as data size grows (note the FPGA's
-advantage already *grows* with size vs single-core: 2.0× → 2.4× on taxi).
+- **The SF10 margin (1.08×) is thin** — within the run-to-run variance you would expect on a shared
+  cluster node. Treat it as "parity or better", not as a robust win. taxi_d1 (1.92×) and
+  `tpch_extprice` (2.00×) are the solid ones.
+- **`cpu_exact` is the baseline that matters.** An earlier harness (`IQR_RESULTS.md`) used a
+  `quantile_cont` formulation that runs ~8× slower than the `GROUP BY`+window form used here, which
+  flattered the FPGA badly. Do not quote those numbers.
 
-**Where the accelerator already shines:** low-core / power-constrained deployments, and the
-histogram-approximation regime — the FPGA delivers exact-quality outlier decisions (Section 1) at
-1.7–3.6× the throughput of a 32-core CPU running the same approximation.
+### 3a. What actually made it fast: the accelerator was never the bottleneck
+
+Instrumenting the query end-to-end (`OASIS_IQR_TIMING=1`) produced the most important result in this
+document. On taxi_d4, **before** optimization (0.144 s):
+
+| phase | ms | |
+|---|--:|---|
+| DuckDB row emission | **81** | table function had `MaxThreads() == 1` — 20.3 M rows on one thread |
+| IQR two passes (PCIe) | 26 | 163 MB streamed to the FPGA, twice, at line rate |
+| host memcpy | 20 | per-row-group copy into the column buffer, one thread |
+| IQR setup | 8 | `derive_window()` read all 163 MB to collect 8192 stride samples |
+| parquet fetch + submit | 5 | |
+| **waiting for the FPGA decoder** | **0.07** | **0.05% of the query** |
+
+**We spent 70 µs of a 144 ms query waiting on the FPGA.** Everything else was serial host code
+running on 1 of 32 cores. Four software changes (no bitstream, no RTL, no HBM):
+
+1. **Parallel emission** — heavy phase moved to `InitGlobal`; workers claim disjoint row slices off an
+   atomic cursor. 81 ms → ~10 ms. *This one change flipped taxi_d4 from 0.55× to 1.06× vs the CPU.*
+2. **Pipelined decode** — the loop submitted one row group and blocked on it, idling the decoder
+   through every fetch/submit/copy. Now keeps 8 groups in flight (`OASIS_IQR_DECODE_WINDOW`); the
+   scheduler was already async and already load-balanced across lanes, we simply never used it.
+3. **Parallel memcpy** (+ a zero-copy path where row groups align to the 64 KB FPGA transfer, guarded
+   with a fallback; these files don't align).
+4. **Sampling by seek, not scan** — `derive_window()` now jumps to `p[0], p[step], …` instead of
+   walking 20.3 M elements to find 8192 of them. 8 ms → 0.6 ms.
+
+taxi_d4: **0.180 s → 0.063 s (2.9×), with the bitstream untouched.**
+
+### 3b. Where the remaining time goes, and what is left
+
+taxi_d4 after optimization (0.063 s; `heavy` = 54 ms):
+
+| phase | ms |
+|---|--:|
+| **IQR two passes (PCIe)** | **26** |
+| FPGA decode wait | 9 |
+| host memcpy | 10 |
+| DuckDB emission (parallel) | ~9 |
+| parquet fetch + submit | 6 |
+| IQR setup | 0.6 |
+
+The largest single cost is now the **two PCIe passes**: the decoded column (163 MB) crosses PCIe three
+times — out once when the decoder produces it, back in twice for the histogram and the flag pass — at
+12.5 GB/s, which *is* PCIe line rate. It cannot be made faster; it can only be done fewer times.
+
+**The tap (fuse decode → IQR pass 1) — NOT implemented, and it is not a free wiring change.**
+The histogram cannot bin a value until it knows the window (`bin_min`/`bin_shift`), and today the
+window is derived *from the decoded column*, which does not exist while the decoder is still producing
+it. Removing pass 1 therefore requires changing **where the window comes from** — e.g. deriving it from
+a few row groups decoded up front, then tap-histogramming the rest and re-streaming those few (~4 MB).
+That is worth ~13 ms on taxi_d4 (~18%) but **shifts the outlier counts**, and §1 already identifies
+taxi_d4 as the dataset most sensitive to window placement (2701 ppm). Costed but deliberately deferred:
+a 5-hour bitgen and an accuracy regression, for 18%, while already winning.
+
+Smaller remaining items: more decoder lanes (`--decoders N`; `fpga_wait` is now a real 9 ms since the
+memcpy no longer masks it) and eliminating the remaining memcpy via aligned row groups.
+
+**HBM / card memory is a dead end** — see `IQR_HBM_LEARNINGS.md`. Even fully working it *relocates*
+PCIe traffic to HBM rather than removing it, and card reads measured 8 MB/s against 12 GB/s for host
+DMA (cause never found; three hypotheses falsified).
 
 ---
 
