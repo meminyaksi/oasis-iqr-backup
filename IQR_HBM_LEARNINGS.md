@@ -264,6 +264,17 @@ the very outliers being detected). See `IQR_OPTIMIZATION_PLAN.md`.
    `free_hugepages = 0` with `nr_hugepages = 8` ⇒ a dead process still owns them.
    `sudo hdev reboot` **is** on the sudo allowlist (`sudo -l`); `sudo reboot` is not. Node takes
    5–15 min; may need an admin power-cycle if it doesn't return.
+5b. **`sudo hdev set hugepages --size 1G --pages 8` silently does NOTHING on alveo-u55c-07.**
+   It reports success, `hdev get hugepages` keeps showing `hugepages-1048576kB: 0`, and every FPGA
+   query dies with *"Your system has 0 free 1GiB huge pages"*. It is not a memory-availability
+   problem (we had 41 GB free). **Write sysfs directly instead — this works:**
+   ```bash
+   echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+   cat /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages   # must be 8
+   ```
+   Note `hdev` leaves 8192 x 2 MB pages (16 GB) reserved regardless; that is normal and does not
+   block the 1 GiB pages. Do not add more 2 MB pages (e.g. for a Coyote example) and then expect
+   1 GiB pages to allocate — fragmentation can starve them.
 6. **CMake cache lies.** `EN_MEM:STRING=0` / `TLBL_BITS:STRING=21` in `CMakeCache.txt` are the *Coyote
    defaults*; a plain `set(X ...)` in our `CMakeLists.txt` shadows them. **Check the generated
    `base.tcl`** (`cfg(en_mem)`, `cfg(tlbl_bits)`, `cfg(hclk_f)`) for the truth.

@@ -52,19 +52,27 @@ void IqrRunner::derive_window(const std::vector<InputChunk> &inputs) {
         return;
     }
 
+    // Seek directly to each sampled index instead of walking every element to find it: we want 8192
+    // values out of (here) 20M, so stepping over the column touches 8192 cache lines rather than
+    // reading all 163 MB through one core. Same indices, same sample, ~8 ms cheaper on taxi_d4.
     std::vector<int64_t> sample;
     sample.reserve(std::min<size_t>(total, SAMPLE_TARGET));
     size_t step = std::max<size_t>(1, total / SAMPLE_TARGET);
-    size_t idx = 0, next = 0;
-    for (const auto &chunk : inputs) {
-        const int64_t *p = reinterpret_cast<const int64_t *>(chunk.first);
-        size_t n = chunk.second / sizeof(int64_t);
-        for (size_t i = 0; i < n; ++i, ++idx) {
-            if (idx == next) {
-                sample.push_back(p[i]);
-                next += step;
-            }
+
+    size_t chunk_base = 0; // index of the first element of the current chunk
+    size_t c          = 0;
+    for (size_t idx = 0; idx < total; idx += step) {
+        // Advance to the chunk containing `idx` (indices are non-decreasing, so this walks forward).
+        while (c < inputs.size() &&
+               idx >= chunk_base + inputs[c].second / sizeof(int64_t)) {
+            chunk_base += inputs[c].second / sizeof(int64_t);
+            ++c;
         }
+        if (c >= inputs.size()) {
+            break;
+        }
+        const int64_t *p = reinterpret_cast<const int64_t *>(inputs[c].first);
+        sample.push_back(p[idx - chunk_base]);
     }
 
     std::sort(sample.begin(), sample.end());
