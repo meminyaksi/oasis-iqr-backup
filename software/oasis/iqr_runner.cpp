@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -52,12 +53,25 @@ void IqrRunner::derive_window(const std::vector<InputChunk> &inputs) {
         return;
     }
 
-    // Seek directly to each sampled index instead of walking every element to find it: we want 8192
-    // values out of (here) 20M, so stepping over the column touches 8192 cache lines rather than
-    // reading all 163 MB through one core. Same indices, same sample, ~8 ms cheaper on taxi_d4.
+    // Seek directly to each sampled index instead of walking every element to find it: we want a few
+    // thousand values out of (here) 20M, so stepping over the column touches that many cache lines
+    // rather than reading all 163 MB through one core. Same indices, same sample, ~8 ms cheaper on
+    // taxi_d4. The reads are ~20 KB apart, so each costs a cache miss (~80 ns) -- the sample size is
+    // therefore a direct accuracy/latency knob, tunable with OASIS_IQR_SAMPLE for measurement.
+    static const size_t sample_target = [] {
+        const char *e = std::getenv("OASIS_IQR_SAMPLE");
+        if (e) {
+            long v = std::strtol(e, nullptr, 10);
+            if (v >= 64) {
+                return static_cast<size_t>(v);
+            }
+        }
+        return SAMPLE_TARGET;
+    }();
+
     std::vector<int64_t> sample;
-    sample.reserve(std::min<size_t>(total, SAMPLE_TARGET));
-    size_t step = std::max<size_t>(1, total / SAMPLE_TARGET);
+    sample.reserve(std::min<size_t>(total, sample_target));
+    size_t step = std::max<size_t>(1, total / sample_target);
 
     size_t chunk_base = 0; // index of the first element of the current chunk
     size_t c          = 0;
