@@ -1,13 +1,128 @@
-# IQR + HBM (card memory): learnings & open experiment — 2026-07-13
+# IQR: state of play, learnings, and the HBM dead end
+### Updated 2026-07-14. **READ §0 FIRST.** Everything below §0 is history/reference.
 
-**READ THIS FIRST before touching HBM / card memory / `EN_MEM` in oasis or celeris.**
+---
 
-Goal: the IQR operator is **PCIe-bandwidth-bound**. Cut the number of times the decoded column
-crosses PCIe (today: 3) by keeping it in the FPGA's HBM.
+## 0. STATE OF PLAY — resume here
 
-**Status: HBM card reads run at 8–11 MB/s (vs 12 GB/s host DMA), bit-exact but ~1200x too slow.**
-Two bitstreams are in flight (§7) to find out why. Until they land, `OASIS_IQR_USE_CARD=0` (host) is
-the default and the system works correctly and at full PCIe speed.
+### Where the project is
+
+**The FPGA beats 32-thread DuckDB's native exact quantile on all 7 datasets, 1.08×–2.00×**, at
+99.73%–100% per-row agreement with exact IQR. This is DONE, committed, and re-verified on silicon.
+Nothing is in flight. Nothing is broken.
+
+- Perf + correctness (authoritative, fresh): **`bench/RESULTS.md`** — §2 perf, §3a *how* we got here,
+  §3b what's left, §1 correctness. Raw: `bench/perf_build11_ws.csv`, `bench/correctness_build11.txt`.
+- Bitstream: **`hardware/build-11`** (1024-bin histogram, timing closed WNS 0.000). Unchanged all day.
+- Default mode: **host** (`OASIS_IQR_USE_CARD=0`). Card/HBM mode is a dead end (§1–§7 below).
+
+| dataset | CPU exact @32 | FPGA | speedup | per-row accuracy |
+|---|--:|--:|--:|--:|
+| tpch_extprice | 0.102 | **0.051** | **2.00×** | 100% |
+| taxi_d1 | 0.025 | **0.013** | **1.92×** | 99.958% |
+| tpch_qty | 0.032 | **0.019** | **1.68×** | 100% (bit-exact) |
+| taxi_d2 | 0.035 | **0.023** | **1.52×** | 99.952% |
+| taxi_d3 | 0.059 | **0.044** | **1.34×** | 99.999% |
+| taxi_d4 | 0.081 | **0.063** | **1.29×** | 99.730% |
+| extprice SF10 | 0.483 | **0.448** | **1.08×** | 100% |
+
+### THE lesson of 2026-07-14: the accelerator was never the bottleneck
+
+Instrumentation (`OASIS_IQR_TIMING=1`) showed we spent **0.07 ms of a 144 ms query waiting for the
+FPGA** — 0.05%. Every bottleneck was **serial host code on 1 of 32 cores**. taxi_d4 went
+**0.180 s → 0.063 s (2.9×)** with **zero hardware change**. The four fixes (all in
+`extension/src/oasis_iqr.cpp` + `software/oasis/iqr_runner.cpp`):
+
+1. **`MaxThreads() == 1`** on the `iqr_flags` table function → DuckDB emitted 20.3 M rows
+   single-threaded. **81 ms of 144.** This one fix flipped d4 from 0.55× (losing) to 1.06× (winning).
+2. **Serial decode loop** — submitted one row group, blocked on it, idled the decoder through every
+   fetch/submit/copy. The `Scheduler` was *already* async and *already* load-balanced across lanes;
+   we simply never used it. Now 8 in flight (`OASIS_IQR_DECODE_WINDOW`).
+3. **Single-threaded memcpy** of decoded groups into the column buffer (20 ms) → parallel. (A
+   zero-copy path exists — sink = slice of the column buffer — but needs row groups to be a whole
+   number of 64 KB FPGA transfers; these files aren't, so it falls back. Guarded, prints `sink=`.)
+4. **`derive_window()` read all 163 MB** to collect 8192 stride samples (walked every element testing
+   `if (idx == next)`). Now seeks to `p[k*step]`. 8 ms → 0.6 ms.
+
+**Do not trust "the FPGA/decoder is the bottleneck" without measuring.** I asserted decode was 77% of
+runtime and nearly burned a 5-hour `--decoders 4` bitgen; `fpga_wait` was 0.05%. Note `fpga_wait ≈ 0`
+means *"not the critical path"*, NOT *"instant"* — once the memcpy was parallelized it rose to a real
+9 ms.
+
+### How to measure (do this before optimizing anything)
+
+```bash
+cd ~/oasis/extension/build/release && export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
+OASIS_IQR_TIMING=1 ./duckdb -c "PRAGMA threads=32;
+  SELECT count(*) FILTER (WHERE f) FROM iqr_flags('$HOME/datasets/taxi_d4.parquet','fare_cents') t(v,f);
+  SELECT count(*) FILTER (WHERE f) FROM iqr_flags('$HOME/datasets/taxi_d4.parquet','fare_cents') t(v,f);"
+```
+Read the **2nd** (warm) block. `emit ≈ DuckDB's real − heavy`. Full sweeps:
+`bash bench/perf.sh` and `bash bench/correctness.sh` (2 warmups + 7 timed, median; run on the alveo node).
+
+Env knobs: `OASIS_IQR_TIMING=1`, `OASIS_IQR_DECODE_WINDOW=8` (1 = old serial behaviour),
+`OASIS_IQR_SAMPLE=8192`, `OASIS_IQR_USE_CARD=0`.
+
+### Current time budget (taxi_d4, 63 ms; `heavy` = 54 ms)
+
+| phase | ms | note |
+|---|--:|---|
+| **IQR two passes (PCIe)** | **26** | 163 MB × 2 at 12.5 GB/s = **line rate. Cannot be made faster.** |
+| FPGA decode wait | 9 | real now that the memcpy no longer masks it |
+| host memcpy | 10 | parallel; would be 0 with aligned row groups |
+| DuckDB emission | ~9 | parallel (was 81) |
+| parquet fetch + submit | 6 | |
+| IQR setup | 0.6 | was 8 |
+
+### The two candidate next bitstreams — costed, neither started
+
+**① Bin-MIDPOINT quartile — RECOMMENDED IF ANY.** The FPGA reports each quartile at its bin's *lower
+edge* (bin width 16 on d4), so Q1/Q3 land low, both fences shift down, and the 4048–4080 band is
+over-flagged (54,921 rows = d4's 2701 ppm). **Proven it is NOT the window sample**: swept
+`OASIS_IQR_SAMPLE` 8192 → 524288 (64×), `n_out`/`lo_eff`/`hi_eff` **bit-identical** at every size while
+cost went 27 → 56 ms. CPU-hist with the same 1024 bins but exact quartiles disagrees only 24 ppm,
+which isolates it. Fix = **one adder** on the quartile output; no latency, no resources, no timing
+risk. `bench/RESULTS.md` §3 simulates it: gap −1247 → −50, **~25× more accurate**.
+*User decided 2026-07-14 that 99.73% is already good enough — deferred, not rejected.*
+
+**② The "tap" (fuse decode → IQR pass 1) — NOT a free wiring change. Probably don't.** Worth ~13 ms
+(18%) by removing one of the three PCIe crossings. **Blocker:** the histogram cannot bin a value until
+it knows the window (`bin_min`/`bin_shift`), and the window is derived *from the decoded column*, which
+doesn't exist while the decoder is still producing it. Removing pass 1 requires changing where the
+window comes from (e.g. decode ~4 row groups first, derive from those, tap-histogram the rest,
+re-stream those 4 ≈ 4 MB) — which **shifts the outlier counts**, on the dataset already most sensitive
+to window placement. Trading correctness for 18% while already winning is a bad deal.
+
+**③ `--decoders 4`** — `fpga_wait` is now a real 9 ms, so this finally buys *something* (~7 ms), but
+it's the smallest of the three and was worth literally nothing before today's fixes.
+
+### Gotchas that ate hours on 2026-07-14 (see also §9)
+
+- **`sudo hdev set hugepages --size 1G --pages 8` is a SILENT NO-OP on alveo-u55c-07.** Reports
+  success, allocates nothing, every query dies with *"0 free 1GiB huge pages"*. **Write sysfs
+  directly:** `echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`
+- **Build Coyote's `sw/` on the ALVEO node** — `coyote/sw/CMakeLists.txt` has `-march=native`;
+  hacc-build-02 is Intel (AVX-512), alveo-u55c-07 is AMD Zen 2 (no AVX-512) → `Illegal instruction`
+  that looks like an FPGA fault but isn't.
+- **`make release` in `extension/` rebuilds ALL of DuckDB (~15 min).** The `unittest` target always
+  fails to link (`~/opt` rpath) — **that is expected and harmless**; the `duckdb` binary is fine.
+  Check its mtime.
+- **`liboasis.so` is linked dynamically** → changes to `software/oasis/` need only
+  `cmake --build software/build && cmake --install software/build`, **no DuckDB rebuild**.
+- **Don't use the old `IQR_RESULTS.md` numbers.** Its DuckDB baseline used `quantile_cont`, which is
+  ~8× slower than the `GROUP BY`+window form in `bench/sql/exact_count.sql`. It flattered us badly
+  (claimed 3.7× when we were actually *losing* at 0.55×). `bench/RESULTS.md` is authoritative.
+
+---
+
+## HISTORY: the HBM / card-memory dead end (2026-07-13)
+
+**Do not restart this without reading §0 first.** Conclusion: **HBM is a dead end** — not because it's
+slow (Coyote's own `hello_world` reads card memory at **10.3 GB/s**), but because **moving the column
+to HBM relocates the 192 MB of PCIe traffic to HBM rather than removing it**. Same bytes, different
+wire. The win was never there. Separately, *our* card reads run at 8–11 MB/s for reasons we never
+found (three hypotheses falsified: HBM timing, 1 GiB pages, page-fault storms). The five Coyote driver
+bugs fixed below are real and worth upstreaming regardless.
 
 ---
 
