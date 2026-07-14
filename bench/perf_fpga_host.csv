@@ -1,0 +1,8 @@
+dataset,rows,bytes,system,threads,median_s,min_s,reps
+tpch_qty,,4547249,fpga,32,NA,NA,7
+taxi_d1,,3965929,fpga,32,NA,NA,7
+taxi_d2,,8017090,fpga,32,NA,NA,7
+taxi_d3,,17785519,fpga,32,NA,NA,7
+taxi_d4,,27875548,fpga,32,NA,NA,7
+tpch_extprice,,31000037,fpga,32,NA,NA,7
+tpch_extprice_sf10,,309899406,fpga,32,NA,NA,7
