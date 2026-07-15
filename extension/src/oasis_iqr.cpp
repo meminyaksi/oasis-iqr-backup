@@ -181,16 +181,23 @@ std::shared_ptr<libstf::Buffer> DecodeColumnAllGroups(ClientContext &context, oa
         return nullptr;
     }
 
-    // Zero-copy needs every group but the last to end on a 64 KB FPGA-transfer boundary; otherwise
-    // the following group's slice would start misaligned.
-    bool zero_copy = true;
-    for (size_t k = 0; k + 1 < live.size(); k++) {
-        size_t nbytes = meta.groups[live[k]].chunks[col].num_values * sizeof(int64_t);
-        if (nbytes % libstf::BYTES_PER_FPGA_TRANSFER != 0) {
-            zero_copy = false;
-            break;
-        }
-    }
+    // DISABLED -- a slice sink DOES NOT WORK on this hardware, and it hangs, not errors.
+    //
+    // The FPGA output writer manages each output buffer as a whole *registered allocation*; the
+    // decode-completion interrupt routes back to the runner by allocation. A MakeSlice() view into a
+    // shared buffer is not a registered allocation, so the interrupt never arrives and the runner
+    // blocks forever in get_next_batch(). This is the "one-buffer-per-chunk invariant" that the
+    // working scan path documents and obeys (oasis_scan.cpp: each chunk's sink is its own
+    // ctx.allocate_output_buffer()). Zero-copy legitimately lives on the SOURCE and the DuckDB-emit
+    // side (FlatVector::SetData), never on the sink.
+    //
+    // The 64 KB-alignment guard below was never the real constraint -- it merely happened to fail on
+    // every real (unaligned) parquet and so always fell back to memcpy, hiding the broken path. Feeding
+    // it an aligned file exposed the hang. The memcpy is not removable this way; the only legitimate
+    // way to drop it is to teach IqrRunner to stream the per-chunk buffers in sequence instead of
+    // gathering them into one contiguous column. Do not re-enable slice sinks. See
+    // memory/iqr-fpga-beats-duckdb-host-path.md and IQR_HBM_LEARNINGS.md.
+    bool zero_copy = false;
     tm.zero_copy = zero_copy;
 
     // One contiguous int64 destination buffer for the whole column. Allocated through the output-buffer

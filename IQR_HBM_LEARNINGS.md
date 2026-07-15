@@ -39,8 +39,13 @@ FPGA** — 0.05%. Every bottleneck was **serial host code on 1 of 32 cores**. ta
    fetch/submit/copy. The `Scheduler` was *already* async and *already* load-balanced across lanes;
    we simply never used it. Now 8 in flight (`OASIS_IQR_DECODE_WINDOW`).
 3. **Single-threaded memcpy** of decoded groups into the column buffer (20 ms) → parallel. (A
-   zero-copy path exists — sink = slice of the column buffer — but needs row groups to be a whole
-   number of 64 KB FPGA transfers; these files aren't, so it falls back. Guarded, prints `sink=`.)
+   zero-copy slice-sink path was attempted — sink = slice of the column buffer — and **it is now hard
+   DISABLED: slice sinks HANG on this hardware.** The FPGA output writer routes the decode-completion
+   interrupt back per *registered allocation*; a slice view is not one → interrupt never arrives →
+   deadlock. This is the one-buffer-per-chunk invariant `oasis_scan.cpp:228,288` documents. Rewriting
+   the parquet to 64 KB-aligned row groups removes the memcpy *guard* and detonates the hang; do NOT
+   do it. The memcpy stays until `IqrRunner` learns to stream per-chunk buffers. See 2026-07-15 note
+   in `memory/iqr-fpga-beats-duckdb-host-path.md`.)
 4. **`derive_window()` read all 163 MB** to collect 8192 stride samples (walked every element testing
    `if (idx == next)`). Now seeks to `p[k*step]`. 8 ms → 0.6 ms.
 
