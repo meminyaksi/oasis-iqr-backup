@@ -153,16 +153,35 @@ document. On taxi_d4, **before** optimization (0.144 s):
 running on 1 of 32 cores. Four software changes (no bitstream, no RTL, no HBM):
 
 1. **Parallel emission** — heavy phase moved to `InitGlobal`; workers claim disjoint row slices off an
-   atomic cursor. 81 ms → ~10 ms. *This one change flipped taxi_d4 from 0.55× to 1.06× vs the CPU.*
+   atomic cursor. The table function had `MaxThreads() == 1`, so 20.3 M result rows were emitted through
+   DuckDB on a single core. 81 ms → ~9 ms. *This one change flipped taxi_d4 from 0.55× to 1.06× vs the
+   CPU — the largest single gain by far.*
 2. **Pipelined decode** — the loop submitted one row group and blocked on it, idling the decoder
    through every fetch/submit/copy. Now keeps 8 groups in flight (`OASIS_IQR_DECODE_WINDOW`); the
    scheduler was already async and already load-balanced across lanes, we simply never used it.
-3. **Parallel memcpy** (+ a zero-copy path where row groups align to the 64 KB FPGA transfer, guarded
-   with a fallback; these files don't align).
+   Reclaims the ~9 ms the host would otherwise sit blocked on the decoder; smallest of the four, and
+   only pays off *together with* (3), which stops the memcpy from masking the wait.
+3. **Parallel memcpy** — the 166 per-row-group copies into the contiguous column buffer write to
+   disjoint ranges, so they run on a thread pool instead of one core. ~20 ms → ~10 ms.
 4. **Sampling by seek, not scan** — `derive_window()` now jumps to `p[0], p[step], …` instead of
    walking 20.3 M elements to find 8192 of them. 8 ms → 0.6 ms.
 
-taxi_d4: **0.180 s → 0.063 s (2.9×), with the bitstream untouched.**
+**Per-step gain (taxi_d4, the phase each step attacks):**
+
+| # | step | before | after | saved | note |
+|---|---|--:|--:|--:|---|
+| 1 | parallel emission     | 81 ms | ~9 ms  | **~72 ms** | biggest; flipped loss→win on its own |
+| 3 | parallel memcpy        | 20 ms | ~10 ms | **~10 ms** | 166-buffer gather across cores |
+| 2 | pipelined decode       | (hidden wait) | ~9 ms on critical path | **~9 ms** | keeps FPGA off the critical path |
+| 4 | seek-sample window     | 8 ms  | 0.6 ms | **~7 ms**  | stop reading 163 MB for 8192 samples |
+
+taxi_d4: **0.180 s → 0.063 s (2.9×), with the bitstream untouched.** vs 32-thread `cpu_exact` this went
+from 0.55× (losing) to 1.29× (winning); across all 7 datasets, from losing on 6 → **winning on all 7
+(1.08×–2.00×)**.
+
+**The common thread:** none of the four touched the FPGA or the IQR math. Every one removed a place
+where 31 of 32 cores sat idle while 1 did the work. The accelerator was always fast; the ordinary host
+code wrapped around it was doing everything single-file.
 
 ### 3b. Where the remaining time goes, and what is left
 
@@ -190,8 +209,23 @@ That is worth ~13 ms on taxi_d4 (~18%) but **shifts the outlier counts**, and §
 taxi_d4 as the dataset most sensitive to window placement (2701 ppm). Costed but deliberately deferred:
 a 5-hour bitgen and an accuracy regression, for 18%, while already winning.
 
-Smaller remaining items: more decoder lanes (`--decoders N`; `fpga_wait` is now a real 9 ms since the
-memcpy no longer masks it) and eliminating the remaining memcpy via aligned row groups.
+Smaller remaining item: more decoder lanes (`--decoders N`; `fpga_wait` is now a real 9 ms since the
+memcpy no longer masks it) — but decode was never the bottleneck, so this is low value and costs a
+5-hour bitgen.
+
+**Eliminating the memcpy via a zero-copy slice sink is a DEAD END (tried & failed 2026-07-15).** The
+idea: rewrite the parquet to 64 KB-aligned row groups so the decoder DMAs each group straight into its
+final slot in the column buffer, no copy. It **hangs, not errors, and window=1 hangs too** (not a
+concurrency bug). Root cause: the FPGA output writer routes each decode-completion interrupt back per
+*registered allocation*; a `MakeSlice()` view into a shared buffer is not one, so the interrupt never
+arrives → deadlock. This is the one-buffer-per-chunk invariant the working scan path documents and
+obeys (`oasis_scan.cpp:228,288` — every chunk's sink is its own `allocate_output_buffer()`; zero-copy
+there lives on the SOURCE and DuckDB-emit side, never the sink). The 64 KB-alignment guard in
+`oasis_iqr.cpp` had been *hiding* this by always falling back to memcpy on real (unaligned) files; an
+aligned file removed the guard and exposed the hang. `zero_copy` is now hard-disabled with a warning
+comment. The 10 ms memcpy stays until `IqrRunner` is taught to stream the 166 per-chunk buffers in
+sequence instead of gathering them into one contiguous column (a real runner change, not scoped). See
+`IQR_HBM_LEARNINGS.md`.
 
 **HBM / card memory is a dead end** — see `IQR_HBM_LEARNINGS.md`. Even fully working it *relocates*
 PCIe traffic to HBM rather than removing it, and card reads measured 8 MB/s against 12 GB/s for host
