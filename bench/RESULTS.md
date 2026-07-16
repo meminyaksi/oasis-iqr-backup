@@ -231,6 +231,49 @@ sequence instead of gathering them into one contiguous column (a real runner cha
 PCIe traffic to HBM rather than removing it, and card reads measured 8 MB/s against 12 GB/s for host
 DMA (cause never found; three hypotheses falsified).
 
+### 3c. Reading the budget — what actually bounds this query (analysis, 2026-07-16)
+
+**Nothing in this query is compute-bound.** No arithmetic anywhere is the bottleneck — not the FPGA's
+IQR math (idle 99.95%), not the decode (9 ms). The 63 ms splits into two comparable halves, both of
+which are *data movement* or *row handling*, not computation:
+
+```
+IQR data movement (2 PCIe passes) ...... ~26 ms  (41%)  — the single largest piece
+everything else ........................ ~37 ms  (59%)
+   ├─ decode + gather(memcpy) + fetch ..  ~25 ms
+   └─ DuckDB emission ..................   ~9 ms
+```
+
+So the sharp statements are: the **IQR operation is PCIe-bandwidth-bound** (moving 163 MB twice at line
+rate), not compute-bound; and it is the *largest* single cost, **not** a small portion. The only lever
+left on the IQR side is *fewer PCIe crossings* (a hardware change) — you cannot compute your way out of
+a movement-bound problem.
+
+**Is the win from decoding? No — decode is a tax, not an edge.** Both `cpu_exact` and `fpga` decode the
+same parquet, so decode is a *shared* cost, not a differential advantage. On the FPGA it is worse than
+neutral: the decode-related host work (decode-wait 9 + gather 10 + fetch 6 ≈ **25 ms, ~40%**) exists
+only because we decode into 166 scattered buffers and must gather them — DuckDB decodes straight into
+its pipeline with no equivalent gather. Estimate: strip parquet from both (raw int64 in memory) and the
+FPGA would likely win by *more* (~1.8× vs 1.29× on taxi_d4), because it sheds its 25 ms decode tax while
+the CPU still pays the heavy exact-IQR compute. (Not yet measured; a raw-int64 microbench would settle
+it.)
+
+**Why the win is thin (1.08–1.29× on most): DuckDB's exact method is very well tuned.** The tell is
+`cpu_hist` — the *same* 1024-bin histogram algorithm the FPGA uses, run naively in SQL, is **~7× slower
+than `cpu_exact`** (taxi_d4: 0.553 vs 0.079 s). So the FPGA is not winning with a smarter *algorithm*;
+it runs a so-so-on-CPU algorithm on hardware fast enough to edge out a strong CPU implementation. The
+FPGA's real edge is *cheap hardware IQR (streaming histogram at line rate) vs expensive CPU IQR
+(hash-aggregate every distinct value + a cumulative window over 20 M rows)*.
+
+**Why DuckDB emission is not "just streaming."** The heavy phase already has the two result arrays in
+memory, yet emitting them cost 81 ms on one core because it is genuine O(rows) work: per row it (a)
+**unpacks one bit** from the FPGA's packed 1-bit-per-row flag bitmask into DuckDB's 1-byte BOOL
+(`flag_out[k] = (mask[i>>3] >> (i&7)) & 1` — a format transform, not a pointer), (b) writes the value,
+across ~10,000 chunk calls each with engine overhead. 20.3 M × per-row work on one core ≈ 81 ms. The
+work is embarrassingly parallel (row *i* is independent of row *j*), so splitting rows across 32 cores
+via the atomic cursor cut it to ~9 ms. The flag column can *never* be zero-copy (bit→byte expansion is
+unavoidable); the compact 1-bit packing that saves PCIe is paid back as an unpack at emission.
+
 ---
 
 ## 4. Fairness notes / threats to validity
@@ -240,6 +283,21 @@ DMA (cause never found; three hypotheses falsified).
 - **FPGA number is the full product path** (decode + IQR + DuckDB emit), *not* a kernel microbench.
   Kernel-only sanity via `iqr_sim` (raw int64, no decode/DB) confirms correctness (`total=8192`,
   `collisions=0`) but is not used as a headline number.
+- **The timed endpoints are symmetric, and if anything harder on the FPGA.** DuckDB's `.timer` wraps
+  the whole statement for every system: start = raw parquet file, end = the single outlier count. The
+  FPGA path additionally must **emit all 20.3 M `(value, is_outlier)` rows out through DuckDB's engine**
+  to be counted (the ~9 ms emission), *inside* the timed region; `cpu_exact` fuses its final
+  filter+count into its own pipeline with no such materialization. So the endpoint taxes the FPGA
+  extra — the comparison is not rigged in its favour.
+- **Timing is host-side wall clock, and it is a conservative *upper* bound on FPGA cost.** `wait_ms` is
+  a `std::chrono` stopwatch around the blocking `get_next_batch()`; anything that delayed the query is
+  captured (never an under-count), and it also absorbs queue/DMA-feed latency (so it slightly
+  *over*-credits the FPGA). Overlapped FPGA cycles hidden behind host work are deliberately uncounted —
+  they cost 0 wall clock. **The StreamProfiler is NOT used for the headline number:** its cycle counters
+  see only the FPGA lane (blind to the ~54 ms of host work), and they never reset per query (accumulate
+  until an explicit `profile.stop` the query path never issues). Using it would compare FPGA-kernel time
+  against CPU-whole-query time and dishonestly flatter the FPGA ~7×. It is a *diagnostic* only
+  (starved vs stalled vs handshakes) — which is how we learned the lane was starved ~99.95%.
 - **CPU-hist is a slightly pessimistic baseline:** it computes its window with two exact
   `quantile_disc` passes, whereas the FPGA uses a cheap stride sample. A sample-based SQL window would
   narrow the FPGA-vs-hist gap somewhat; we report the straightforward SQL implementation.
