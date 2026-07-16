@@ -297,7 +297,12 @@ unavoidable); the compact 1-bit packing that saves PCIe is paid back as an unpac
   see only the FPGA lane (blind to the ~54 ms of host work), and they never reset per query (accumulate
   until an explicit `profile.stop` the query path never issues). Using it would compare FPGA-kernel time
   against CPU-whole-query time and dishonestly flatter the FPGA ~7×. It is a *diagnostic* only
-  (starved vs stalled vs handshakes) — which is how we learned the lane was starved ~99.95%.
+  (starved vs stalled vs handshakes). Recorded reading (input lane, 128 MiB, build-09):
+  `handshakes=262144, starved=20%, stalled=0.3%` → **within the streaming window** the IQR compute is
+  never the bottleneck (0.3% back-pressured) and the FPGA waits on PCIe 20% of the time (PCIe-bound
+  signature). Distinct from the *end-to-end wall-clock* figure that the lane is active only ~0.05% of
+  the whole query — that one includes emission/memcpy/decode where the FPGA isn't streaming at all. Do
+  not conflate the two: 20% starved is *of the stream*, 0.05% active is *of the query*.
 - **CPU-hist is a slightly pessimistic baseline:** it computes its window with two exact
   `quantile_disc` passes, whereas the FPGA uses a cheap stride sample. A sample-based SQL window would
   narrow the FPGA-vs-hist gap somewhat; we report the straightforward SQL implementation.
