@@ -301,8 +301,33 @@ unavoidable); the compact 1-bit packing that saves PCIe is paid back as an unpac
 - **CPU-hist is a slightly pessimistic baseline:** it computes its window with two exact
   `quantile_disc` passes, whereas the FPGA uses a cheap stride sample. A sample-based SQL window would
   narrow the FPGA-vs-hist gap somewhat; we report the straightforward SQL implementation.
-- **Small workloads favor the CPU:** all inputs ≤310 MB compressed; fixed PCIe/launch overheads are a
-  larger fraction of FPGA time here than they would be at 10–100× the data.
+- **Scaling trend (measured): the advantage shrinks as data grows — it favors the CPU, not the FPGA.**
+  This is the opposite of the usual accelerator story and worth stating plainly. The taxi series is a
+  controlled experiment (same `fare_cents` column, more of it):
+
+  | dataset | size | speedup | fpga MB/s | cpu MB/s |
+  |---|--:|--:|--:|--:|
+  | taxi_d1 | 3.8 MB | 1.92× | 291 | 151 |
+  | taxi_d2 | 7.6 MB | 1.52× | 332 | 218 |
+  | taxi_d3 | 17 MB | 1.34× | 385 | 287 |
+  | taxi_d4 | 27 MB | 1.29× | 422 | 328 |
+  | extprice_sf10 | 295 MB | 1.08× | 660 | 612 |
+
+  Speedup falls monotonically with size; the largest dataset is ~parity. Both throughputs rise with
+  size (fixed overhead amortizes) but **the CPU rises faster** and closes the gap. Two mechanisms:
+  (1) the FPGA's end-to-end is dominated by **host plumbing that is strictly linear in rows** (emission
+  bit-unpack, gather/memcpy, decode orchestration) — it pays the same per-row tax regardless of the
+  values; (2) DuckDB's exact `GROUP BY value` scales **sub-linearly on bounded-cardinality columns**
+  (taxi fares, TPC-H qty have few distinct values → the hash table stays small → extra rows are cheap
+  increments), so the CPU gets *more efficient per row* at scale while the FPGA cannot. The FPGA's real
+  edge is **cardinality-independence**: it wins biggest on high-cardinality, poorly-compressible data
+  (`tpch_extprice` SF1 = 2.00×, where the CPU's hash table is large) — but even that collapses to 1.08×
+  at 10× scale (sf10), because the linear host tax then dominates. *Earlier drafts of this section
+  speculated the FPGA would do better at 10–100× the data; the sf10 point measured the opposite. That
+  reasoning counted the FPGA amortizing its launch overhead but ignored that the CPU amortizes better.*
+  Caveats: 7 points, sf10 is a single large point whose 1.08× is within cluster noise, and taxi d1→d4
+  mildly confounds size with distribution — but the direction is consistent across the series and the
+  scaled pair.
 
 ---
 
