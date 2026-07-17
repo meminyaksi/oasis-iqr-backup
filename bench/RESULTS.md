@@ -274,6 +274,65 @@ work is embarrassingly parallel (row *i* is independent of row *j*), so splittin
 via the atomic cursor cut it to ~9 ms. The flag column can *never* be zero-copy (bit→byte expansion is
 unavoidable); the compact 1-bit packing that saves PCIe is paid back as an unpack at emission.
 
+### 3d. Baseline optimization + the cardinality thesis (2026-07-17)
+
+Today's work stress-tested the *CPU baseline itself* — is `exact_count.sql` the fastest fair CPU code,
+and how much of the FPGA's margin rests on the baseline having slack? All numbers below are on
+**alveo-u55c-07** (same host as the FPGA — the Intel build node has a different CPU, so CPU times must
+come from the card node), **single warm runs** on a shared node with visible run-to-run variance;
+**treat as directional, medians of 5–7 still pending.** Queries: `bench/manual_queries.sql`,
+`bench/cpu_variants.sh`.
+
+**Three exact CPU formulations (all bit-identical, count = 2,057,243 on taxi_d4):**
+
+| CPU formulation | taxi_d4 warm | note |
+|---|--:|---|
+| `quantile_disc` (DuckDB built-in) | ~0.66 s | its own quantile; **~7–10× slower** — cannot collapse duplicates, processes all N |
+| `groupby_current` (`exact_count.sql`) | ~0.089 s | GROUP BY + CDF, then **re-scans all N rows** to count |
+| `groupby_histsum` (optimized) | ~0.068 s | count via `COALESCE(sum(c),0)` over the histogram — **no re-scan**; ~24% faster |
+
+Findings:
+1. **The current baseline has slack.** The final `count(*) FROM s WHERE …` re-scans all N rows, but the
+   per-value counts already exist in the `ecnt` histogram. Replacing it with
+   `SELECT COALESCE(sum(c),0) FROM ecnt,ef WHERE v<lo OR v>hi` avoids the second full pass. Warm gain
+   **~24% (~21 ms)** on taxi_d4 — real but *smaller* than a cold single run suggested (~40%): measure
+   warm, take medians. (`COALESCE` matters — `sum()` over an empty set returns NULL, not 0, when a
+   dataset has zero outliers.)
+2. **The FPGA's low-card margin is baseline-dependent.** taxi_d4 FPGA ≈ 0.063 s vs: `quantile_disc`
+   **~10×**, `groupby_current` **~1.3×**, `groupby_histsum` **~1.0× (parity, within noise)**. Against
+   the *fastest* exact CPU code, the FPGA's low-cardinality advantage nearly vanishes.
+3. **`quantile_disc` is not the fair baseline for a low-card "beats DuckDB" claim** — it is ~10× slower
+   only because it can't exploit low cardinality. Report it as the "naive user writes this" number, but
+   the hand-tuned GROUP BY is the honest baseline. (Both CPU baselines use **zero** of our C++ — pure
+   stock DuckDB, native `read_parquet`; our code only runs on the `iqr_flags` path.)
+
+**Measured cardinality (why any of this happens):**
+
+| dataset | rows | distinct | uniqueness |
+|---|--:|--:|--:|
+| taxi_d4 | 20.3 M | 14,681 | 0.072% (very low) |
+| tpch_qty | 6.0 M | 50 | 0.0008% (extremely low) |
+| tpch_extprice | 6.0 M | 933,900 | 15.6% (high) |
+
+**The definitive contrast — optimized CPU (`histsum`) vs FPGA, same host, single warm runs:**
+
+| dataset | distinct | CPU optimized | FPGA | outcome |
+|---|--:|--:|--:|---|
+| tpch_qty (low card) | 50 | ~0.021 s | ~0.021 s | **head-to-head** |
+| tpch_extprice (high card) | 933,900 | ~0.105 s | ~0.053 s | **FPGA ~2×** |
+
+Both tpch datasets have **0 IQR outliers** (bounded distributions; exact CPU and FPGA *agree* — the
+`histsum` NULL is sum-over-empty = 0). Timing is valid regardless: both sides do the full
+decode/histogram/quartile/scan work; the flag count doesn't change the work done.
+
+**The reframed thesis (the headline that actually holds up):** the FPGA is **cardinality-independent**.
+On low-cardinality data the CPU collapses duplicates (GROUP BY to 50 or 14,681 rows) and *matches or
+beats* the FPGA; on high-cardinality data the CPU cannot collapse (934 K distinct) and the FPGA wins
+**~2× even against the fastest hand-tuned CPU code**. Cardinality also drives **accuracy**: distinct >
+1024 bins ⇒ quantization error (taxi_d4, 2701 ppm); distinct ≤ 1024 ⇒ bit-exact (tpch_qty). So the
+honest claim is not one blended speedup but: **"matches the CPU on low-cardinality data, ~2× on
+high-cardinality data, at cardinality-independent cost — the accelerator's niche is high cardinality."**
+
 ---
 
 ## 4. Fairness notes / threats to validity
