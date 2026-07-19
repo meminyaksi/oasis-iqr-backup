@@ -386,15 +386,14 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     }
 }
 
-unique_ptr<FunctionData> IqrFlagsBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
-    auto filename = StringValue::Get(input.inputs[0]);
-    auto column   = StringValue::Get(input.inputs[1]);
-
+// Resolves (file, column) to a validated IqrFlagsBindData: locates the target column, checks it is a
+// 64-bit integer, and captures its signedness. Shared by iqr_flags and iqr_flags_only, which run the
+// identical heavy phase and differ only in output schema. `fn` names the caller for error messages.
+unique_ptr<IqrFlagsBindData> ResolveIqrColumn(ClientContext &context, const string &filename,
+                                              const string &column, const char *fn) {
     ParquetOptions parquet_opts(context);
     ParquetReader  reader(context, OpenFileInfo {filename}, parquet_opts);
 
-    // Locate the target column by name.
     auto bind_data = make_uniq<IqrFlagsBindData>();
     for (idx_t i = 0; i < reader.columns.size(); i++) {
         if (reader.columns[i].name.GetIdentifierName() == column) {
@@ -404,27 +403,46 @@ unique_ptr<FunctionData> IqrFlagsBind(ClientContext &context, TableFunctionBindI
         }
     }
     if (bind_data->column_id == DConstants::INVALID_INDEX) {
-        throw BinderException("iqr_flags: column '%s' not found in '%s'", column, filename);
+        throw BinderException("%s: column '%s' not found in '%s'", fn, column, filename);
     }
 
     // The vFPGA top instantiates IQR_detection with 64-bit values, so only 64-bit integer columns
     // are supported. Signedness is taken from the column type and forwarded to the device.
     auto type_id = bind_data->column_type.id();
     if (type_id != LogicalTypeId::BIGINT && type_id != LogicalTypeId::UBIGINT) {
-        throw BinderException(
-            "iqr_flags: column '%s' must be a 64-bit integer (BIGINT or UBIGINT), but is %s", column,
-            bind_data->column_type.ToString());
+        throw BinderException("%s: column '%s' must be a 64-bit integer (BIGINT or UBIGINT), but is %s",
+                              fn, column, bind_data->column_type.ToString());
     }
     bind_data->filename    = filename;
     bind_data->column_name = column;
     bind_data->is_signed   = (type_id == LogicalTypeId::BIGINT);
+    return bind_data;
+}
+
+unique_ptr<FunctionData> IqrFlagsBind(ClientContext &context, TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types, vector<string> &names) {
+    auto bind_data = ResolveIqrColumn(context, StringValue::Get(input.inputs[0]),
+                                      StringValue::Get(input.inputs[1]), "iqr_flags");
 
     // Output schema: the value column, then the boolean outlier flag.
-    names.push_back(column);
+    names.push_back(bind_data->column_name);
     return_types.push_back(bind_data->column_type);
     names.push_back("is_outlier");
     return_types.push_back(LogicalType::BOOLEAN);
 
+    return std::move(bind_data);
+}
+
+// iqr_flags_only(path, column) -> just the BOOLEAN is_outlier column (one row per input row). Same
+// heavy phase as iqr_flags, but the emit skips re-copying the value: the caller already has the
+// values, so the only new information is the per-row flag. Half the output to materialize, and it is
+// the mask you apply back onto your own table.
+unique_ptr<FunctionData> IqrFlagsOnlyBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types, vector<string> &names) {
+    auto bind_data = ResolveIqrColumn(context, StringValue::Get(input.inputs[0]),
+                                      StringValue::Get(input.inputs[1]), "iqr_flags_only");
+    names.emplace_back("is_outlier");
+    return_types.push_back(LogicalType::BOOLEAN);
     return std::move(bind_data);
 }
 
@@ -473,6 +491,32 @@ void IqrFlagsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &ou
     output.SetChildCardinality(emit);
 }
 
+// Emit only the boolean flag column (no value echoed back). Shares InitGlobal/InitLocal/GlobalState
+// with iqr_flags; the parallel cursor + bitmask-unpack are identical, just without the value copy.
+void IqrFlagsOnlyFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+    auto &gstate = data_p.global_state->Cast<IqrFlagsGlobalState>();
+
+    size_t start = gstate.cursor.fetch_add(STANDARD_VECTOR_SIZE, std::memory_order_relaxed);
+    if (start >= gstate.num_elements) {
+        output.SetChildCardinality(0);
+        return;
+    }
+    size_t emit = std::min<size_t>(STANDARD_VECTOR_SIZE, gstate.num_elements - start);
+
+    const uint8_t *mask = reinterpret_cast<const uint8_t *>(gstate.flags->ptr);
+
+    auto &flag_vec = output.data[0];
+    flag_vec.SetVectorType(VectorType::FLAT_VECTOR);
+    auto flag_out = FlatVector::GetDataMutable<bool>(flag_vec);
+
+    for (size_t k = 0; k < emit; k++) {
+        size_t i    = start + k;
+        // Packed bitmask: element i is byte i/8, bit i%8 (LSB-first) -- matches IQR_detection.sv.
+        flag_out[k] = (mask[i >> 3] >> (i & 7)) & 1u;
+    }
+    output.SetChildCardinality(emit);
+}
+
 } // namespace
 
 void RegisterOasisIqrFunction(ExtensionLoader &loader) {
@@ -484,6 +528,12 @@ void RegisterOasisIqrFunction(ExtensionLoader &loader) {
                             IqrFlagsInitLocal                            // local init (per worker)
     );
     loader.RegisterFunction(iqr_flags);
+
+    // Flag-only sibling: same heavy phase, emits just the is_outlier boolean array (no value column).
+    TableFunction iqr_flags_only("iqr_flags_only", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                 IqrFlagsOnlyFunction, IqrFlagsOnlyBind, IqrFlagsInitGlobal,
+                                 IqrFlagsInitLocal);
+    loader.RegisterFunction(iqr_flags_only);
 }
 
 } // namespace duckdb

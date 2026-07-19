@@ -403,3 +403,406 @@ bash bench/perf.sh        | tee bench/perf_results.csv      # Section 2 (CPU + F
 bash bench/perf_fpga.sh   | tee bench/perf_fpga.csv         # FPGA-only re-run
 ```
 SQL models: `bench/sql/{correctness_cpu,correctness_fpga,exact_count,hist_count,fpga_count}.sql`.
+
+---
+
+## 6. The useful-product comparison — all timing codes (2026-07-18)
+
+This section supersedes the earlier "scalar count" framing. **The count is not the useful product.**
+`count(*) FILTER (WHERE is_outlier)` tells you *how many* outliers exist; it does not tell you *which
+rows* are outliers — and only the latter lets a user actually filter, inspect, or remove them. Crucially,
+the scalar count is the **one operation that most flatters the CPU**: DuckDB collapses 6M rows → 50
+distinct groups and never materializes a per-row result, so on low-cardinality data the FPGA only *ties*.
+The moment the deliverable becomes the **per-row product**, the CPU must expand back to all N rows and the
+FPGA — which flags every row natively — wins on every cardinality.
+
+Two orthogonal cost axes fall out of the measurements and are the core thesis:
+- **FPGA host-CPU cost tracks OUTPUT size**, not cardinality (≈constant ~0.05 s CPU-time when 0 outliers).
+- **CPU cost tracks CARDINALITY** (the `GROUP BY` grows), regardless of output.
+
+So the FPGA is **cardinality-independent**; 32-core DuckDB is not.
+
+All codes below are **whole queries** (embedded, not referenced). They are identical across datasets
+except the path/column — substitute from this table:
+
+| dataset | path | column | cardinality | outliers (FPGA / CPU) |
+|---|---|---|---|---|
+| tpch_qty (low card) | `/home/myaksi/datasets/tpch_qty.parquet` | `v` | 50 | 0 / 0 |
+| tpch_extprice (high card) | `/home/myaksi/datasets/tpch_extprice.parquet` | `v` | 933,900 | 0 / 0 |
+| taxi_d4 (mid card, real outliers) | `/home/myaksi/datasets/taxi_d4.parquet` | `fare_cents` | 14,681 | 2,112,164 / 2,057,243 |
+
+Session setup for every run: `PRAGMA threads=32; .timer on;` — run each `CREATE` 3× and take the warm one.
+
+### 6.1 CPU-exact code — the stage-by-stage evolution
+
+Every stage produces the **identical, canonical** outlier decision (validated in §7); they differ only in
+how much work they do. Stages 1–3 output the scalar **count**; stage 3.5 is the first (non-optimized)
+per-row attempt that decodes the file twice; stage 4 is the optimized **useful per-row product** we compare.
+
+**Stage 1 — Traditional (non-optimized) DuckDB, built-in `quantile_disc`.** The "naive user writes this"
+baseline. ~7–10× slower because the built-in quantile cannot exploit low cardinality — it processes all N.
+```sql
+WITH s AS (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+q AS (SELECT quantile_disc(v,0.25) q1, quantile_disc(v,0.75) q3 FROM s),
+f AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM q)
+SELECT count(*) FROM s,f WHERE s.v<f.lo OR s.v>f.hi;
+```
+
+**Stage 2 — GROUP BY optimization (`groupby_current`).** Collapse duplicates into a histogram, derive
+Q1/Q3 from the cumulative counts (integer, divider-free: `cc*4>=t` is the 25th percentile), 1.5×IQR fences
+via shifts (`x+(x>>1)`). Still **re-scans all N rows** at the end to count.
+```sql
+WITH s AS (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq  AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+               (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef  AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq)
+SELECT count(*) FROM s,ef WHERE s.v<ef.lo OR s.v>ef.hi;
+```
+
+**Stage 3 — Output-side optimization (`groupby_histsum`).** The per-value counts already exist in `ecnt`,
+so count the outliers by **summing the histogram** instead of re-scanning all N rows. ~24% faster than
+stage 2 (warm). `COALESCE` because `sum()` over an empty set is NULL, not 0. *Only the CTE body from stage
+2 is reused; the final line changes:*
+```sql
+-- ... identical s / ecnt / etot / ecum / eq / ef CTEs as Stage 2 ...
+SELECT COALESCE(sum(c),0) FROM ecnt,ef WHERE ecnt.v<ef.lo OR ecnt.v>ef.hi;
+```
+**Status: retained for the scalar-count case, but NOT used for the useful product.** `histsum` is a
+count-only trick — it works because you can sum the histogram to get a *number*. It does **not** apply once
+the output is a per-row mask/rows: producing a flag for every row cannot be collapsed to the histogram.
+Kept here for completeness (and it is the right CPU code if a user only wants the count).
+
+**Stage 3.5 — First per-row attempt (non-optimized: decodes the file TWICE).** The naive way to go from
+count to per-row: a plain `s AS (...)` CTE, and store both the value and the flag. `s` is referenced twice
+(once to build the histogram `ecnt`, once in the final labeling join `FROM s, ef`), and **without
+`MATERIALIZED` DuckDB re-reads/re-decodes the parquet for each reference** — so the file is decoded twice.
+Measured **0.196 s warm / 0.571 CPU-s** on tpch_qty (the FPGA was 0.167 s here). This is the version we
+tried first and then optimized away.
+```sql
+CREATE OR REPLACE TABLE cpu_flags AS
+WITH s AS (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),   -- NOTE: no MATERIALIZED -> decoded twice
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq  AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+               (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef  AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq)
+SELECT s.v, (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;  -- also stores the redundant value
+```
+Two fixes turned this into Stage 4: **(a)** add `AS MATERIALIZED` to `s` → the parquet is decoded **once**
+and reused (fair vs the FPGA, which also decodes once and passes twice); **(b)** drop the redundant `s.v`
+column when only the mask is wanted (flag-only). Together these took tpch_qty from **0.196 → 0.064 s**
+(full mask) and **0.040 s** (outlier rows only).
+
+**Stage 4 — Useful product (per-row), the fair CPU we compare.** Two forms; both add
+`AS MATERIALIZED` so the parquet is **decoded once** (fair vs the FPGA, which decodes once and passes
+twice — without it DuckDB re-decodes the file for the labeling pass, as Stage 3.5 shows).
+
+*4a — full per-row flag mask (aligned to every row, held in RAM):*
+```sql
+CREATE OR REPLACE TABLE mask AS
+WITH s AS MATERIALIZED (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq  AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+               (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef  AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq)
+SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;
+```
+*4b — outlier rows only (inline filter; never materializes the full mask):*
+```sql
+CREATE OR REPLACE TABLE outliers AS
+WITH s AS MATERIALIZED (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq  AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+               (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef  AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq)
+SELECT s.v FROM s, ef WHERE s.v < ef.lo OR s.v > ef.hi;
+```
+
+### 6.2 FPGA code — the three stages
+
+The FPGA compute (decode + two IQR passes on the histogram) is **identical** in all three; only the host
+*output handling* changes. Two functions ship in the oasis extension: `iqr_flags` → `(value, is_outlier)`
+per row; `iqr_flags_only` → just the `is_outlier` boolean (the pure mask, half the output — no value echoed).
+
+**Stage 1 — scalar count** (fastest FPGA number, but not the useful product):
+```sql
+SELECT count(*) FILTER (WHERE f) FROM iqr_flags('<PATH>','<COL>') t(v,f);
+```
+**Stage 2 — full per-row flag mask into RAM** (the useful product; `iqr_flags_only` = flag-only, leanest):
+```sql
+CREATE OR REPLACE TABLE mask AS SELECT is_outlier FROM iqr_flags_only('<PATH>','<COL>');
+```
+**Stage 3 — outlier rows only** (inline filter; needs the value, so `iqr_flags`):
+```sql
+CREATE OR REPLACE TABLE outliers AS SELECT v FROM iqr_flags('<PATH>','<COL>') t(v,f) WHERE f;
+```
+
+### 6.3 Timing results (useful product, warm; single runs — medians pending)
+
+**Stage 4b / FPGA stage 3 — outlier rows (inline filter):**
+
+| dataset | FPGA (real) | CPU (real) | FPGA speedup | FPGA CPU-s | CPU CPU-s | CPU-work ratio |
+|---|--:|--:|--:|--:|--:|--:|
+| tpch_qty (low) | **0.040** | 0.063 | **1.58×** | 0.045 | 0.482 | **10.7×** |
+| tpch_extprice (high) | **0.073** | 0.125 | **1.71×** | 0.051 | 1.619 | **31.7×** |
+| taxi_d4 (20M, 2.1M outliers) | **0.266** | 0.332 | **1.25×** | 0.315 | 1.637 | **5.2×** |
+
+**Stage 4a / FPGA stage 2 — full per-row mask materialized (flag-only):**
+
+| dataset | FPGA (real) | CPU (real) | FPGA speedup |
+|---|--:|--:|--:|
+| tpch_qty | 0.064 | 0.092 | 1.44× |
+| tpch_extprice | 0.096 | 0.167 | 1.74× |
+
+**Reading the numbers:**
+- **The low-card tie is gone.** On the scalar count tpch_qty was 0.021 = 0.021 (tie). On the useful product
+  the FPGA wins **1.58×** (outlier rows) / **1.44×** (full mask). The tie was an artifact of the CPU
+  collapsing its output; asking for per-row results removes that shortcut.
+- **CPU-work ratio (the `user` column) is the headline.** The FPGA uses **5–32× less host CPU** — because
+  the outlier math runs on the chip; the host only decodes + stores. In a busy DB that freed CPU serves
+  other queries. FPGA `user` is flat (~0.05) at 0 outliers and rises only with *output* (taxi = 0.315);
+  CPU `user` balloons with *cardinality* (0.48 → 1.62).
+- **Materializing the output is a shared tax.** The ~40 ms gap between the scalar count (~0.025) and the
+  mask-in-RAM (~0.064) is DuckDB writing 6M values into a table — paid equally by both sides, so the
+  comparison stays fair. Filtering to outlier rows inline (4b) avoids storing the full mask and is faster
+  than the full mask on 0-outlier data (0.040 vs 0.064 on tpch_qty).
+- **`iqr_flags_only` vs `iqr_flags`:** flag-only halves the FPGA output (no value re-emitted) — use it when
+  you want the mask to apply to your own table; use `iqr_flags` when you need the values (e.g. filtering to
+  outlier rows).
+
+### 6.4 CPU-exact implementation sweep — which quartile method is fastest (2026-07-19)
+
+The output is now fixed as the **flag array** (the useful product), and the labeling pass
+(`SELECT (v<lo OR v>hi) FROM s,ef`) is **identical** for every implementation — so the only thing that
+changes the CPU cost is **how Q1/Q3 are computed**. We swept 5 methods, all producing the identical mask,
+all with `s AS MATERIALIZED` (decode once) + `CREATE OR REPLACE TABLE mask` (equal storage tax). The
+"maybe it's faster without GROUP BY" idea was the motivation. Codes for all five are in §6.5; runnable as
+`bench/sql/cpu_variants/approach{1..5}.sql` (runner `bench/cpu_flag_variants.sh`).
+
+**tpch_qty (low cardinality, ~50 distinct of 6.0M rows), warm:**
+
+| # | method | `real` (s) | `user` (CPU-s) | vs baseline | correct? |
+|---|---|--:|--:|--:|:--:|
+| **1** | **GROUP BY histogram + cumulative window** | **0.092** | 0.529 | **1.00× (winner)** | exact |
+| 2 | no GROUP BY — `quantile_disc([.25,.75])` single pass | 0.603 | 1.418 | 6.6× slower | exact |
+| 3 | no GROUP BY — `percentile_disc WITHIN GROUP` | 0.733 | 1.432 | 8.0× slower | exact |
+| 4 | full sort — `row_number()` nearest-rank | 3.381 | 44.844 | 36.8× slower | exact |
+| 5 | `approx_quantile` (t-digest) | 0.380 | 3.711 | 4.1× slower | **approx** |
+
+**Verdict — the GROUP BY baseline is already optimal on low cardinality; the "no GROUP BY" idea loses.**
+- **Dropping GROUP BY is a *pessimization* here.** The histogram collapses 6.0M rows → ~50 distinct
+  *before* any quartile math; every method that skips it (2,3,4,5) must process all 6M and is 4–37× slower.
+  The collapse is exactly why the baseline was already winning.
+- **`quantile_disc` vs `percentile_disc` are the same engine path** (0.603 vs 0.733, within noise) — both
+  do a full selection over 6M. No planner advantage from the ordered-set syntax.
+- **Full sort (4) is catastrophic: 84× more CPU** (44.8 vs 0.53 CPU-s) — it sorts all 6M *and* computes a
+  window count. This is the concrete cost of the "naive, no-helper" approach; keep it as the cautionary
+  data point.
+- **`approx_quantile` (5) is the fastest *non-*GROUP-BY method (0.380) but still 4× slower than the
+  baseline** — and it is **approximate** (t-digest), so it is disqualified from the canonical path unless
+  the §6.5 correctness check shows bit-exact quartiles on a given dataset. Not worth it here: slower *and*
+  riskier.
+- **Caveat — this is the LOW-card result only.** On high cardinality (tpch_extprice, taxi_d4) the GROUP BY
+  collapse shrinks (few duplicates), so methods 2/3 may close the gap or win; that sweep is **pending**. If
+  they win there, the right CPU baseline becomes **cardinality-adaptive** (GROUP BY when distinct-count is
+  small, `quantile_disc` otherwise) — a finding to add once measured.
+
+### 6.5 CPU-exact implementation sweep — all five codes
+
+All five differ only in the `q`/`ef` block (quartile computation); the `s` CTE and the final
+`SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef` labeling are identical. Shown on tpch_qty;
+swap the `read_parquet` path + column (`v` / `fare_cents`) for the other datasets.
+
+*Approach 1 — GROUP BY histogram + cumulative window (baseline, winner on low-card):*
+```sql
+CREATE OR REPLACE TABLE mask AS
+WITH s AS MATERIALIZED (SELECT v::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq  AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+               (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef  AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq)
+SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;
+```
+*Approach 2 — no GROUP BY, single-pass `quantile_disc` list:*
+```sql
+CREATE OR REPLACE TABLE mask AS
+WITH s AS MATERIALIZED (SELECT v::BIGINT v FROM read_parquet('<PATH>')),
+q  AS (SELECT quantile_disc(v, [0.25, 0.75]) qq FROM s),
+ef AS (SELECT qq[1] q1, qq[2] q3,
+              qq[1]-((qq[2]-qq[1])+((qq[2]-qq[1])>>1)) lo,
+              qq[2]+((qq[2]-qq[1])+((qq[2]-qq[1])>>1)) hi FROM q)
+SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;
+```
+*Approach 3 — no GROUP BY, ordered-set `percentile_disc WITHIN GROUP`:*
+```sql
+CREATE OR REPLACE TABLE mask AS
+WITH s AS MATERIALIZED (SELECT v::BIGINT v FROM read_parquet('<PATH>')),
+q  AS (SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY v) q1,
+              percentile_disc(0.75) WITHIN GROUP (ORDER BY v) q3 FROM s),
+ef AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM q)
+SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;
+```
+*Approach 4 — full sort, `row_number()` nearest-rank (cautionary: 84× CPU):*
+```sql
+CREATE OR REPLACE TABLE mask AS
+WITH s AS MATERIALIZED (SELECT v::BIGINT v FROM read_parquet('<PATH>')),
+r  AS (SELECT v, row_number() OVER (ORDER BY v) rn, count(*) OVER () n FROM s),
+q  AS (SELECT max(v) FILTER (WHERE rn = CAST(ceil(0.25*n) AS BIGINT)) q1,
+              max(v) FILTER (WHERE rn = CAST(ceil(0.75*n) AS BIGINT)) q3 FROM r),
+ef AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM q)
+SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;
+```
+*Approach 5 — `approx_quantile` (fast but APPROXIMATE — correctness-gated):*
+```sql
+CREATE OR REPLACE TABLE mask AS
+WITH s AS MATERIALIZED (SELECT v::BIGINT v FROM read_parquet('<PATH>')),
+q  AS (SELECT CAST(approx_quantile(v,0.25) AS BIGINT) q1,
+              CAST(approx_quantile(v,0.75) AS BIGINT) q3 FROM s),
+ef AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM q)
+SELECT (s.v < ef.lo OR s.v > ef.hi) AS is_outlier FROM s, ef;
+```
+*Correctness cross-check (all quartile columns must match; `approx` may differ):*
+```sql
+WITH s AS MATERIALIZED (SELECT v::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+a AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t) q1,
+             (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+b AS (SELECT quantile_disc(v,0.25) q1, quantile_disc(v,0.75) q3 FROM s),
+c AS (SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY v) q1,
+             percentile_disc(0.75) WITHIN GROUP (ORDER BY v) q3 FROM s),
+r AS (SELECT v, row_number() OVER (ORDER BY v) rn, count(*) OVER () n FROM s),
+d AS (SELECT max(v) FILTER (WHERE rn=CAST(ceil(0.25*n) AS BIGINT)) q1,
+             max(v) FILTER (WHERE rn=CAST(ceil(0.75*n) AS BIGINT)) q3 FROM r),
+e AS (SELECT CAST(approx_quantile(v,0.25) AS BIGINT) q1,
+             CAST(approx_quantile(v,0.75) AS BIGINT) q3 FROM s)
+SELECT a.q1 gb, b.q1 qd, c.q1 pd, d.q1 rn, e.q1 approx,
+       a.q3 gb3, b.q3 qd3, c.q3 pd3, d.q3 rn3, e.q3 approx3
+FROM a,b,c,d,e;
+```
+
+---
+
+## 7. Correctness — all test codes and the logic (2026-07-18)
+
+The outlier flag is a **deterministic function of the value**: `flag = (v < lo OR v > hi)` with one global
+fence pair. Every row sharing a value therefore gets the same flag. This underpins the whole method: a
+naive positional zip of two flag arrays is fragile (DuckDB's 32-thread scan does not guarantee row order,
+and the data has no unique row key), but carrying each row's **value** and re-deciding it is a *true*
+line-by-line check that is order-independent. `bench/sql/correctness_{rowwise,consistency,disagree_detail,
+cpu_vs_builtin}.sql` + `bench/correctness_rowwise.sh`.
+
+The full validation chain (both links proven **row-by-row**):
+```
+stock DuckDB quantile_disc  ==  our optimized CPU   →  0 disagree rows (bit-identical)
+our optimized CPU           ≈   FPGA                →  0 on tpch_qty/extprice; 54,921 on taxi_d4
+                                                         (2701 ppm, one-directional, boundary-confined)
+FPGA internal consistency   →   0 values flagged both ways (clean threshold)
+⇒ the FPGA is validated against canonical DuckDB, transitively.
+```
+
+### 7.1 FPGA vs CPU-exact — per-row agreement (the main test)
+Compares the FPGA's **actual** per-row flag against the CPU-exact decision on **every row**. `agree_rows +
+disagree_rows` must equal `total_rows`.
+```sql
+WITH
+s    AS MATERIALIZED (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq   AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+                (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef   AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq),
+fp   AS (SELECT v, f AS fpga FROM iqr_flags('<PATH>','<COL>') t(v,f))
+SELECT count(*) AS total_rows,
+       count(*) FILTER (WHERE fp.fpga)                               AS fpga_outliers,
+       (SELECT count(*) FROM s,ef WHERE s.v<ef.lo OR s.v>ef.hi)      AS cpu_outliers,
+       count(*) FILTER (WHERE fp.fpga = (fp.v<ef.lo OR fp.v>ef.hi))  AS agree_rows,
+       count(*) FILTER (WHERE fp.fpga <> (fp.v<ef.lo OR fp.v>ef.hi)) AS disagree_rows,
+       round(1e6*count(*) FILTER (WHERE fp.fpga<>(fp.v<ef.lo OR fp.v>ef.hi))/count(*),3) AS disagree_ppm
+FROM fp, ef;
+```
+
+### 7.2 FPGA internal consistency (catches non-threshold bugs)
+Every value must get **one** flag — result MUST be 0. This is what the count-only test could never verify.
+```sql
+SELECT count(*) AS values_with_inconsistent_flags
+FROM (SELECT v FROM iqr_flags('<PATH>','<COL>') t(v,f) GROUP BY v HAVING count(DISTINCT f) > 1);
+```
+
+### 7.3 Disagreement detail (the *which* and *why*)
+The specific values that differ — always in the 1024-bin quantization band at the fence. Empty = bit-exact.
+```sql
+WITH
+s    AS MATERIALIZED (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+eq   AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t)   q1,
+                (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+ef   AS (SELECT q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM eq),
+fpv  AS (SELECT v, bool_or(f) AS fpga_flag, count(*) AS rows
+         FROM iqr_flags('<PATH>','<COL>') t(v,f) GROUP BY v)
+SELECT fpv.v value, fpv.rows, fpv.fpga_flag, (fpv.v<ef.lo OR fpv.v>ef.hi) exact_flag, ef.lo, ef.hi
+FROM fpv, ef WHERE fpv.fpga_flag <> (fpv.v<ef.lo OR fpv.v>ef.hi) ORDER BY fpv.rows DESC LIMIT 20;
+```
+
+### 7.4 Optimized CPU vs stock DuckDB (validates the baseline itself)
+Confirms the GROUP BY optimization did not change the answer vs canonical `quantile_disc` (discrete = the
+right oracle; `quantile_cont` interpolates and differs by design). Fence-level match ⇒ per-row match,
+because both apply the identical `v<lo OR v>hi` rule to identical data — only the fence *values* could differ.
+```sql
+WITH
+s    AS MATERIALIZED (SELECT <COL>::BIGINT v FROM read_parquet('<PATH>')),
+trad AS (SELECT quantile_disc(v,0.25) q1, quantile_disc(v,0.75) q3 FROM s),
+tf   AS (SELECT q1,q3,q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM trad),
+ecnt AS (SELECT v, count(*) c FROM s GROUP BY v),
+etot AS (SELECT sum(c) t FROM ecnt),
+ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt),
+oq   AS (SELECT (SELECT min(v) FROM ecum,etot WHERE cc*4>=t) q1, (SELECT min(v) FROM ecum,etot WHERE cc*4>=3*t) q3),
+of   AS (SELECT q1,q3,q1-((q3-q1)+((q3-q1)>>1)) lo, q3+((q3-q1)+((q3-q1)>>1)) hi FROM oq)
+SELECT tf.q1 trad_q1, of.q1 opt_q1, tf.q3 trad_q3, of.q3 opt_q3,
+       (tf.q1=of.q1 AND tf.q3=of.q3) quartiles_match,
+       tf.lo trad_lo, of.lo opt_lo, tf.hi trad_hi, of.hi opt_hi,
+       (tf.lo=of.lo AND tf.hi=of.hi) fences_match,
+       (SELECT count(*) FROM s WHERE s.v<tf.lo OR s.v>tf.hi) trad_outliers,
+       (SELECT count(*) FROM s WHERE s.v<of.lo OR s.v>of.hi) opt_outliers
+FROM tf, of;
+```
+Explicit per-row form (for symmetry with 7.1):
+```sql
+-- ... same s / trad / tf / ecnt.. / of CTEs (fences only) ...
+SELECT count(*) total_rows,
+       count(*) FILTER (WHERE (s.v<tf.lo OR s.v>tf.hi) <> (s.v<of.lo OR s.v>of.hi)) disagree_rows
+FROM s, tf, of;
+```
+
+### 7.5 Correctness results
+
+| dataset | 7.1 FPGA↔CPU disagree | ppm | 7.2 consistency | 7.4 CPU↔builtin |
+|---|--:|--:|--:|---|
+| tpch_qty | **0** (bit-exact) | 0 | 0 | quartiles/fences/count **identical**, 0 disagree rows |
+| tpch_extprice | 0 (verified correct) | ~0 | 0 | identical, 0 disagree rows |
+| taxi_d4 | 54,921 | 2701 | 0 | Q1/Q3 930/2190, fences −960/4080, count 2,057,243 — **identical**, 0 disagree rows |
+
+Key observations:
+1. **`disagree_rows` on taxi_d4 = `fpga_outliers − cpu_outliers` exactly** (54,921 = 2,112,164 − 2,057,243).
+   So the binning error is **one-directional**: the FPGA over-flags 54,921 boundary rows and **misses zero**
+   true outliers — the safe/conservative direction for outlier detection.
+2. **Every disagreeing value lies in [4049, 4080]**, right at the exact upper fence (`hi = 4080`); the single
+   value 4080 accounts for 46,760 of them. It is pure 1024-bin quantization at the fence, not scatter.
+3. **tpch_qty is bit-exact** because 50 distinct values fit inside 1024 bins (no quantization). Low
+   cardinality ⇒ exact FPGA; >1024 distinct ⇒ small, bounded, one-sided error.
+4. **The CPU baseline is canonical** — bit-identical to stock DuckDB `quantile_disc`, so the entire
+   FPGA-vs-CPU comparison rests on the standard DuckDB answer, not a hand-rolled approximation.
