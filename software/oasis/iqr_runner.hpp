@@ -3,9 +3,12 @@
 #include "oasis/iqr_config.hpp"
 #include "oasis/oasis_context.hpp"
 
+#include "oasis/bypass_receiver.hpp"
+
 #include <libstf/buffer.hpp>
 #include <libstf/common.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -99,6 +102,39 @@ class IqrRunner {
      */
     Result run(const std::vector<InputChunk> &inputs);
 
+    /**
+     * ---- Overlapped (incremental) driving of pass 1 -------------------------------------------
+     *
+     * run() cannot start until the whole column exists, so on the streaming decode path the two
+     * PCIe passes are strictly serialised after decode (measured: sf10 heavy = 92.8 decode + 77.8
+     * iqr, exactly additive -- RESULTS.md 9.14). Pass 1 is a pure streaming reduction, so it can
+     * instead consume each row group as it is decoded, hiding it under decode:
+     *
+     *     heavy = max(decode, pass1) + pass2   instead of   decode + pass1 + pass2
+     *
+     * Pass 2 genuinely cannot move: it needs the final Q1/Q3, which exist only once every element
+     * has been histogrammed.
+     *
+     * Call sequence (all on one thread, chunks in column order):
+     *     begin_overlapped(prefix)          // window from `prefix`, clear histogram
+     *     feed_pass1(chunk, is_last) x N    // is_last only on the column's final chunk
+     *     finish_overlapped(all_chunks)     // pass 2 + drain -> Result
+     *
+     * THE CALLER MUST SUPPLY THE WINDOW. The bins have to be fixed before the first pass-1 beat, so
+     * the runner cannot derive them the way run() does -- it has not seen the data yet. Deriving
+     * them from a PREFIX of the column was tried and is CATASTROPHIC on order-dependent data: it
+     * flagged 19,997,999 of 20,000,000 rows where the correct answer was 200 (RESULTS.md 9.15). The
+     * window must come from a sample that SPANS the column; see DeriveWindowSpanning() in the
+     * extension. Passing it here rather than through the constructor keeps run() on its own
+     * derive-from-data path, so a caller whose overlap does not engage is unaffected.
+     *
+     * Not supported with use_card (staging needs the whole column up front); the caller must fall
+     * back to run().
+     */
+    void   begin_overlapped(int64_t bin_min, uint64_t bin_shift);
+    void   feed_pass1(const InputChunk &chunk, bool is_last);
+    Result finish_overlapped(const std::vector<InputChunk> &inputs);
+
   private:
     OasisContext              &ctx_;
     std::shared_ptr<IqrConfig> iqr_config_;
@@ -130,6 +166,21 @@ class IqrRunner {
     // leaving the caller's original host buffers intact (they still back the value-column output).
     // Returns the staged buffer (its ptr is the card-resident vaddr the passes read).
     std::shared_ptr<libstf::Buffer> stage_to_card(const std::vector<InputChunk> &inputs);
+
+    // Zero the histogram banks and BLOCK until the clear sweep has completed. Must be fenced ahead
+    // of the first pass-1 beat: the clear is a posted CSR write on the control plane while the input
+    // travels the data plane, with no mutual ordering, so beats that overtake it get binned then
+    // wiped. Shared by run() and begin_overlapped().
+    void clear_histogram_fenced();
+
+    // Drains the flag buffer(s) the FPGA wrote into one contiguous bitmask, then reads back the
+    // count-loss and profiler diagnostics. Shared tail of run() and finish_overlapped(). Returns the
+    // instant the drain completed, so the caller can close `passes_ms` on device time alone.
+    std::chrono::steady_clock::time_point
+    collect_result(Result &result, size_t out_bytes, BypassStreamReceiver::Handle &handle);
+
+    // Overlapped-mode state, live only between begin_overlapped() and finish_overlapped().
+    bool overlapped_ = false;
 };
 
 } // namespace oasis

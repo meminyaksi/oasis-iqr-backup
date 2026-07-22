@@ -155,6 +155,137 @@ std::shared_ptr<libstf::Buffer> IqrRunner::stage_to_card(const std::vector<Input
     return libstf::make_buffer(ctx_.memory_pool(), ptr, total, total);
 }
 
+void IqrRunner::clear_histogram_fenced() {
+    // Zero the histogram and FENCE the clear ahead of the input DMA. The clear is a posted CSR
+    // write on the control plane; the input DMA travels the data plane with no mutual ordering. If
+    // pass-1 beats reach the core before the clear does, they get binned then wiped -> lost counts.
+    // The device exposes a clear-completion counter that advances when a sweep finishes: capture it,
+    // pulse clear, then spin until it advances -- at which point the banks are zero AND the core is
+    // idle-ready, so the subsequent DMA cannot lose beats. (Spin is ~tens of us, negligible.)
+    uint64_t clr_seq0 = iqr_config_->clear_seq();
+    iqr_config_->clear_histogram();
+    for (uint64_t spins = 0; iqr_config_->clear_seq() == clr_seq0; ++spins) {
+        if (spins > 100000000ull) {
+            throw std::runtime_error("IqrRunner: timed out waiting for histogram clear to complete");
+        }
+    }
+}
+
+// Returns the instant the FPGA finished writing the flags, so callers can close `passes_ms` on the
+// drain alone -- the concatenation and CSR read-back below are host book-keeping, not device time.
+std::chrono::steady_clock::time_point
+IqrRunner::collect_result(Result &result, size_t out_bytes, BypassStreamReceiver::Handle &handle) {
+    // Drain the flag buffer(s) the FPGA wrote. next() blocks on the completion interrupt and
+    // returns nullptr once the transfer is fully drained.
+    std::vector<std::shared_ptr<libstf::Buffer>> chunks;
+    while (auto buffer = handle.next()) {
+        chunks.push_back(buffer);
+    }
+    auto t_drained = std::chrono::steady_clock::now();
+
+    if (chunks.size() == 1) {
+        // Common case (the whole flag column fits one output-writer buffer): hand it back directly.
+        result.flags = chunks.front();
+    } else {
+        // Large column split across buffers: concatenate into one contiguous bitmask for the caller.
+        void *ptr    = nullptr;
+        auto  status = ctx_.memory_pool()->allocate(out_bytes, &ptr);
+        if (!status.ok()) {
+            throw std::runtime_error("IqrRunner: failed to allocate flag buffer: " + status.message());
+        }
+        size_t off = 0;
+        for (const auto &c : chunks) {
+            std::memcpy(static_cast<std::byte *>(ptr) + off, c->ptr, c->size);
+            off += c->size;
+        }
+        result.flags = libstf::make_buffer(ctx_.memory_pool(), ptr, out_bytes, out_bytes);
+    }
+
+    // Debug: the histogram grand total (== N iff the banks were zeroed) and the count-loss
+    // diagnostics, so the host can see WHERE counts were lost without guessing:
+    // num_elements >= accepted >= committed >= histogram_total (input / coalescing / BRAM hazard).
+    result.histogram_total = iqr_config_->histogram_total();
+    result.accepted        = iqr_config_->accepted();
+    result.committed       = iqr_config_->committed();
+    result.flushes         = iqr_config_->flushes();
+    result.collisions      = iqr_config_->collisions();
+
+    // Stream-utilization breakdown (read now, before the next run's first beat re-zeroes them).
+    result.input_profile  = iqr_config_->input_profile();
+    result.output_profile = iqr_config_->output_profile();
+    return t_drained;
+}
+
+// Flag output size. The device packs the flags into a dense bitmask (1 bit/element) emitted as full
+// 512-bit (= NUM_TUPLES*64) beats, so the output is ceil(N/512) 64-byte beats -- 64x smaller than an
+// INT64-per-flag column.
+static constexpr size_t FLAG_BITS_PER_BEAT  = 512; // CELERIS_NUM_TUPLES(8) * 64
+static constexpr size_t FLAG_BYTES_PER_BEAT = FLAG_BITS_PER_BEAT / 8; // 64
+
+static size_t flag_bytes_for(size_t num_elements) {
+    size_t beats = (num_elements + FLAG_BITS_PER_BEAT - 1) / FLAG_BITS_PER_BEAT;
+    return beats * FLAG_BYTES_PER_BEAT;
+}
+
+void IqrRunner::begin_overlapped(int64_t bin_min, uint64_t bin_shift) {
+    if (use_card_) {
+        // Card mode stages the whole column before either pass, so there is nothing to overlap.
+        throw std::runtime_error("IqrRunner: begin_overlapped() is not supported with use_card");
+    }
+    // The caller owns the window here (see the header): the runner has not seen a single value yet,
+    // so anything it could derive would be a prefix -- the bug in RESULTS.md 9.15.
+    bin_min_   = bin_min;
+    bin_shift_ = bin_shift;
+    iqr_config_->set_bin_min(bin_min_);
+    iqr_config_->set_bin_shift(bin_shift_);
+    iqr_config_->set_use_card(false);
+
+    clear_histogram_fenced();
+    overlapped_ = true;
+}
+
+void IqrRunner::feed_pass1(const InputChunk &chunk, bool is_last) {
+    if (!overlapped_) {
+        throw std::runtime_error("IqrRunner: feed_pass1() called before begin_overlapped()");
+    }
+    if (chunk.second == 0) {
+        return;
+    }
+    libstf::enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), chunk.first, chunk.second,
+                                 static_cast<libstf::stream_t>(ctx_.iqrStream()), is_last,
+                                 coyote::STRM_HOST);
+}
+
+IqrRunner::Result IqrRunner::finish_overlapped(const std::vector<InputChunk> &inputs) {
+    if (!overlapped_) {
+        throw std::runtime_error("IqrRunner: finish_overlapped() called before begin_overlapped()");
+    }
+    overlapped_ = false;
+
+    Result result;
+    result.num_elements = count_elements(inputs);
+    result.bin_min      = bin_min_;
+    result.bin_shift    = bin_shift_;
+    if (result.num_elements == 0) {
+        return result;
+    }
+
+    size_t out_bytes = flag_bytes_for(result.num_elements);
+
+    // The flag destination must be enqueued before the FLAG pass emits. Pass 1 is already in flight
+    // but emits nothing, so acquiring here -- after the histogram, before pass 2 -- is in time.
+    auto handle = ctx_.bypass_receiver().acquire(out_bytes);
+
+    // Only pass 2 is timed here: pass 1 was overlapped with decode and is accounted to the decode
+    // phase, so `passes_ms` is directly comparable to run()'s figure halved.
+    auto t_pass0 = std::chrono::steady_clock::now();
+    stream_pass(inputs, coyote::STRM_HOST, static_cast<int64_t>(ctx_.iqrStream())); // pass 2: FLAG
+
+    auto t_drained = collect_result(result, out_bytes, *handle);
+    result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
+    return result;
+}
+
 IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     Result result;
     result.num_elements = count_elements(inputs);
@@ -192,27 +323,11 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     const uint32_t strm_kind = use_card_ ? coyote::STRM_CARD : coyote::STRM_HOST;
     const int64_t  dest      = use_card_ ? CARD_STREAM : static_cast<int64_t>(ctx_.iqrStream());
 
-    // 2. Flag output size. The device packs the flags into a dense bitmask (1 bit/element) emitted as
-    // full 512-bit (= NUM_TUPLES*64) beats, so the output is ceil(N/512) 64-byte beats -- 64x smaller
-    // than an INT64-per-flag column.
-    static constexpr size_t FLAG_BITS_PER_BEAT  = 512; // CELERIS_NUM_TUPLES(8) * 64
-    static constexpr size_t FLAG_BYTES_PER_BEAT = FLAG_BITS_PER_BEAT / 8; // 64
-    size_t out_beats = (result.num_elements + FLAG_BITS_PER_BEAT - 1) / FLAG_BITS_PER_BEAT;
-    size_t out_bytes = out_beats * FLAG_BYTES_PER_BEAT;
+    // 2. Flag output size (dense 1-bit-per-element bitmask, whole 512-bit beats).
+    size_t out_bytes = flag_bytes_for(result.num_elements);
 
-    // 3. Zero the histogram and FENCE the clear ahead of the input DMA. The clear is a posted CSR
-    // write on the control plane; the input DMA travels the data plane with no mutual ordering. If
-    // pass-1 beats reach the core before the clear does, they get binned then wiped -> lost counts.
-    // The device exposes a clear-completion counter that advances when a sweep finishes: capture it,
-    // pulse clear, then spin until it advances -- at which point the banks are zero AND the core is
-    // idle-ready, so the subsequent DMA cannot lose beats. (Spin is ~tens of us, negligible.)
-    uint64_t clr_seq0 = iqr_config_->clear_seq();
-    iqr_config_->clear_histogram();
-    for (uint64_t spins = 0; iqr_config_->clear_seq() == clr_seq0; ++spins) {
-        if (spins > 100000000ull) {
-            throw std::runtime_error("IqrRunner: timed out waiting for histogram clear to complete");
-        }
-    }
+    // 3. Zero the histogram, fenced ahead of the input DMA.
+    clear_histogram_fenced();
 
     // 4. Enqueue the flag output buffer BEFORE streaming the input. In oasis, output is FPGA-initiated:
     // the buffer is enqueued to the IQR stream (the reserved stream past the decoders) and the
@@ -229,46 +344,9 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     stream_pass(*pass_inputs, strm_kind, dest); // pass 1: HISTOGRAM
     stream_pass(*pass_inputs, strm_kind, dest); // pass 2: FLAG
 
-    // 6. Drain the flag buffer(s) the FPGA wrote. handle->next() blocks on the completion interrupt
-    // and returns nullptr once the transfer is fully drained.
-    std::vector<std::shared_ptr<libstf::Buffer>> chunks;
-    while (auto buffer = handle->next()) {
-        chunks.push_back(buffer);
-    }
-    result.passes_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pass0)
-            .count();
-
-    if (chunks.size() == 1) {
-        // Common case (the whole flag column fits one output-writer buffer): hand it back directly.
-        result.flags = chunks.front();
-    } else {
-        // Large column split across buffers: concatenate into one contiguous bitmask for the caller.
-        void *ptr    = nullptr;
-        auto  status = ctx_.memory_pool()->allocate(out_bytes, &ptr);
-        if (!status.ok()) {
-            throw std::runtime_error("IqrRunner: failed to allocate flag buffer: " + status.message());
-        }
-        size_t off = 0;
-        for (const auto &c : chunks) {
-            std::memcpy(static_cast<std::byte *>(ptr) + off, c->ptr, c->size);
-            off += c->size;
-        }
-        result.flags = libstf::make_buffer(ctx_.memory_pool(), ptr, out_bytes, out_bytes);
-    }
-
-    // 7. Debug: read back the histogram grand total (== N iff the banks were zeroed) and the
-    // count-loss diagnostics. The host can now see WHERE counts were lost without guessing:
-    // num_elements >= accepted >= committed >= histogram_total (input / coalescing / BRAM hazard).
-    result.histogram_total = iqr_config_->histogram_total();
-    result.accepted        = iqr_config_->accepted();
-    result.committed       = iqr_config_->committed();
-    result.flushes         = iqr_config_->flushes();
-    result.collisions      = iqr_config_->collisions();
-
-    // Stream-utilization breakdown (read now, before the next run's first beat re-zeroes them).
-    result.input_profile  = iqr_config_->input_profile();
-    result.output_profile = iqr_config_->output_profile();
+    // 6. Drain the flags and read back the diagnostics.
+    auto t_drained = collect_result(result, out_bytes, *handle);
+    result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
     return result;
 }
 
