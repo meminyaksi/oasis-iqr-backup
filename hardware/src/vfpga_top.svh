@@ -128,11 +128,23 @@ MetaIntfArbiter #(
 
 // -- Data path ------------------------------------------------------------------------------------
 AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+
+// Fused pass 1: the decoded beats are TEE'd off each decoder lane straight into the IQR histogram,
+// so pass 1 runs during decode instead of being re-streamed from the host afterwards. Flattened
+// per-lane wires (interface arrays are awkward to drive from a generate block). In an RDMA build
+// there is no IQR lane, so hist_ready is tied high below and the tee degenerates to a pass-through.
+localparam int IQR_ELEMS = DATABEAT_SIZE / 8;   // 8 x int64 per 512-bit beat
+logic    [NUM_DECODERS-1:0]                 hist_valid;
+logic    [NUM_DECODERS-1:0]                 hist_ready;
+logic    [NUM_DECODERS-1:0]                 host_side_ready;
+data64_t [NUM_DECODERS-1:0][IQR_ELEMS-1:0]  hist_data;
+logic    [NUM_DECODERS-1:0][IQR_ELEMS-1:0]  hist_keep;
 for (genvar I = 0; I < NUM_DECODERS; I++) begin
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in(.*);
     typed_ndata_i #(DATABEAT_SIZE)          typed_out(.*);
     ndata_i       #(data8_t, DATABEAT_SIZE) out(.*);
+    ndata_i       #(data8_t, DATABEAT_SIZE) host_tee(.*);
 
 `ifdef EN_RDMA
     // AXI4SR to AXI4S
@@ -184,17 +196,42 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin
         .profile(decoder_profiles[I])
     );
 
-    // Discard typed
+    // TEE. The decoded beat goes to the host (which re-streams it for pass 2) AND, when fused
+    // pass 1 is enabled, to the IQR histogram feed. Both sinks must accept before the decoder
+    // advances; the feed carries a per-lane skid buffer so its ready is high except when
+    // genuinely backed up, which keeps this from slowing decode.
     `DATA_ASSIGN(typed_out, out);
+
+    // Textbook tee: a beat advances only when BOTH sinks accept.
+    assign out.ready     = host_side_ready[I] && hist_ready[I];
+    assign hist_valid[I] = out.valid && host_side_ready[I];
+    // Same 512 bits, regrouped from 64 bytes to 8 x int64; keep collapses 8 byte-lanes into one.
+    assign hist_data[I]  = out.data;
+    for (genvar K = 0; K < IQR_ELEMS; K++) begin : g_hist_keep
+        assign hist_keep[I][K] = &out.keep[K * 8 +: 8];
+    end
 
     NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi (
         .clk(clk),
         .rst_n(rst_n),
 
-        .in(out),
+        .in(host_tee),
         .out(axi_out[I])
     );
+
+    // Host branch of the tee (unchanged payload; this is what pass 2 re-streams).
+    assign host_tee.data      = out.data;
+    assign host_tee.keep      = out.keep;
+    assign host_tee.last      = out.last;
+    assign host_tee.valid     = out.valid && hist_ready[I];
+    assign host_side_ready[I] = host_tee.ready;
 end
+
+`ifdef EN_RDMA
+// No IQR lane in an RDMA build, so nothing consumes the histogram tee: hold every lane's ready high
+// and the tee degenerates to a plain pass-through to the host.
+assign hist_ready = '1;
+`endif
 
 // -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
 `ifdef EN_RDMA
@@ -263,57 +300,80 @@ LocalRead #(
 // Selected input to the operator (host or card).
 ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_in();
 
-`ifdef EN_MEM
-// Card/HBM source: the decoded column staged in HBM arrives on axis_card_recv[0]. Receive only --
-// the SW-issued LOCAL_READ(STRM_CARD) drives the shell DMA, so no ReadReqGenerator/sq_rd is needed.
-AXI4S iqr_card_axi (.aclk(clk), .aresetn(rst_n));
-`AXIS_ASSIGN(axis_card_recv[0], iqr_card_axi)
-
-ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_card();
-AXIToNData #(
-    .data_t(data8_t),
-    .NUM_ELEMENTS(DATABEAT_SIZE)
-) inst_iqr_card_recv (
-    .clk(clk),
-    .rst_n(rst_n),
-    .in(iqr_card_axi),
-    .out(iqr_bytes_card)
-);
-
-// The vFPGA never writes card memory (staging is host-driven LOCAL_OFFLOAD); tie off the card write
-// path and any unused card-recv slots.
+// Card/HBM removed. It was measured at 8 MB/s with a size-independent ~1548x penalty on the READ
+// path -- a fixed per-request cost, not slow memory (RESULTS.md 9.17) -- and the fused design below
+// makes it unnecessary anyway: with pass 1 fed on-chip there is only one pass left to source.
+// The use_card CSR is retained but ignored, so the register map and the host software are unchanged.
 for (genvar C = 0; C < N_CARD_AXI; C++) begin : g_iqr_card_send_tie
     always_comb axis_card_send[C].tie_off_m();
 end
-for (genvar C = 1; C < N_CARD_AXI; C++) begin : g_iqr_card_recv_tie
+for (genvar C = 0; C < N_CARD_AXI; C++) begin : g_iqr_card_recv_tie
     always_comb axis_card_recv[C].tie_off_s();
 end
 
-// 2:1 ndata mux: card when use_card, else host. Park the idle source's ready at 0.
-assign iqr_bytes_in.data    = iqr_use_card ? iqr_bytes_card.data  : iqr_bytes_host.data;
-assign iqr_bytes_in.keep    = iqr_use_card ? iqr_bytes_card.keep  : iqr_bytes_host.keep;
-assign iqr_bytes_in.last    = iqr_use_card ? iqr_bytes_card.last  : iqr_bytes_host.last;
-assign iqr_bytes_in.valid   = iqr_use_card ? iqr_bytes_card.valid : iqr_bytes_host.valid;
-assign iqr_bytes_host.ready = iqr_use_card ? 1'b0 : iqr_bytes_in.ready;
-assign iqr_bytes_card.ready = iqr_use_card ? iqr_bytes_in.ready : 1'b0;
-`else
-// No card memory in this build: host path only (use_card is ignored).
 assign iqr_bytes_in.data    = iqr_bytes_host.data;
 assign iqr_bytes_in.keep    = iqr_bytes_host.keep;
 assign iqr_bytes_in.last    = iqr_bytes_host.last;
 assign iqr_bytes_in.valid   = iqr_bytes_host.valid;
 assign iqr_bytes_host.ready = iqr_bytes_in.ready;
-`endif
 
 // data8 ndata (64 lanes) -> data64 ndata (8 lanes): same 512 bits; regroup keep (8 bytes -> 1 elem).
-ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_in();
-assign iqr_in.data        = iqr_bytes_in.data;
-assign iqr_in.last        = iqr_bytes_in.last;
-assign iqr_in.valid       = iqr_bytes_in.valid;
-assign iqr_bytes_in.ready = iqr_in.ready;
+// This is the HOST-sourced stream. It carries pass 2 always, and pass 1 too when fusing is off.
+ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_host_in();
+assign iqr_host_in.data   = iqr_bytes_in.data;
+assign iqr_host_in.last   = iqr_bytes_in.last;
+assign iqr_host_in.valid  = iqr_bytes_in.valid;
+assign iqr_bytes_in.ready = iqr_host_in.ready;
 for (genvar K = 0; K < IQR_NUM_ELEMENTS; K++) begin : g_iqr_keep_in
-    assign iqr_in.keep[K] = &iqr_bytes_in.keep[K * 8 +: 8];
+    assign iqr_host_in.keep[K] = &iqr_bytes_in.keep[K * 8 +: 8];
 end
+
+// -- Fused pass 1: the on-chip feed from the decoder lanes ----------------------------------------
+logic        iqr_clear_req;   // driven by inst_iqr_config below; also re-arms the feed
+logic        iqr_fuse_enable;
+logic [63:0] iqr_hist_expected;
+logic [63:0] iqr_fed_elements;
+logic        iqr_feed_done;
+logic        iqr_hist_active;   // from IQR_detection: high while it is consuming pass 1
+
+ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_feed_in();
+IqrHistogramFeed #(
+    .value_t(data64_t),
+    .NUM_ELEMENTS(IQR_NUM_ELEMENTS),
+    .N_LANES(NUM_DECODERS)
+) inst_iqr_histogram_feed (
+    .clk(clk),
+    .rst_n(rst_n),
+
+    .i_enable(iqr_fuse_enable),
+    .i_expected(iqr_hist_expected),
+    .i_restart(iqr_clear_req),      // same pulse that zeroes the banks re-arms the element count
+
+    .i_valid(hist_valid),
+    .o_ready(hist_ready),
+    .i_data(hist_data),
+    .i_keep(hist_keep),
+
+    .o_fed_elements(iqr_fed_elements),
+    .o_done(iqr_feed_done),
+
+    .out(iqr_feed_in)
+);
+
+// Pass selector. The IQR core reads BOTH passes from one port, so the source is chosen by which
+// pass it is in: the on-chip feed during HISTOGRAM, the host stream during FLAG. With fusing off
+// this collapses to the host stream in both passes, i.e. the legacy behaviour.
+ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_in();
+logic iqr_take_feed;
+assign iqr_take_feed = iqr_fuse_enable && iqr_hist_active;
+
+assign iqr_in.data  = iqr_take_feed ? iqr_feed_in.data  : iqr_host_in.data;
+assign iqr_in.keep  = iqr_take_feed ? iqr_feed_in.keep  : iqr_host_in.keep;
+assign iqr_in.last  = iqr_take_feed ? iqr_feed_in.last  : iqr_host_in.last;
+assign iqr_in.valid = iqr_take_feed ? iqr_feed_in.valid : iqr_host_in.valid;
+// Park the idle source's ready low so it cannot advance while unselected.
+assign iqr_feed_in.ready = iqr_take_feed ? iqr_in.ready : 1'b0;
+assign iqr_host_in.ready = iqr_take_feed ? 1'b0         : iqr_in.ready;
 
 // -- StreamProfiler taps on the IQR input (both passes) and output (flag emission) ----------------
 // Free-running (stop tied low): counters accumulate over a run and re-zero on the next run's first
@@ -336,7 +396,7 @@ StreamProfiler inst_iqr_profile_in (
 // IQR config block (config 3): window CSRs in, count-loss diagnostics + debug out.
 logic [63:0] iqr_bin_min, iqr_bin_shift_w, iqr_dbg_total, iqr_dbg_clear_seq;
 logic [63:0] iqr_dbg_accepted, iqr_dbg_committed, iqr_dbg_flushes, iqr_dbg_collisions;
-logic        iqr_is_signed, iqr_clear_req;
+logic        iqr_is_signed;   // iqr_clear_req is declared earlier: the feed uses it
 IqrConfig inst_iqr_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -364,7 +424,12 @@ IqrConfig inst_iqr_config (
     .bin_shift(iqr_bin_shift_w),
     .is_signed(iqr_is_signed),
     .clear_req(iqr_clear_req),
-    .use_card(iqr_use_card)
+    .use_card(iqr_use_card),
+
+    .fed_elements(iqr_fed_elements),
+    .feed_done(iqr_feed_done),
+    .fuse_enable(iqr_fuse_enable),
+    .hist_expected(iqr_hist_expected)
 );
 
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_flags_nd();
@@ -387,6 +452,8 @@ IQR_detection #(
     .dbg_committed(iqr_dbg_committed),
     .dbg_flushes(iqr_dbg_flushes),
     .dbg_collisions(iqr_dbg_collisions),
+
+    .o_hist_active(iqr_hist_active),
 
     .in(iqr_in),
     .out(iqr_flags_nd)

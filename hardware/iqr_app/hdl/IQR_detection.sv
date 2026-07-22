@@ -55,6 +55,12 @@ module IQR_detection #(
     output logic [63:0]                           dbg_flushes,
     output logic [63:0]                           dbg_collisions,
 
+    // Which pass the core is currently consuming input for. The two passes read the SAME `in`
+    // port sequentially, so a top that sources them differently -- pass 1 fused with the decoder
+    // output on-chip, pass 2 re-streamed from host memory -- needs to know which to select.
+    // High in HISTOGRAM (pass 1), low in QUARTILES/FLAG. Combinational off `state`.
+    output logic                                  o_hist_active,
+
     ndata_i.s in,   // #(value_t, NUM_ELEMENTS) input values
     ndata_i.m out   // #(value_t, NUM_ELEMENTS) results (driven later)
 );
@@ -71,6 +77,9 @@ module IQR_detection #(
     } state_t;
 
     state_t state;
+
+    // Pass selector for a fused top (see the port comment).
+    assign o_hist_active = (state == HISTOGRAM);
 
     // Quartile search status
     logic q1_found;

@@ -186,6 +186,19 @@ bool stream_enabled() {
 // first implementation derived it from a PREFIX instead and was catastrophically wrong on
 // order-dependent data -- 19,997,999 of 20,000,000 rows flagged against a true answer of 200. See
 // RESULTS.md 9.15, and re-run bench/overlap_ab.sh accuracy after touching any of this.
+// OASIS_IQR_FUSE=1 arms the RTL to feed the histogram straight from the decoder output, so pass 1
+// costs no PCIe traffic and no host time at all. Needs a bitstream with IqrHistogramFeed (build-15
+// onwards); on an older bitstream the fuse CSRs are ignored and pass 1 would never terminate, so the
+// runner's histogram_total check catches it rather than silently returning wrong flags.
+// Unlike OASIS_IQR_OVERLAP this does NOT require the streaming sink -- the tee is in hardware.
+bool fuse_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_FUSE");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+
 bool overlap_enabled() {
     static const bool on = [] {
         const char *e = std::getenv("OASIS_IQR_OVERLAP");
@@ -198,7 +211,10 @@ bool overlap_enabled() {
 // before any group decodes, then once per decoded chunk in column order. Lets the caller feed the
 // IQR histogram pass while the remaining groups are still decoding.
 struct DecodeHooks {
-    std::function<void(size_t total_elements)>                                on_start;
+    // (total_elements, streaming): `streaming` is the FINAL per-file sink decision, not the env
+    // var. The software overlap needs the streaming sink and must bail when it is false, or it
+    // would arm pass 1 and then wait forever for chunks that are never fed.
+    std::function<void(size_t total_elements, bool streaming)>                on_start;
     std::function<void(const std::shared_ptr<libstf::Buffer> &, size_t, bool)> on_chunk;
 };
 
@@ -516,10 +532,12 @@ std::shared_ptr<libstf::Buffer> DecodeColumnAllGroups(
     // `fetch` and into `fpga_wait` with decode total unchanged (181.1 -> 181.7 ms), while costing
     // ~7 % more host CPU (sf10 0.442 -> 0.474 CPU-s). The decoder, not the host feed, bounds this
     // phase. See RESULTS.md 9.11.
-    // Announce the element count now that the streaming decision is final, so the caller can set up
-    // the overlapped IQR pass before the first group lands.
-    if (hooks && hooks->on_start && stream) {
-        hooks->on_start(total);
+    // Announce the element count now that the streaming decision is final, so the caller can arm
+    // the IQR pass before the first group lands. Fired regardless of sink: the RTL-fused path tees
+    // in hardware and works with the memcpy sink too; only the software overlap needs streaming,
+    // and it gates itself on stream_enabled().
+    if (hooks && hooks->on_start) {
+        hooks->on_start(total, stream);
     }
 
     const size_t window    = decode_window();
@@ -607,14 +625,21 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     // The bins must be fixed before the first beat, and they MUST come from a sample that spans the
     // column -- a prefix-derived window is a wrong-answer bug, not a precision trade-off (§9.15).
     // If the spanning sample cannot be taken we simply do not overlap.
-    bool       overlap = overlap_enabled() && stream_enabled() && !use_card && !bind.needs_values;
+    // Fused pass 1 (RTL) takes precedence over the software overlap: it is strictly better where
+    // available (no PCIe traffic, no host CPU) and works with either sink.
+    bool       fuse    = fuse_enabled() && !use_card;
+    bool       overlap = !fuse && overlap_enabled() && stream_enabled() && !use_card && !bind.needs_values;
     int64_t    win_min   = 0;
     uint64_t   win_shift = 0;
     double     window_ms = 0.0;
-    if (overlap) {
+    if (fuse || overlap) {
+        // Both need the bins fixed before any value arrives, so the window comes from a host-side
+        // sample that SPANS the column (a prefix-derived one is a wrong-answer bug -- RESULTS.md 9.15).
         auto t_win = TimingClock::now();
-        overlap    = DeriveWindowSpanning(context, bind, win_min, win_shift);
+        bool ok    = DeriveWindowSpanning(context, bind, win_min, win_shift);
         window_ms  = ms_since(t_win);
+        fuse       = fuse && ok;
+        overlap    = overlap && ok;
     }
 
     // auto_window stays true: if the overlap does not engage (the streaming guard rejects the file),
@@ -624,8 +649,21 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
 
     bool        pass1_started = false;
     DecodeHooks hooks;
+
+    if (fuse) {
+        // Arm the device before the first group decodes; the decode then drives pass 1 as a side
+        // effect of the hardware tee. The element count must be exact -- the on-chip feed
+        // regenerates the terminating `last` from it, since each lane asserts `last` per row group.
+        hooks.on_start = [&](size_t total_elements, bool) {
+            runner.begin_fused(win_min, win_shift, total_elements);
+            pass1_started = true;
+        };
+    }
     if (overlap) {
-        hooks.on_start = [&](size_t) {
+        hooks.on_start = [&](size_t, bool streaming) {
+            if (!streaming) {
+                return;   // memcpy fallback: leave pass1_started false so run() handles it
+            }
             runner.begin_overlapped(win_min, win_shift); // clears the histogram
             pass1_started = true;
         };
@@ -638,7 +676,8 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     auto   t_decode = TimingClock::now();
     // Non-empty only on the streaming path; then gstate.values stays null and these ARE the input.
     std::vector<std::pair<std::shared_ptr<libstf::Buffer>, size_t>> chunks;
-    gstate.values = DecodeColumnAllGroups(context, ctx, bind, n, tm, &chunks, overlap ? &hooks : nullptr);
+    gstate.values =
+        DecodeColumnAllGroups(context, ctx, bind, n, tm, &chunks, (fuse || overlap) ? &hooks : nullptr);
     double decode_ms    = ms_since(t_decode);
     gstate.num_elements = n;
     if (n == 0) {
@@ -669,7 +708,9 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     // pass1_started is the authority, not `overlap`: the decode path silently falls back to the
     // memcpy sink when a row group is not a multiple of 8 elements, and then no chunk was ever fed.
     auto             t_iqr = TimingClock::now();
-    auto             res   = pass1_started ? runner.finish_overlapped(inputs) : runner.run(inputs);
+    auto             res   = !pass1_started ? runner.run(inputs)
+                             : (fuse ? runner.finish_fused(inputs)
+                                     : runner.finish_overlapped(inputs));
     double           iqr_ms = ms_since(t_iqr);
     gstate.flags           = res.flags;
 
@@ -683,7 +724,7 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
                      tm.streamed ? "stream" : (tm.zero_copy ? "zero-copy" : "memcpy"),
                      // overlapped: pass 1 is inside `decode`, so `passes` below is pass 2 only.
                      // win_derive is the spanning host sample, charged to `heavy` but not to decode.
-                     pass1_started ? "overlapped" : "serial", window_ms, decode_ms,
+                     !pass1_started ? "serial" : (fuse ? "fused" : "overlapped"), window_ms, decode_ms,
                      tm.wait_ms, tm.fetch_ms, tm.submit_ms, tm.copy_ms, iqr_ms, res.stage_ms,
                      res.passes_ms, ms_since(t_all));
 

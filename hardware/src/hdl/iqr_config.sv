@@ -53,6 +53,11 @@ module IqrConfig (
     input logic [63:0] prof_out_stalled,
     input logic [63:0] prof_out_idle,
 
+    // Fused-pass-1 feed diagnostics, so the host can tell "pass 1 never finished" from
+    // "pass 1 finished with the wrong count".
+    input logic [63:0] fed_elements,
+    input logic        feed_done,
+
     // Runtime window outputs, driven to IQR_detection.
     output logic [63:0] bin_min,
     output logic [63:0] bin_shift,
@@ -62,7 +67,15 @@ module IqrConfig (
     // Data source select for the IQR input passes: 0 = host DMA (axis_host_recv, legacy),
     // 1 = card/HBM (axis_card_recv). The host stages the decoded column into HBM (LOCAL_OFFLOAD)
     // and sets this so both passes read from HBM instead of re-DMAing from the host.
-    output logic        use_card
+    output logic        use_card,
+
+    // -- Fused pass 1 (histogram driven from the decoder output, not re-streamed) ----
+    // fuse_enable : select the on-chip feed for HISTOGRAM; 0 = legacy host-streamed pass 1
+    // hist_expected : total elements in the column. The feed regenerates `last` from this,
+    //   because each decoder lane asserts `last` per ROW GROUP and no lane knows where the
+    //   column ends. Wrong value => pass 1 ends early => silently wrong quartiles.
+    output logic        fuse_enable,
+    output logic [63:0] hist_expected
 );
 
 `RESET_RESYNC // Reset pipelining
@@ -84,6 +97,8 @@ assign values[11] = prof_out_handshakes;
 assign values[12] = prof_out_starved;
 assign values[13] = prof_out_stalled;
 assign values[14] = prof_out_idle;
+assign values[15] = fed_elements;   // elements the on-chip feed has pushed this run
+assign values[16] = {63'd0, feed_done};  // the terminating `last` has been sent
 
 ConfigReadRegisterFile #(
     .NUM_REGS(NUM_IQR_CONFIG_REGS)
@@ -114,6 +129,17 @@ ConfigWriteRegister #(4, logic [63:0]) inst_use_card (
     .clk(clk), .write_config(write_config), .data(use_card_reg)
 );
 assign use_card = use_card_reg[0];
+
+// reg 5 = fuse_enable, reg 6 = hist_expected (see the port comments).
+logic [63:0] fuse_enable_reg;
+ConfigWriteRegister #(5, logic [63:0]) inst_fuse_enable (
+    .clk(clk), .write_config(write_config), .data(fuse_enable_reg)
+);
+assign fuse_enable = fuse_enable_reg[0];
+
+ConfigWriteRegister #(6, logic [63:0]) inst_hist_expected (
+    .clk(clk), .write_config(write_config), .data(hist_expected)
+);
 
 // reg 3 = clear pulse: assert clear_req for one cycle when written.
 always_ff @(posedge clk) begin

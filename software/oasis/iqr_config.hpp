@@ -98,10 +98,24 @@ class IqrConfig : public libstf::Config {
     // Re-arm the histogram clear sweep so the next run starts from a zeroed histogram.
     void clear_histogram()             { write_register(libstf::ConfigRegister(3, 1u)); }
 
-    // Select the IQR input source for both passes: false = host DMA (legacy), true = card/HBM.
-    // When true, the host must first stage the decoded column into HBM (LOCAL_OFFLOAD) so the
-    // device reads it locally instead of re-DMAing from the host each pass.
+    // DEPRECATED, retained so the register map does not shift. The card/HBM datapath was removed
+    // from the RTL: it measured 8 MB/s with a size-independent ~1548x penalty on the READ path
+    // (RESULTS.md 9.17), and with pass 1 fused on-chip there is only one pass left to source.
     void set_use_card(bool use_card)   { write_register(libstf::ConfigRegister(4, use_card ? 1u : 0u)); }
+
+    // -- Fused pass 1 --------------------------------------------------------------------------
+    // Feed the HISTOGRAM pass straight from the decoder output instead of re-streaming the column
+    // from the host. `expected` is the total element count of the column: each decoder lane asserts
+    // `last` once per ROW GROUP and no lane knows where the column ends, so the on-chip feed
+    // regenerates the single terminating `last` from this count. A wrong value ends pass 1 early
+    // and every quartile is silently wrong -- always verify histogram_total() == N afterwards.
+    void set_fuse_enable(bool on)      { write_register(libstf::ConfigRegister(5, on ? 1u : 0u)); }
+    void set_hist_expected(uint64_t n) { write_register(libstf::ConfigRegister(6, n)); }
+
+    // Feed diagnostics: elements pushed so far, and whether the terminating `last` was sent.
+    // Distinguishes "pass 1 never finished" from "pass 1 finished with the wrong count".
+    uint64_t fed_elements()            { return read_register(15).value(); }
+    bool     feed_done()               { return read_register(16).value() != 0; }
 
     static constexpr uint64_t ID = IQR_CONFIG_ID;
 };

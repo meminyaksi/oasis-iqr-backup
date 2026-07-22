@@ -131,6 +131,27 @@ class IqrRunner {
      * Not supported with use_card (staging needs the whole column up front); the caller must fall
      * back to run().
      */
+    /**
+     * ---- Fused pass 1 (RTL) -------------------------------------------------------------------
+     * Unlike begin_overlapped(), which still DMAs pass 1 from the host, this arms the hardware to
+     * feed the histogram directly from the decoder output. The host then simply decodes; pass 1
+     * happens as a side effect and costs no PCIe traffic and no host time at all.
+     *
+     *     begin_fused(bin_min, bin_shift, N)   // before decoding
+     *     ... caller decodes the column ...     // pass 1 runs on-chip
+     *     finish_fused(chunks)                  // pass 2 + drain
+     *
+     * `N` must be the exact element count: the on-chip feed regenerates the single terminating
+     * `last` from it (each decoder lane asserts `last` per row group and cannot know where the
+     * column ends). finish_fused() verifies histogram_total == N and throws if not, because a
+     * miscount produces plausible-looking but wrong quartiles rather than an obvious failure.
+     *
+     * Works with either sink: the tee is in hardware, so it does not care whether the host
+     * gathered the column or kept per-row-group chunks.
+     */
+    void   begin_fused(int64_t bin_min, uint64_t bin_shift, size_t expected_elements);
+    Result finish_fused(const std::vector<InputChunk> &inputs);
+
     void   begin_overlapped(int64_t bin_min, uint64_t bin_shift);
     void   feed_pass1(const InputChunk &chunk, bool is_last);
     Result finish_overlapped(const std::vector<InputChunk> &inputs);
@@ -181,6 +202,7 @@ class IqrRunner {
 
     // Overlapped-mode state, live only between begin_overlapped() and finish_overlapped().
     bool overlapped_ = false;
+    bool fused_      = false;
 };
 
 } // namespace oasis

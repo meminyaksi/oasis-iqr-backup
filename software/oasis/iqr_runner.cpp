@@ -227,6 +227,71 @@ static size_t flag_bytes_for(size_t num_elements) {
     return beats * FLAG_BYTES_PER_BEAT;
 }
 
+void IqrRunner::begin_fused(int64_t bin_min, uint64_t bin_shift, size_t expected_elements) {
+    if (use_card_) {
+        throw std::runtime_error("IqrRunner: begin_fused() is not supported with use_card");
+    }
+    bin_min_   = bin_min;
+    bin_shift_ = bin_shift;
+    iqr_config_->set_bin_min(bin_min_);
+    iqr_config_->set_bin_shift(bin_shift_);
+    iqr_config_->set_use_card(false);
+
+    // Order matters: the element count and the enable must be in place BEFORE the clear pulse,
+    // because that same pulse re-arms the feed's element counter on the device.
+    iqr_config_->set_hist_expected(expected_elements);
+    iqr_config_->set_fuse_enable(true);
+    clear_histogram_fenced();
+    fused_ = true;
+}
+
+IqrRunner::Result IqrRunner::finish_fused(const std::vector<InputChunk> &inputs) {
+    if (!fused_) {
+        throw std::runtime_error("IqrRunner: finish_fused() called before begin_fused()");
+    }
+    fused_ = false;
+
+    Result result;
+    result.num_elements = count_elements(inputs);
+    result.bin_min      = bin_min_;
+    result.bin_shift    = bin_shift_;
+    if (result.num_elements == 0) {
+        iqr_config_->set_fuse_enable(false);
+        return result;
+    }
+
+    // Pass 1 ran on-chip during decode. Wait for the feed to have sent its terminating `last`
+    // before enqueuing pass 2: the device would back-pressure anyway (the input mux parks the host
+    // source while the core is in HISTOGRAM), but polling turns a silent stall into a clear error.
+    for (uint64_t spins = 0; !iqr_config_->feed_done(); ++spins) {
+        if (spins > 200000000ull) {
+            throw std::runtime_error(
+                "IqrRunner: fused pass 1 did not complete (fed " +
+                std::to_string(iqr_config_->fed_elements()) + " of " +
+                std::to_string(result.num_elements) + " elements)");
+        }
+    }
+
+    size_t out_bytes = flag_bytes_for(result.num_elements);
+    auto   handle    = ctx_.bypass_receiver().acquire(out_bytes);
+
+    auto t_pass0 = std::chrono::steady_clock::now();
+    stream_pass(inputs, coyote::STRM_HOST, static_cast<int64_t>(ctx_.iqrStream())); // pass 2: FLAG
+
+    auto t_drained   = collect_result(result, out_bytes, *handle);
+    result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
+
+    iqr_config_->set_fuse_enable(false);   // leave the device on the legacy path
+
+    // A miscounted pass 1 yields plausible but wrong quartiles, so check rather than trust.
+    if (result.histogram_total != result.num_elements) {
+        throw std::runtime_error(
+            "IqrRunner: fused pass 1 histogram total " + std::to_string(result.histogram_total) +
+            " != " + std::to_string(result.num_elements) + " elements");
+    }
+    return result;
+}
+
 void IqrRunner::begin_overlapped(int64_t bin_min, uint64_t bin_shift) {
     if (use_card_) {
         // Card mode stages the whole column before either pass, so there is nothing to overlap.
