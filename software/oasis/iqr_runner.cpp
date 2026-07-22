@@ -263,12 +263,22 @@ IqrRunner::Result IqrRunner::finish_fused(const std::vector<InputChunk> &inputs)
     // Pass 1 ran on-chip during decode. Wait for the feed to have sent its terminating `last`
     // before enqueuing pass 2: the device would back-pressure anyway (the input mux parks the host
     // source while the core is in HISTOGRAM), but polling turns a silent stall into a clear error.
-    for (uint64_t spins = 0; !iqr_config_->feed_done(); ++spins) {
-        if (spins > 200000000ull) {
-            throw std::runtime_error(
-                "IqrRunner: fused pass 1 did not complete (fed " +
-                std::to_string(iqr_config_->fed_elements()) + " of " +
-                std::to_string(result.num_elements) + " elements)");
+    // Bound this in WALL CLOCK, not spins. Each feed_done() is an MMIO read (~1 us), so a spin
+    // budget of 200 M was really a ~200 s timeout -- longer than any sane `timeout` on the query,
+    // which meant the process was always killed before it could report WHY. The whole point of
+    // polling here is to turn a silent stall into a diagnostic, so the budget has to be short
+    // enough to actually be reached: decode is ~90 ms on the largest column we run.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!iqr_config_->feed_done()) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                iqr_config_->set_fuse_enable(false);   // unpark the mux before giving up
+                throw std::runtime_error(
+                    "IqrRunner: fused pass 1 did not complete (fed " +
+                    std::to_string(iqr_config_->fed_elements()) + " of " +
+                    std::to_string(result.num_elements) + " elements, histogram_total " +
+                    std::to_string(iqr_config_->histogram_total()) + ")");
+            }
         }
     }
 
