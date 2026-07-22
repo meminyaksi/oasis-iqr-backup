@@ -226,6 +226,67 @@ constexpr int64_t IQR_HW_NUM_BINS = 1024;
 template <typename F>
 void ParallelRanges(size_t n, size_t nthreads, F &&fn);
 
+// How many row groups the window sample spans. 16 is the MINIMUM SAFE value, not a default to tune
+// down: at OASIS_IQR_WINDOW_GROUPS=8 taxi_d1 regresses from 1247 outliers to 1348 (§9.15.1).
+size_t window_groups() {
+    static const size_t k = [] {
+        const char *e = std::getenv("OASIS_IQR_WINDOW_GROUPS");
+        if (e) {
+            long v = std::strtol(e, nullptr, 10);
+            if (v > 0) {
+                return static_cast<size_t>(v);
+            }
+        }
+        return static_cast<size_t>(16);
+    }();
+    return k;
+}
+
+// OASIS_IQR_WINDOW_FPGA=1 takes the window sample from the FPGA decoder instead of decompressing it
+// on the host. See DeriveWindowFromFpga() for why that is worth doing. Off by default so the fused
+// bitstream can be validated against the window path that is already trusted.
+bool window_fpga_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_WINDOW_FPGA");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+
+// The one place the (sample -> bin_min, bin_shift) rule lives. Both window derivations feed it, so
+// they cannot drift apart: whichever way the sample was collected, identical values must produce an
+// identical window. Same rule as IqrRunner::derive_window -- robust percentiles, NOT min/max, so a
+// stray outlier cannot blow up the bin width (footer min/max was tried and is degenerate: taxi_d4
+// spans -128540..33407632, which makes 1024 bins 32768 wide while the fares live in 0..5000).
+// Consumes `sample` (sorts it in place). Returns false if there is nothing usable to measure.
+bool WindowFromSample(std::vector<int64_t> &sample, int64_t &bin_min_out, uint64_t &bin_shift_out) {
+    if (sample.size() < 2) {
+        return false;
+    }
+    std::sort(sample.begin(), sample.end());
+    const size_t  m     = sample.size();
+    const int64_t lo    = sample[m * 1 / 100];
+    const int64_t hi    = sample[std::min(m - 1, m * 99 / 100)];
+    const int64_t range = hi - lo;
+    if (range <= 0) {
+        bin_min_out   = lo;
+        bin_shift_out = 0;
+        return true;
+    }
+
+    uint64_t width = static_cast<uint64_t>((range + IQR_HW_NUM_BINS - 1) / IQR_HW_NUM_BINS);
+    uint64_t shift = 0;
+    while ((1ull << shift) < width) {
+        ++shift;
+    }
+    const int64_t binw = static_cast<int64_t>(1ull << shift);
+
+    // Floor-align the low edge to a bin boundary (correct for negative lo too).
+    bin_min_out   = (lo >= 0) ? (lo / binw) * binw : -(((-lo) + binw - 1) / binw) * binw;
+    bin_shift_out = shift;
+    return true;
+}
+
 // Derives the histogram window (bin_min, bin_shift) WITHOUT the decoded column in hand, so pass 1 can
 // be started before decode finishes. Returns false if no usable sample could be taken, in which case
 // the caller must fall back to the serial path.
@@ -244,16 +305,7 @@ void ParallelRanges(size_t n, size_t nthreads, F &&fn);
 // construction, and feeds the same robust p1/p99 rule IqrRunner::derive_window already uses.
 bool DeriveWindowSpanning(ClientContext &context, const IqrFlagsBindData &bind, int64_t &bin_min_out,
                           uint64_t &bin_shift_out) {
-    static const size_t k_groups = [] {
-        const char *e = std::getenv("OASIS_IQR_WINDOW_GROUPS");
-        if (e) {
-            long v = std::strtol(e, nullptr, 10);
-            if (v > 0) {
-                return static_cast<size_t>(v);
-            }
-        }
-        return static_cast<size_t>(16);
-    }();
+    const size_t k_groups = window_groups();
 
     ParquetOptions parquet_opts(context);
     ParquetReader  probe(context, OpenFileInfo {bind.filename}, parquet_opts, bind.parquet_metadata);
@@ -325,34 +377,133 @@ bool DeriveWindowSpanning(ClientContext &context, const IqrFlagsBindData &bind, 
     for (auto &part : parts) {
         sample.insert(sample.end(), part.begin(), part.end());
     }
-    if (sample.size() < 2) {
+    return WindowFromSample(sample, bin_min_out, bin_shift_out);
+}
+
+// Derives the histogram window from a sample decoded BY THE FPGA, so the host never decompresses
+// anything twice.
+//
+// WHY. DeriveWindowSpanning() pulls one DataChunk (2048 rows) from each of 16 spanning row groups on
+// the HOST. That sounds cheap -- 0.05 % of sf10 -- but you cannot decode 2048 rows out of a
+// compressed Parquet page: reading any row forces a full page decompress. So it costs ~3.2 ms per
+// group, ~51 ms of host CPU, parallelised down to ~18 ms of wall clock. And every one of those pages
+// is decompressed AGAIN by the FPGA moments later as part of the real decode. It is pure duplicated
+// work, and it lands on the metric this study leads with: §9.15.1 measured host CPU-work on
+// tpch_extprice falling 3.70x -> 1.91x once the window was enabled.
+//
+// So: decode the 16 spanning groups on the FPGA (fuse off, since the bins do not exist yet), sample
+// their output, derive the window, and let the caller then decode the WHOLE column with the bins
+// already set. The sampled groups therefore decode twice, ~3 ms of FPGA time. That is deliberate.
+// The alternative -- keeping their decoded values and replaying them into the (idle) iqr_host_in
+// port so nothing decodes twice -- saves ~1.7 ms but requires flipping fuse_enable in the middle of
+// the HISTOGRAM state, i.e. a posted CSR write with no ordering against in-flight data. That is the
+// same hazard class that already forced the histogram-clear fence, and it is not worth 1.7 ms.
+//
+// The sample must SPAN the column. Taking it from whichever groups decode first is the prefix window,
+// which flagged 19,997,999 of 20,000,000 rows against a true answer of 200 (RESULTS.md 9.15).
+//
+// Returns false if no usable sample could be taken; the caller must then fall back.
+bool DeriveWindowFromFpga(ClientContext &context, oasis::OasisContext &ctx,
+                          const IqrFlagsBindData &bind, int64_t &bin_min_out,
+                          uint64_t &bin_shift_out) {
+    auto &fs          = FileSystem::GetFileSystem(context);
+    auto  file_handle = fs.OpenFile(bind.filename, FileOpenFlags::FILE_FLAGS_READ);
+
+    ParquetOptions parquet_opts(context);
+    ParquetReader  reader(context, OpenFileInfo {bind.filename}, parquet_opts, bind.parquet_metadata);
+    auto           meta = BuildParcoreMetadata(reader);
+
+    const size_t col = bind.column_id;
+
+    std::vector<size_t> live;
+    for (size_t gi = 0; gi < meta.groups.size(); gi++) {
+        if (meta.groups[gi].chunks[col].num_values > 0) {
+            live.push_back(gi);
+        }
+    }
+    if (live.empty()) {
         return false;
     }
 
-    // Same rule as IqrRunner::derive_window: robust percentiles, not min/max, so a stray outlier
-    // cannot blow up the bin width.
-    std::sort(sample.begin(), sample.end());
-    const size_t  m     = sample.size();
-    const int64_t lo    = sample[m * 1 / 100];
-    const int64_t hi    = sample[std::min(m - 1, m * 99 / 100)];
-    const int64_t range = hi - lo;
-    if (range <= 0) {
-        bin_min_out   = lo;
-        bin_shift_out = 0;
-        return true;
+    // Uniformly spaced, first and last always included: drift is monotonic in row order, so the ends
+    // of the file are exactly what a prefix sample misses.
+    const size_t        k = std::min(window_groups(), live.size());
+    std::vector<size_t> picks;
+    picks.reserve(k);
+    for (size_t i = 0; i < k; i++) {
+        picks.push_back(live[(k == 1) ? 0 : (i * (live.size() - 1)) / (k - 1)]);
+    }
+    picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
+
+    // STRIDE-SAMPLE, do not keep everything. The FPGA decodes whole row groups, so these picks yield
+    // ~2 M values on sf10 -- and std::sort on 2 M int64 costs ~100 ms, which would swallow the entire
+    // saving. ~2048 per group matches what the host path sampled and is far more than the ~8192 the
+    // serial derive_window() uses.
+    constexpr size_t PER_GROUP_SAMPLE = 2048;
+
+    struct InFlight {
+        oasis::SplinterResultHandle result;
+        size_t                      num_values;
+        size_t                      gi;
+    };
+    std::deque<InFlight> in_flight;
+    std::vector<int64_t> sample;
+    sample.reserve(picks.size() * PER_GROUP_SAMPLE);
+
+    auto drain_one = [&]() {
+        InFlight g = std::move(in_flight.front());
+        in_flight.pop_front();
+        auto batch = g.result.get_next_batch();
+        if (!batch) {
+            throw InternalException("iqr_flags: window decode of row group %llu produced no output",
+                                    (unsigned long long)g.gi);
+        }
+        const int64_t *p      = static_cast<const int64_t *>(batch->buffer->ptr);
+        const size_t   stride = std::max<size_t>(1, g.num_values / PER_GROUP_SAMPLE);
+        for (size_t i = 0; i < g.num_values; i += stride) {
+            sample.push_back(p[i]);
+        }
+    };
+
+    const size_t depth = decode_window();
+    for (size_t gi : picks) {
+        const auto &group = meta.groups[gi];
+        const auto &cc    = group.chunks[col];
+        auto        type  = parcore::metadata::to_libstf_type(cc.type);
+
+        uint64_t span_begin = std::numeric_limits<uint64_t>::max();
+        uint64_t span_end   = 0;
+        for (const auto &c : group.chunks) {
+            span_begin = std::min<uint64_t>(span_begin, c.offset);
+            span_end   = std::max<uint64_t>(span_end, c.offset + c.total_compressed_size);
+        }
+        CoalescedFetcher fetcher(*file_handle, ctx.memory_pool(),
+                                 {span_begin, span_end - span_begin});
+        auto handle = fetcher.Register(cc.offset, cc.total_compressed_size);
+        fetcher.PrepareReads();
+        for (size_t i = 0; i < fetcher.num_reads(); i++) {
+            fetcher.ExecuteMergedRead(i);
+        }
+
+        oasis::QuerySplinter splinter;
+        oasis::OperatorFlow  flow;
+        flow.push_back(MakeHostSourceCopy(ctx, fetcher.Resolve(handle)));
+        flow.push_back(
+            std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type));
+        flow.push_back(std::make_unique<oasis::LocalSinkOperator>(
+            ctx.allocate_output_buffer(cc.num_values * libstf::size_of(type)), gi));
+        splinter.streams.push_back(std::move(flow));
+
+        in_flight.push_back({ctx.scheduler().submit(std::move(splinter)), cc.num_values, gi});
+        if (in_flight.size() >= depth) {
+            drain_one();
+        }
+    }
+    while (!in_flight.empty()) {
+        drain_one();
     }
 
-    uint64_t width = static_cast<uint64_t>((range + IQR_HW_NUM_BINS - 1) / IQR_HW_NUM_BINS);
-    uint64_t shift = 0;
-    while ((1ull << shift) < width) {
-        ++shift;
-    }
-    const int64_t binw = static_cast<int64_t>(1ull << shift);
-
-    // Floor-align the low edge to a bin boundary (correct for negative lo too).
-    bin_min_out   = (lo >= 0) ? (lo / binw) * binw : -(((-lo) + binw - 1) / binw) * binw;
-    bin_shift_out = shift;
-    return true;
+    return WindowFromSample(sample, bin_min_out, bin_shift_out);
 }
 
 // Decodes the target column across every row group via the ParCore decoder into one contiguous host
@@ -629,17 +780,33 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     // available (no PCIe traffic, no host CPU) and works with either sink.
     bool       fuse    = fuse_enabled() && !use_card;
     bool       overlap = !fuse && overlap_enabled() && stream_enabled() && !use_card && !bind.needs_values;
-    int64_t    win_min   = 0;
-    uint64_t   win_shift = 0;
-    double     window_ms = 0.0;
+    int64_t     win_min   = 0;
+    uint64_t    win_shift = 0;
+    double      window_ms = 0.0;
+    const char *win_src   = "n/a";
     if (fuse || overlap) {
-        // Both need the bins fixed before any value arrives, so the window comes from a host-side
-        // sample that SPANS the column (a prefix-derived one is a wrong-answer bug -- RESULTS.md 9.15).
+        // Both need the bins fixed before any value arrives, so the window comes from a sample that
+        // SPANS the column (a prefix-derived one is a wrong-answer bug -- RESULTS.md 9.15).
+        //
+        // Two ways to get that sample. The FPGA path decodes the spanning groups on the device and
+        // costs ~3 ms of device time; the host path decompresses their pages on the CPU and costs
+        // ~18 ms wall / ~51 ms of host CPU for work the FPGA is about to repeat. The FPGA path is
+        // strictly better but changes which values are sampled -- whole groups, stride-sampled,
+        // rather than each group's first DataChunk -- so bin_min/bin_shift can land a step apart and
+        // flag counts can shift. It is therefore opt-in until re-gated with overlap_ab.sh accuracy.
         auto t_win = TimingClock::now();
-        bool ok    = DeriveWindowSpanning(context, bind, win_min, win_shift);
-        window_ms  = ms_since(t_win);
-        fuse       = fuse && ok;
-        overlap    = overlap && ok;
+        bool ok    = false;
+        if (window_fpga_enabled()) {
+            ok = DeriveWindowFromFpga(context, ctx, bind, win_min, win_shift);
+            win_src = ok ? "fpga" : "fpga-failed";
+        }
+        if (!ok) {
+            ok      = DeriveWindowSpanning(context, bind, win_min, win_shift);
+            win_src = window_fpga_enabled() ? "host(fallback)" : "host";
+        }
+        window_ms = ms_since(t_win);
+        fuse      = fuse && ok;
+        overlap   = overlap && ok;
     }
 
     // auto_window stays true: if the overlap does not engage (the streaming guard rejects the file),
@@ -716,15 +883,18 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
 
     if (timing_enabled()) {
         std::fprintf(stderr,
-                     "[iqr] rows=%zu  groups=%zu  window=%zu  sink=%s  pass1=%s  win_derive %.2f ms\n"
+                     "[iqr] rows=%zu  groups=%zu  window=%zu  sink=%s  pass1=%s  "
+                     "win_derive %.2f ms (%s)\n"
                      "[iqr]   decode  %8.2f ms   (fpga_wait %.2f | fetch %.2f | submit %.2f | copy %.2f)\n"
                      "[iqr]   iqr     %8.2f ms   (staging %.2f | passes %.2f)\n"
                      "[iqr]   heavy   %8.2f ms   <- everything before DuckDB emits a single row\n",
                      n, tm.groups, decode_window(),
                      tm.streamed ? "stream" : (tm.zero_copy ? "zero-copy" : "memcpy"),
                      // overlapped: pass 1 is inside `decode`, so `passes` below is pass 2 only.
-                     // win_derive is the spanning host sample, charged to `heavy` but not to decode.
-                     !pass1_started ? "serial" : (fuse ? "fused" : "overlapped"), window_ms, decode_ms,
+                     // win_derive is the spanning sample, charged to `heavy` but not to decode; its
+                     // source is host (CPU page decompress) or fpga (device decode of the picks).
+                     !pass1_started ? "serial" : (fuse ? "fused" : "overlapped"), window_ms, win_src,
+                     decode_ms,
                      tm.wait_ms, tm.fetch_ms, tm.submit_ms, tm.copy_ms, iqr_ms, res.stage_ms,
                      res.passes_ms, ms_since(t_all));
 

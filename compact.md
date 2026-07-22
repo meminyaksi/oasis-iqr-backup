@@ -162,8 +162,13 @@ decode and never crosses PCIe. Pass 2 is untouched — it needs the final Q1/Q3 
   sink (the tee is in hardware), so taxi_d3/d4 benefit too. `finish_fused` polls `feed_done` and then
   **verifies `histogram_total == N`** — a miscounted pass 1 gives plausible-but-wrong quartiles.
 
-**Target: `heavy` ~131 ms vs today's 169.7** — already measured in software (§9.15), so a bitstream
-landing elsewhere means the RTL is wrong, not the idea.
+**Target: `heavy` ~150 ms vs today's 169.7.** Do NOT validate against 131 — that figure (§9.15) was
+measured with the *free prefix* window, the one that gives wrong answers. The correct spanning window
+costs ~18 ms, which build-15 pays too, so the honest arithmetic is `169.7 − 38 (pass 1 deleted)
++ 18 (window) ≈ 150`. Anything near 150 means the RTL is right; 169 means the fuse never engaged.
+
+**The window tax is the reason fusion only pays above ~20 M rows**, exactly as it did for the software
+overlap (§9.15.1). Fixing it is the pure-software follow-up in §8.1b.
 
 ### When build-15 finishes
 
@@ -221,7 +226,32 @@ the candidate replacement. **Flashing it replaces the IQR bitstream** — reflas
 
 ## 8. Next steps after build-15, in priority order
 
-1. **Validate build-15** (§6). Expect `heavy` 169.7 → ~131, `passes` 76.6 → ~38, `decode` unchanged.
+1. **Validate build-15** (§6). Expect `heavy` 169.7 → **~150**, `passes` 76.6 → ~38, `decode`
+   unchanged, `win_derive` ~18. Run with `OASIS_IQR_WINDOW_FPGA` **unset** so the window path is the
+   one already trusted — a changed window would confound the RTL verdict.
+
+1b. **Derive the window on the FPGA instead of the CPU** (`OASIS_IQR_WINDOW_FPGA=1`, pure software,
+   already implemented). Today `DeriveWindowSpanning` decompresses the first `DataChunk` of 16
+   spanning row groups **on the host** — and because you cannot decode 2048 rows out of a compressed
+   page, that means fully decompressing 16 pages to keep 0.05 % of the column: ~18 ms wall and
+   **~51 ms of host CPU**, duplicating work the FPGA is about to do anyway. §9.15.1 measured the
+   damage to the study's headline: CPU-work on extprice fell **3.70× → 1.91×**.
+   Instead: decode 16 spanning groups **on the FPGA** (fuse off), stride-sample their output, derive
+   the window, then decode the whole column with the bins already set. The 16 groups decode twice —
+   ~3 ms — which is deliberate: the alternative (replaying them from host memory into the idle
+   `iqr_host_in` port) saves 1.7 ms but requires flipping `fuse_enable` mid-`HISTOGRAM`, i.e. a posted
+   CSR write racing the data plane. That is the hazard class that already forced the histogram-clear
+   fence. Not worth 1.7 ms.
+   **Expect `heavy` ~150 → ~135 and host CPU back to baseline**, and fusion becomes a win on *every*
+   dataset rather than only above ~20 M rows. Re-run `overlap_ab.sh accuracy` after: the sample
+   differs from the CPU one, so `bin_min`/`bin_shift` may land a step apart and counts can shift
+   (taxi_d2 moved 2877 → 2617 when the prefix window was replaced). **`ov_drift` must still be 200.**
+   *Metadata cannot replace this.* Footer min/max is free and was tested: taxi_d4 spans
+   −128540..33407632, so 1024 bins are 32768 wide while fares live in 0..5000 ⇒ everything in bin 0
+   ⇒ q1 = q3 ⇒ degenerate. Percentiles over per-group extremes fail too (outliers in ~every group),
+   page-level `ColumnIndex` fails for the same reason at finer grain, and dictionary pages give the
+   value *domain* without frequencies and don't exist on PLAIN-encoded sf10/extprice. What is needed
+   is a robust **quantile**; Parquet only stores **extremes**.
 2. **Step 2 — store bin indices instead of values.** Pass 2 only needs "is v below lo / above hi".
    The histogram already computes a 10-bit bin index, so storing that instead of the 64-bit value is
    **6.4× less data: 457.7 MB → 71.5 MB**, taking pass 2 from ~38 ms to ~6 ms and `heavy` to ~98.
