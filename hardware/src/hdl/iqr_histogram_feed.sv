@@ -72,6 +72,12 @@ module IqrHistogramFeed #(
 
     localparam int LANE_BITS = (N_LANES > 1) ? $clog2(N_LANES) : 1;
 
+    // Element accounting. Declared up here because the skid buffers' ready depends on `done` (the
+    // safety valve below).
+    logic [63:0] fed;
+    logic        done;
+    logic [63:0] beat_elems;
+
     // -- Per-lane 2-deep skid buffer ---------------------------------------------------------
     // Decouples the tee in the top from this module's arbitration. Two entries is enough: the
     // worst-case wait for a turn is N_LANES-1 beats and the aggregate input rate is ~1/3 of the
@@ -86,7 +92,13 @@ module IqrHistogramFeed #(
         assign sk_full[L] = sk_occ[L][1];      // both slots taken
         assign sk_has[L]  = sk_occ[L][0];      // head valid
         // Inert when disabled: never back-pressure the decoder's path to the host.
-        assign o_ready[L] = (!i_enable) || (!sk_full[L]);
+        //
+        // SAFETY VALVE: also hold ready high once `done`. The top's mux parks this module's ready at
+        // 0 the instant the core leaves HISTOGRAM, so without this a single miscounted element turns
+        // into a DEADLOCKED DECODER rather than a wrong answer -- the skids fill, the tee stops
+        // advancing, and the host hangs with nothing to report. Dropping post-`done` beats instead
+        // degrades a miscount to the histogram_total != N error the host already checks for.
+        assign o_ready[L] = (!i_enable) || done || (!sk_full[L]);
     end
 
     // -- Round-robin arbitration over the lane heads ------------------------------------------
@@ -114,20 +126,35 @@ module IqrHistogramFeed #(
     end
 
     // -- Element accounting and `last` generation ----------------------------------------------
-    logic [63:0] fed;
-    logic        done;
-    logic [63:0] beat_elems;
-
-    assign beat_elems     = 64'($countones(out.keep));
+    // Count off the SKID SLOT, not off out.keep. Sourcing it from out.keep made the always_comb
+    // below read a signal it also drives (out.last needs beat_elems, beat_elems came from out.keep),
+    // which xsim treats as a non-converging combinational loop and resolves to X -- `fed` then went
+    // X on the first beat and `last` never fired. Synthesis would have inferred the same flat logic,
+    // so this is a simulation-visibility fix, but the dependency was genuinely circular as written.
+    logic [$clog2(NUM_ELEMENTS + 1) - 1:0] beat_cnt;
+    always_comb begin
+        beat_cnt = '0;
+        for (int e = 0; e < NUM_ELEMENTS; e++) begin
+            if (sk_keep[next_grant][0][e]) beat_cnt = beat_cnt + 1'b1;
+        end
+    end
+    assign beat_elems     = 64'(beat_cnt);
     assign o_fed_elements = fed;
     assign o_done         = done;
 
-    // Drive the merged stream straight from the granted lane's head. No output register: the IQR
-    // core holds in.ready high through HISTOGRAM, so a combinational path here does not limit
-    // throughput and avoids an extra beat of latency in the `last` accounting.
+    // Drive the merged stream from `next_grant` -- the lane SELECTED THIS CYCLE -- not from `grant`,
+    // which is last cycle's winner and is precisely the lane that has just run dry.
+    //
+    // This was the build-15 hang. `out.valid` follows `any_head` (ANY lane has a head) while the
+    // payload came from sk_data[grant]. As soon as lane `grant` emptied and a different lane had
+    // data, the module asserted valid over an empty slot: garbage `keep` bits inflated beat_elems,
+    // `fed` overshot i_expected, `last` fired early, the core left HISTOGRAM, the top's mux parked
+    // this module's ready at 0, the skids filled, and the tee deadlocked the DECODER -- a silent
+    // hang with no host-visible error, since the host never even reached finish_fused.
+    // It is invisible with N_LANES=1, where grant is always 0.
     always_comb begin
-        out.data  = sk_data[grant][0];
-        out.keep  = sk_keep[grant][0];
+        out.data  = sk_data[next_grant][0];
+        out.keep  = sk_keep[next_grant][0];
         out.valid = i_enable && any_head && !done;
         out.last  = i_enable && any_head && ((fed + beat_elems) >= i_expected);
     end
@@ -149,8 +176,10 @@ module IqrHistogramFeed #(
             // Push: the top's tee handed us a beat this cycle.
             for (int L = 0; L < N_LANES; L++) begin
                 logic push, pop;
-                push = i_enable && i_valid[L] && o_ready[L];
-                pop  = out.valid && out.ready && (grant == LANE_BITS'(L));
+                // Once `done`, accept and DISCARD: see o_ready's comment on why dropping beats is
+                // the safe behaviour here.
+                push = i_enable && !done && i_valid[L] && o_ready[L];
+                pop  = out.valid && out.ready && (next_grant == LANE_BITS'(L));
 
                 if (push && !pop) begin
                     if (!sk_occ[L][0]) begin
