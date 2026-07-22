@@ -247,9 +247,9 @@ the candidate replacement. **Flashing it replaces the IQR bitstream** — reflas
 
 ---
 
-## 8. Next steps after build-15, in priority order
+## 8. Next steps after build-16, in priority order
 
-1. **Validate build-15** (§6). Expect `heavy` 169.7 → **~150**, `passes` 76.6 → ~38, `decode`
+1. **Validate build-16** (§6). Expect `heavy` 169.7 → **~150**, `passes` 76.6 → ~38, `decode`
    unchanged, `win_derive` ~18. Run with `OASIS_IQR_WINDOW_FPGA` **unset** so the window path is the
    one already trusted — a changed window would confound the RTL verdict.
 
