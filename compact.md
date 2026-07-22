@@ -1,7 +1,16 @@
-# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-22, after the RTL fusion work)
+# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-23, after the build-15 hang + fix)
 
 **Read this first after a compact.** Authoritative numbers: `bench/RESULTS.md` §9 (§9.1–§9.18).
 This file is state + next actions.
+
+> **NEWEST FIRST (2026-07-23, ~01:00):** build-15 flashed but **HUNG the decoder** — a fused query
+> sat silent until `timeout` with no error. Root cause: an arbiter bug in `IqrHistogramFeed`
+> (payload from last cycle's lane while `valid` followed *any* lane → early `last` → deadlock). Fixed
+> + proved with TWO standalone xsim testbenches (feed alone, and feed→mux→IQR_detection connected).
+> **build-16 is rebuilding on hacc-build-02 with the fix** (started 00:37, RTL on disk 00:00, so the
+> fix IS in it — verified). Also: the fused-pass-1 poll now times out in 10 s of wall clock instead
+> of ~200 s of spins, so a future stall reports instead of hanging. Full detail in §6. **When
+> build-16 lands, validate exactly as §6 — do NOT reuse build-15.**
 
 ---
 
@@ -15,7 +24,8 @@ and the mechanism is a clean **crossover at ~10 M rows**. Host CPU-seconds (2.07
 every change and is the study's most defensible claim. The remaining wall-clock gap is a **bus
 limit** — the FPGA reads at 12.5 GB/s over PCIe, the CPU at 63 GB/s from DRAM. Card memory was
 disqualified as a workaround (8 MB/s). The current work removes the redundant PCIe traffic instead:
-**RTL that fuses IQR pass 1 into decode is written, synthesises clean, and is building as build-15.**
+**RTL fuses IQR pass 1 into decode. build-15 hung (arbiter bug, now fixed + sim-proved); build-16
+is rebuilding with the fix — see the banner at the top and §6.**
 
 ---
 
@@ -136,55 +146,67 @@ IQR lane as separate streams that never meet on-chip.
 
 ---
 
-## 6. IN FLIGHT — build-15, the fused-pass-1 bitstream
+## 6. IN FLIGHT — build-16, the fused-pass-1 bitstream (build-15 hung; fixed)
 
-**Committed and synthesis-clean.** `git reset --hard pre-rtl-fusion` reverts everything.
+**build-15 hung the decoder on silicon.** Flashed fine, `decoder_profiler` returned 0–3, but a fused
+query sat SILENT until `timeout` — no error at all. **build-15 is dead; use build-16.**
+`git reset --hard pre-rtl-fusion` reverts the whole fusion line if ever needed.
 
-```
-5d0ac6e  IQR RTL: fuse pass 1 into decode (IqrHistogramFeed), drop the HBM datapath
-ace1611  IQR: fair benchmark + overlapped pass 1 + full phase instrumentation  [tag: pre-rtl-fusion]
-```
+**The bug (in `iqr_histogram_feed.sv`).** The arbiter drove `out.valid` off `any_head` (ANY lane has
+a beat) while the payload came from `sk_data[grant]` — last cycle's winner, i.e. the lane that just
+ran dry. When that lane emptied while another had data, it asserted valid over an empty slot; garbage
+`keep` bits inflated the element count, `fed` overshot `hist_expected`, `last` fired early, the core
+left HISTOGRAM, the top's mux parked the feed's ready at 0, the skids filled, and the tee **stopped
+the decoder**. The host never reached `finish_fused`, so its `histogram_total==N` check never ran —
+hence silent. **Invisible at N_LANES=1** (`grant` always 0), which is why nothing caught it before.
 
-**What it does:** the decoder output is TEE'd on-chip into the IQR histogram, so pass 1 runs *during*
-decode and never crosses PCIe. Pass 2 is untouched — it needs the final Q1/Q3 and can never be fused.
+**The fix (commits `9e5592d`, `4b7339e`, `01e1632`, `2db6c41`):**
+- drive `out.data/keep` and `pop` from **`next_grant`** (the lane selected *this* cycle), not `grant`.
+- **safety valve:** hold `o_ready` high once `done` and drop late beats — so any *future* miscount is
+  a `histogram_total != N` error (which the host reads in 10 s) instead of a deadlocked decoder.
+- `beat_elems` now counts off the skid slot, not `out.keep` (that was a circular comb dependency that
+  xsim resolved to X); explicit keep-sum instead of `$countones` (returned X here).
+- `IqrRunner::finish_fused` poll is now a **10 s wall-clock deadline**, not 200 M spins (~200 s) —
+  each `feed_done()` is a PCIe MMIO read, so the old budget always outlived the query's `timeout`,
+  which is *why build-15 presented as a pure hang with nothing printed*.
 
-- `hardware/src/hdl/iqr_histogram_feed.sv` (new) — round-robin merge of the decoder lanes. Three
-  jobs: **regenerate `last`** (each lane asserts it per *row group*; the histogram needs exactly one
-  at the end of the column, which no lane knows → counts against the `hist_expected` CSR);
-  order-independence makes round-robin sufficient; a 2-deep skid per lane so the tee can't stall decode.
-- `IQR_detection` — new `o_hist_active` output (both passes share one input port, so the top must
-  know which pass is active to pick the source).
-- `vfpga_top.svh` — tee, feed instance, pass mux. **HBM datapath removed**; the `use_card` CSR is
-  retained so the register map and host software don't shift.
-- `IqrConfig` — +`fuse_enable`(5), +`hist_expected`(6), +`fed_elements`(15), +`feed_done`(16);
-  `NUM_IQR_CONFIG_REGS` 15 → 17.
-- `IqrRunner::begin_fused/finish_fused`; **`OASIS_IQR_FUSE=1`**, off by default. Works with *either*
-  sink (the tee is in hardware), so taxi_d3/d4 benefit too. `finish_fused` polls `feed_done` and then
-  **verifies `histogram_total == N`** — a miscounted pass 1 gives plausible-but-wrong quartiles.
+**PROVEN IN SIM (both run in seconds; need `module load vivado/2024.2`):**
+- `hardware/unit-tests/run_feed_tb.sh` — feed alone, 4 lanes at uneven rates. 5 scenarios pass;
+  all 5 FAIL with DUPLICATE EMISSION when the fix is reverted, so it demonstrably catches the bug.
+- `hardware/unit-tests/run_fused_integration_tb.sh` — feed→mux→IQR_detection connected (the seam no
+  prior test touched), real two-pass flow vs a reference: `dbg_total==N`, 96/96 flags bit-exact, mux
+  switches correctly. Inverting the mux's `take_feed` deadlocks it → TIMEOUT, so it has teeth.
+- **Sim can't reach:** CSR-vs-DMA ordering / the clear fence, and −0.4 ns timing closure. Those are
+  what the morning gates below settle.
 
-**Target: `heavy` ~150 ms vs today's 169.7.** Do NOT validate against 131 — that figure (§9.15) was
-measured with the *free prefix* window, the one that gives wrong answers. The correct spanning window
-costs ~18 ms, which build-15 pays too, so the honest arithmetic is `169.7 − 38 (pass 1 deleted)
-+ 18 (window) ≈ 150`. Anything near 150 means the RTL is right; 169 means the fuse never engaged.
+**build-16 has the fix — verified:** `iqr_histogram_feed.sv` mtime 00:00 < build-16 start 00:37, and
+the on-disk file has `next_grant][0]` ×3 + the safety valve. Watch: `scripts/util/watch_build.sh -w`.
 
-**The window tax is the reason fusion only pays above ~20 M rows**, exactly as it did for the software
-overlap (§9.15.1). Fixing it is the pure-software follow-up in §8.1b.
+**What fusion does (unchanged):** the decoder output is TEE'd on-chip into the IQR histogram, so pass
+1 runs *during* decode and never crosses PCIe. Pass 2 is untouched (needs final Q1/Q3). Register map:
+`IqrConfig` +`fuse_enable`(5) +`hist_expected`(6) +`fed_elements`(15) +`feed_done`(16),
+`NUM_IQR_CONFIG_REGS` 17. `OASIS_IQR_FUSE=1`, off by default; works with either sink.
 
-### When build-15 finishes
+**Target: `heavy` ~150 ms vs today's 169.7.** Do NOT validate against 131 — that figure (§9.15) used
+the *free prefix* window (wrong answers). The correct spanning window costs ~18 ms, which build-16
+pays too: `169.7 − 38 (pass 1 deleted) + 18 (window) ≈ 150`. ~150 = RTL right; 169 = fuse never
+engaged. The window tax is why fusion only pays above ~20 M rows — the §8.1b follow-up removes it.
+
+### When build-16 finishes
 
 ```bash
-head -12 ~/oasis/hardware/build-15/analysis.txt
+head -12 ~/oasis/hardware/build-16/analysis.txt          # WNS negative is OK (build-14 shipped -0.773)
 echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
 cd ~/oasis && bash parcore/libstf/coyote/util/program_hacc_local.sh \
-  hardware/build-15/bitstreams/cyt_top.bit parcore/libstf/coyote/driver/build/coyote_driver.ko 1
+  hardware/build-16/bitstreams/cyt_top.bit parcore/libstf/coyote/driver/build/coyote_driver.ko 1
 echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages   # reprogram clears them
 export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
 cd ~/oasis && timeout 60 ./extension/build/release/duckdb -c "SELECT decoder FROM decoder_profiler();"
 ```
 
-Then, in order:
+Then, in order (leave `OASIS_IQR_WINDOW_FPGA` UNSET — validate the RTL against the trusted window):
 ```bash
-# 1. does it engage and hit the target?  look for pass1=fused and heavy ~131
+# 1. does it engage and hit the target?  look for pass1=fused and heavy ~150 (NOT 131)
 OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_DECODE_WINDOW=16 OASIS_IQR_TIMING=1 \
   timeout 120 ./extension/build/release/duckdb -c \
   "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_flags_only('/home/myaksi/datasets/tpch_extprice_sf10.parquet','v');"
@@ -197,8 +219,9 @@ OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 ./extension/build/release/duckdb < bench/sql
 OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_DECODE_WINDOW=16 python3 bench/medians.py --consume -n 15
 ```
 
-**If `finish_fused` throws `histogram_total != N`,** the feed's `last` regeneration is wrong — read
-`fed_elements()` to see how far it got. That is the single most likely failure.
+**If it hangs again** (should not — sim proved the datapath): it's now bounded, so `finish_fused`
+throws `histogram_total != N` within 10 s. `fed_elements()` shows how far pass 1 got. The remaining
+unsimulated suspects are the CSR clear-fence timing and closure, not the arbiter.
 
 ---
 
@@ -280,6 +303,10 @@ study that beats the CPU rather than reaching parity, because it attacks bytes m
 | `bench/overlap_ab.sh` | `gen` builds ov_uniform/ov_drift; `accuracy` is **the window gate**; `time` is the A/B. |
 | `bench/sql/cpu_op_correctness.sql` | 3-way FPGA/C++/SQL, `threads=1`, POSITIONAL JOIN. |
 | `bench/sql/decoder_probe.sql` | per-lane decoder profilers, all four terms + load balance. |
+| `hardware/unit-tests/run_feed_tb.sh` | xsim, feed arbiter alone, 4 lanes uneven. Seconds. |
+| `hardware/unit-tests/run_fused_integration_tb.sh` | xsim, feed→mux→IQR_detection connected. Seconds. |
+| `scripts/util/watch_build.sh` | `[-w]` watch a `hardware/build-*` without touching Vivado. |
+| `extension/src/oasis_iqr.cpp` | `DeriveWindowFromFpga` (§8.1b, `OASIS_IQR_WINDOW_FPGA=1`, off). |
 
 ## 10. Framing for the writeup
 
