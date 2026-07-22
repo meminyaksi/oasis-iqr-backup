@@ -89,7 +89,7 @@ module tb_iqr_histogram_feed;
         if (rst_n && out.valid && out.ready) begin
             for (int e = 0; e < NUM_ELEMENTS; e++) begin
                 if (out.keep[e]) begin
-                    longint v = out.data[e];
+                    automatic longint v = out.data[e];
                     if (!pushed.exists(v)) begin
                         $error("[%0t] EMITTED A VALUE THAT WAS NEVER PUSHED: 0x%0h (lane %0d slot %0d)",
                                $time, v, v >> 32, v[31:0]);
