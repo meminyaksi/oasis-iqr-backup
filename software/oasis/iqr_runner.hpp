@@ -152,6 +152,28 @@ class IqrRunner {
     void   begin_fused(int64_t bin_min, uint64_t bin_shift, size_t expected_elements);
     Result finish_fused(const std::vector<InputChunk> &inputs);
 
+    /**
+     * ---- Step 2: bin-index pass 2 -------------------------------------------------------------
+     * Pass 2 does nothing per element but compare it against two constants, yet it re-reads the
+     * whole 64-bit column: 8 bytes moved per 1 bit produced. With this on, HISTOGRAM additionally
+     * emits a packed 16-bit-per-element index stream (14-bit signed half-bin index + an `exact`
+     * bit), the host catches it, and pass 2 re-reads THAT -- 4x fewer bytes.
+     *
+     * The results are bit-identical, not approximate: Q1/Q3 are bin lower edges, so 1.5*IQR is an
+     * exact multiple of half a bin and both fences land on half-bin boundaries. Proven in
+     * tb_iqr_index (204884 value/window combinations) and tb_iqr_idx_mode (the same column through
+     * the core in both modes). The `exact` bit exists because floor division collapses every value
+     * in (upper_fence, upper_fence + W/2) onto the fence's own index; without it those outliers are
+     * silently missed.
+     *
+     * Must be set BEFORE begin_fused(): the index receive buffer has to be armed before the first
+     * pass-1 beat, or the beats the device emits during HISTOGRAM have nowhere to land.
+     * Needs a bitstream with the idx_mode CSR (register 7) -- on an older one the register is
+     * ignored, pass 2 would re-read indices as if they were values, and the histogram_total check
+     * would not catch it. Off by default.
+     */
+    void enable_index_pass2(bool on) { idx_mode_ = on; }
+
     void   begin_overlapped(int64_t bin_min, uint64_t bin_shift);
     void   feed_pass1(const InputChunk &chunk, bool is_last);
     Result finish_overlapped(const std::vector<InputChunk> &inputs);
@@ -200,9 +222,24 @@ class IqrRunner {
     std::chrono::steady_clock::time_point
     collect_result(Result &result, size_t out_bytes, BypassStreamReceiver::Handle &handle);
 
+    // Bytes the packed index array occupies for `n` elements: 32 indices per 64-byte beat, padded
+    // to a whole beat (the device masks the tail against hist_expected).
+    static size_t index_bytes_for(size_t n);
+
+    // Drains a bypass-receiver transfer into one contiguous buffer. Shared by the flag drain and
+    // the step-2 index drain.
+    std::shared_ptr<libstf::Buffer> drain_to_buffer(BypassStreamReceiver::Handle &handle,
+                                                    size_t total_bytes);
+
     // Overlapped-mode state, live only between begin_overlapped() and finish_overlapped().
     bool overlapped_ = false;
     bool fused_      = false;
+
+    // Step 2 state. idx_mode_ is sticky (set by the caller); idx_handle_/idx_bytes_ live only
+    // between begin_fused() and finish_fused().
+    bool                                     idx_mode_  = false;
+    std::shared_ptr<BypassStreamReceiver::Handle> idx_handle_;
+    size_t                                   idx_bytes_ = 0;
 };
 
 } // namespace oasis

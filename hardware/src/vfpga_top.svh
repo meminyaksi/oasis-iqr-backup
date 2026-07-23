@@ -336,6 +336,15 @@ logic [63:0] iqr_fed_elements;
 logic        iqr_feed_done;
 logic        iqr_hist_active;   // from IQR_detection: high while it is consuming pass 1
 
+// Step 2 (bin-index pass 2): the packed 16-bit-per-element index stream the core emits during
+// HISTOGRAM, and the CSR that arms it. 512 bits per beat = 32 indices, so pass 2 re-reads 4x fewer
+// beats than the value path it replaces. See hardware/src/hdl/iqr_index.sv.
+logic                        iqr_idx_mode;
+logic [DATABEAT_SIZE*8 - 1:0] iqr_idx_data;
+logic                        iqr_idx_valid;
+logic                        iqr_idx_ready;
+logic                        iqr_idx_last;
+
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_feed_in();
 IqrHistogramFeed #(
     .value_t(data64_t),
@@ -429,7 +438,8 @@ IqrConfig inst_iqr_config (
     .fed_elements(iqr_fed_elements),
     .feed_done(iqr_feed_done),
     .fuse_enable(iqr_fuse_enable),
-    .hist_expected(iqr_hist_expected)
+    .hist_expected(iqr_hist_expected),
+    .idx_mode(iqr_idx_mode)
 );
 
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_flags_nd();
@@ -454,6 +464,13 @@ IQR_detection #(
     .dbg_collisions(iqr_dbg_collisions),
 
     .o_hist_active(iqr_hist_active),
+
+    .i_idx_mode(iqr_idx_mode),
+    .i_expected(iqr_hist_expected),   // shared with the fused feed: the column's element count
+    .o_idx_data(iqr_idx_data),
+    .o_idx_valid(iqr_idx_valid),
+    .i_idx_ready(iqr_idx_ready),
+    .o_idx_last(iqr_idx_last),
 
     .in(iqr_in),
     .out(iqr_flags_nd)
@@ -483,13 +500,26 @@ StreamProfiler inst_iqr_profile_out (
 );
 
 // data64 ndata -> data8 ndata for the output writer.
+//
+// STEP 2: this one writer carries BOTH host-bound streams, because they are disjoint in time -- the
+// index beats are emitted during HISTOGRAM (plus the packer's flush, which drains into QUARTILES)
+// and the packed flags only during FLAG. Steering on iqr_idx_valid rather than on the core's state
+// is what makes the flush safe: the packer holds its last beat until accepted, and a state-based
+// mux would stop routing it the moment HISTOGRAM ended. The two valids are never high together, so
+// the priority here never actually arbitrates.
 ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_out();
-assign iqr_bytes_out.data  = iqr_packed.data;
-assign iqr_bytes_out.last  = iqr_packed.last;
-assign iqr_bytes_out.valid = iqr_packed.valid;
-assign iqr_packed.ready    = iqr_bytes_out.ready;
+logic iqr_idx_take;
+assign iqr_idx_take = iqr_idx_mode && iqr_idx_valid;
+
+assign iqr_bytes_out.data  = iqr_idx_take ? iqr_idx_data  : iqr_packed.data;
+assign iqr_bytes_out.last  = iqr_idx_take ? iqr_idx_last  : iqr_packed.last;
+assign iqr_bytes_out.valid = iqr_idx_take ? 1'b1          : iqr_packed.valid;
+assign iqr_idx_ready       = iqr_idx_take ? iqr_bytes_out.ready : 1'b0;
+assign iqr_packed.ready    = iqr_idx_take ? 1'b0          : iqr_bytes_out.ready;
 for (genvar K = 0; K < IQR_NUM_ELEMENTS; K++) begin : g_iqr_keep_out
-    assign iqr_bytes_out.keep[K * 8 +: 8] = {8{iqr_packed.keep[K]}};
+    // Index beats are always full words (the packer zero-pads the tail; the host masks it off
+    // against the element count), so keep is all ones for them.
+    assign iqr_bytes_out.keep[K * 8 +: 8] = iqr_idx_take ? 8'hFF : {8{iqr_packed.keep[K]}};
 end
 
 NDataToAXI #(data8_t, DATABEAT_SIZE) inst_iqr_ndata_to_axi (

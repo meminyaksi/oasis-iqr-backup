@@ -199,6 +199,20 @@ bool fuse_enabled() {
     return on;
 }
 
+// OASIS_IQR_IDX_PASS2=1 makes pass 2 re-read packed 16-bit bin indices the FPGA emitted during
+// pass 1 instead of the 64-bit value column -- 4x less PCIe traffic at bit-identical results
+// (RESULTS.md 9.19 / tb_iqr_idx_mode). Requires a bitstream with the idx_mode CSR (register 7);
+// on an older one the register is ignored and pass 2 would misread indices as values, which the
+// histogram_total check does NOT catch. Off by default, and only meaningful with OASIS_IQR_FUSE=1
+// since it rides the same begin_fused/finish_fused path.
+bool idx_pass2_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_IDX_PASS2");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+
 bool overlap_enabled() {
     static const bool on = [] {
         const char *e = std::getenv("OASIS_IQR_OVERLAP");
@@ -975,6 +989,10 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     DecodeHooks hooks;
 
     if (fuse) {
+        // Step 2 must be armed before begin_fused(): the index receive buffer has to exist before
+        // the first pass-1 beat or the beats the device emits during HISTOGRAM have nowhere to land.
+        runner.enable_index_pass2(idx_pass2_enabled());
+
         // Arm the device before the first group decodes; the decode then drives pass 1 as a side
         // effect of the hardware tee. The element count must be exact -- the on-chip feed
         // regenerates the terminating `last` from it, since each lane asserts `last` per row group.
@@ -1055,7 +1073,8 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
                      !pass1_started ? (fuse_small        ? "serial(small)"
                                        : fuse_no_stream  ? "serial(no-stream)"
                                                          : "serial")
-                                    : (fuse ? "fused" : "overlapped"),
+                                    : (fuse ? (idx_pass2_enabled() ? "fused+idx" : "fused")
+                                 : "overlapped"),
                      window_ms, win_src,
                      decode_ms,
                      tm.wait_ms, tm.fetch_ms, tm.submit_ms, tm.copy_ms, iqr_ms, res.stage_ms,

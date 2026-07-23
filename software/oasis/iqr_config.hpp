@@ -112,6 +112,12 @@ class IqrConfig : public libstf::Config {
     void set_fuse_enable(bool on)      { write_register(libstf::ConfigRegister(5, on ? 1u : 0u)); }
     void set_hist_expected(uint64_t n) { write_register(libstf::ConfigRegister(6, n)); }
 
+    // Step 2: pass 2 re-reads packed 16-bit bin indices instead of the 64-bit value column, which is
+    // 4x less PCIe traffic at bit-identical results (proven in tb_iqr_index / tb_iqr_idx_mode).
+    // Requires set_hist_expected() -- the index array is padded to a whole 32-element beat and the
+    // device masks the tail against the element count rather than reading an in-band length.
+    void set_idx_mode(bool on)         { write_register(libstf::ConfigRegister(7, on ? 1u : 0u)); }
+
     // Feed diagnostics: elements pushed so far, and whether the terminating `last` was sent.
     // Distinguishes "pass 1 never finished" from "pass 1 finished with the wrong count".
     uint64_t fed_elements()            { return read_register(15).value(); }

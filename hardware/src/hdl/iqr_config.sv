@@ -22,6 +22,7 @@ import oasis::IQR_CONFIG_ID;
 //   read  2 = dbg_committed        write 2 = is_signed
 //   read  3 = dbg_flushes          write 3 = clear pulse
 //   read  4 = dbg_collisions       write 4 = use_card (0=host DMA, 1=card/HBM input)
+//                                  write 5 = fuse_enable, 6 = hist_expected, 7 = idx_mode
 //   read  5 = dbg_total (histogram grand total of the last run)
 //   read  6 = clear_seq (clear-completion counter)
 //   read  7..10 = input  StreamProfiler: handshakes / starved / stalled / idle cycles
@@ -75,7 +76,9 @@ module IqrConfig (
     //   because each decoder lane asserts `last` per ROW GROUP and no lane knows where the
     //   column ends. Wrong value => pass 1 ends early => silently wrong quartiles.
     output logic        fuse_enable,
-    output logic [63:0] hist_expected
+    output logic [63:0] hist_expected,
+    // Step 2: pass 2 re-reads packed bin indices instead of the raw values (4x less PCIe).
+    output logic        idx_mode
 );
 
 `RESET_RESYNC // Reset pipelining
@@ -136,6 +139,13 @@ ConfigWriteRegister #(5, logic [63:0]) inst_fuse_enable (
     .clk(clk), .write_config(write_config), .data(fuse_enable_reg)
 );
 assign fuse_enable = fuse_enable_reg[0];
+
+// reg 7 = idx_mode: FLAG consumes the packed index stream rather than the value column.
+logic [63:0] idx_mode_reg;
+ConfigWriteRegister #(7, logic [63:0]) inst_idx_mode (
+    .clk(clk), .write_config(write_config), .data(idx_mode_reg)
+);
+assign idx_mode = idx_mode_reg[0];
 
 ConfigWriteRegister #(6, logic [63:0]) inst_hist_expected (
     .clk(clk), .write_config(write_config), .data(hist_expected)

@@ -171,35 +171,47 @@ void IqrRunner::clear_histogram_fenced() {
     }
 }
 
+size_t IqrRunner::index_bytes_for(size_t n) {
+    // 32 indices per 512-bit beat, padded to a whole beat. The device zero-fills the tail and masks
+    // it against hist_expected, so the padding never reaches a flag.
+    constexpr size_t IDX_PER_BEAT = 32;
+    constexpr size_t BEAT_BYTES   = 64;
+    return ((n + IDX_PER_BEAT - 1) / IDX_PER_BEAT) * BEAT_BYTES;
+}
+
+std::shared_ptr<libstf::Buffer>
+IqrRunner::drain_to_buffer(BypassStreamReceiver::Handle &handle, size_t total_bytes) {
+    std::vector<std::shared_ptr<libstf::Buffer>> chunks;
+    while (auto buffer = handle.next()) {
+        chunks.push_back(buffer);
+    }
+    if (chunks.empty()) {
+        throw std::runtime_error("IqrRunner: transfer drained no buffers");
+    }
+    if (chunks.size() == 1) {
+        return chunks.front();
+    }
+    void *ptr    = nullptr;
+    auto  status = ctx_.memory_pool()->allocate(total_bytes, &ptr);
+    if (!status.ok()) {
+        throw std::runtime_error("IqrRunner: failed to allocate drain buffer: " + status.message());
+    }
+    size_t off = 0;
+    for (const auto &c : chunks) {
+        std::memcpy(static_cast<std::byte *>(ptr) + off, c->ptr, c->size);
+        off += c->size;
+    }
+    return libstf::make_buffer(ctx_.memory_pool(), ptr, total_bytes, total_bytes);
+}
+
 // Returns the instant the FPGA finished writing the flags, so callers can close `passes_ms` on the
 // drain alone -- the concatenation and CSR read-back below are host book-keeping, not device time.
 std::chrono::steady_clock::time_point
 IqrRunner::collect_result(Result &result, size_t out_bytes, BypassStreamReceiver::Handle &handle) {
     // Drain the flag buffer(s) the FPGA wrote. next() blocks on the completion interrupt and
     // returns nullptr once the transfer is fully drained.
-    std::vector<std::shared_ptr<libstf::Buffer>> chunks;
-    while (auto buffer = handle.next()) {
-        chunks.push_back(buffer);
-    }
+    result.flags   = drain_to_buffer(handle, out_bytes);
     auto t_drained = std::chrono::steady_clock::now();
-
-    if (chunks.size() == 1) {
-        // Common case (the whole flag column fits one output-writer buffer): hand it back directly.
-        result.flags = chunks.front();
-    } else {
-        // Large column split across buffers: concatenate into one contiguous bitmask for the caller.
-        void *ptr    = nullptr;
-        auto  status = ctx_.memory_pool()->allocate(out_bytes, &ptr);
-        if (!status.ok()) {
-            throw std::runtime_error("IqrRunner: failed to allocate flag buffer: " + status.message());
-        }
-        size_t off = 0;
-        for (const auto &c : chunks) {
-            std::memcpy(static_cast<std::byte *>(ptr) + off, c->ptr, c->size);
-            off += c->size;
-        }
-        result.flags = libstf::make_buffer(ctx_.memory_pool(), ptr, out_bytes, out_bytes);
-    }
 
     // Debug: the histogram grand total (== N iff the banks were zeroed) and the count-loss
     // diagnostics, so the host can see WHERE counts were lost without guessing:
@@ -241,6 +253,15 @@ void IqrRunner::begin_fused(int64_t bin_min, uint64_t bin_shift, size_t expected
     // because that same pulse re-arms the feed's element counter on the device.
     iqr_config_->set_hist_expected(expected_elements);
     iqr_config_->set_fuse_enable(true);
+
+    // Step 2: arm the index receive BEFORE the clear/pass 1. The device starts emitting index beats
+    // with the first HISTOGRAM beat, so a handle acquired later would miss them.
+    iqr_config_->set_idx_mode(idx_mode_);
+    if (idx_mode_) {
+        idx_bytes_  = index_bytes_for(expected_elements);
+        idx_handle_ = ctx_.bypass_receiver().acquire(idx_bytes_);
+    }
+
     clear_histogram_fenced();
     fused_ = true;
 }
@@ -282,16 +303,29 @@ IqrRunner::Result IqrRunner::finish_fused(const std::vector<InputChunk> &inputs)
         }
     }
 
+    // Step 2: collect the index array pass 1 produced, and use IT as pass 2's input. The two
+    // host-bound streams share one output writer on the device but are disjoint in time (indices
+    // during HISTOGRAM, flags during FLAG), so this drain must complete before the flag receive is
+    // armed.
+    std::vector<InputChunk>         pass2_chunks = inputs;
+    std::shared_ptr<libstf::Buffer> idx_buffer;
+    if (idx_mode_) {
+        idx_buffer = drain_to_buffer(*idx_handle_, idx_bytes_);
+        idx_handle_.reset();
+        pass2_chunks.assign(1, InputChunk {idx_buffer->ptr, idx_bytes_});
+    }
+
     size_t out_bytes = flag_bytes_for(result.num_elements);
     auto   handle    = ctx_.bypass_receiver().acquire(out_bytes);
 
     auto t_pass0 = std::chrono::steady_clock::now();
-    stream_pass(inputs, coyote::STRM_HOST, static_cast<int64_t>(ctx_.iqrStream())); // pass 2: FLAG
+    stream_pass(pass2_chunks, coyote::STRM_HOST, static_cast<int64_t>(ctx_.iqrStream())); // pass 2
 
     auto t_drained   = collect_result(result, out_bytes, *handle);
     result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
 
     iqr_config_->set_fuse_enable(false);   // leave the device on the legacy path
+    iqr_config_->set_idx_mode(false);
 
     // A miscounted pass 1 yields plausible but wrong quartiles, so check rather than trust.
     if (result.histogram_total != result.num_elements) {
