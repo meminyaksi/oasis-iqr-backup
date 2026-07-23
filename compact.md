@@ -1,6 +1,6 @@
-# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-23, fused pass 1 validated)
+# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-23, step 2 built; build-19 in flight)
 
-**Read this first after a compact.** Authoritative numbers: `bench/RESULTS.md` §9 (§9.1–§9.19).
+**Read this first after a compact.** Authoritative numbers: `bench/RESULTS.md` §9 (§9.1–§9.20).
 This file is state + next actions.
 
 > **NEWEST FIRST (2026-07-23, 12:00): build-16 IS VALIDATED ON SILICON. The fusion works and is
@@ -17,7 +17,18 @@ This file is state + next actions.
 > OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
 > ```
 > `fuse = FUSE && rows > 10M && streaming sink` → **only sf10 fuses today.** Both gates read the
-> cached footer, so no decode is wasted deciding. See §3 for why, and §8 for what is next.
+> cached footer, so no decode is wasted deciding. See §3 for why.
+>
+> **IN FLIGHT — build-19 (`--fast`, ~4–5 h).** Carries TWO new changes, both simulation-proven but
+> **NOT yet on silicon**: **step 2** (pass 2 re-reads packed 16-bit bin indices instead of 64-bit
+> values, `OASIS_IQR_IDX_PASS2=1`, expect sf10 `heavy` ~139.5 → ~115–120, e2e → ~1.21×) and the
+> **FlagBitPacker** shift-register rewrite (timing only). Design + all sim evidence: **RESULTS.md
+> §9.20**. Validation commands: §6.
+>
+> **DO NOT set `OASIS_IQR_IDX_PASS2=1` on build-16 or earlier** — CSR register 7 does not exist
+> there, so pass 2 would read indices as values and `histogram_total` would NOT catch it. The host
+> now detects this in 10 s with a named error, but only because the counter it polls (register 17)
+> also needs build-19.
 
 ---
 
@@ -195,7 +206,7 @@ IQR lane as separate streams that never meet on-chip.
 
 ---
 
-## 6. DONE — build-16, the fused-pass-1 bitstream (validated on silicon 2026-07-23)
+## 6. build-16 fusion DONE on silicon; build-19 (step 2 + packer) IN FLIGHT
 
 **build-15 hung the decoder on silicon.** Flashed fine, `decoder_profiler` returned 0–3, but a fused
 query sat SILENT until `timeout` — no error at all. **build-15 is dead; use build-16.**
@@ -241,7 +252,48 @@ the *free prefix* window (wrong answers). The correct spanning window costs ~18 
 pays too: `169.7 − 38 (pass 1 deleted) + 18 (window) ≈ 150`. ~150 = RTL right; 169 = fuse never
 engaged. The window tax is why fusion only pays above ~20 M rows — the §8.1b follow-up removes it.
 
-### When build-16 finishes
+### When build-19 finishes — validate in THIS order
+
+```bash
+head -14 ~/oasis/hardware/build-19/analysis.txt        # WNS negative is OK (build-14 shipped -0.773)
+cd ~/oasis && bash parcore/libstf/coyote/util/program_hacc_local.sh \
+  hardware/build-19/bitstreams/cyt_top.bit parcore/libstf/coyote/driver/build/coyote_driver.ko 1
+echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages   # AFTER flashing
+export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
+cat /home/myaksi/datasets/tpch_extprice_sf10.parquet > /dev/null   # warm the page cache first!
+timeout 60 ./extension/build/release/duckdb -c "SELECT decoder FROM decoder_profiler();"
+
+# 1. REGRESSION FIRST: index mode OFF must reproduce build-16 (heavy ~139, passes ~38)
+OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_TIMING=1 \
+  timeout 120 ./extension/build/release/duckdb -c \
+  "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_flags_only('/home/myaksi/datasets/tpch_extprice_sf10.parquet','v');"
+
+# 2. index mode ON: look for pass1=fused+idx, passes ~10, heavy ~115-120
+OASIS_IQR_IDX_PASS2=1 OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 \
+  OASIS_IQR_TIMING=1 timeout 120 ./extension/build/release/duckdb -c \
+  "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_flags_only('/home/myaksi/datasets/tpch_extprice_sf10.parquet','v');"
+
+# 3. the gates -- EVERY number must equal build-16's exactly (the claim is bit-identity)
+OASIS_IQR_IDX_PASS2=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 bench/overlap_ab.sh accuracy
+OASIS_IQR_IDX_PASS2=1 OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 \
+  ./extension/build/release/duckdb < bench/sql/cpu_op_correctness.sql
+
+# 4. numbers, both configs
+OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16 \
+  python3 bench/medians.py --consume -n 15
+OASIS_IQR_IDX_PASS2=1 OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 \
+  OASIS_IQR_DECODE_WINDOW=16 python3 bench/medians.py --consume -n 15
+```
+
+**Step 1 before step 2, always.** If index mode misbehaves you need to know whether the bitstream
+itself regressed. **If step 2 throws `index stream incomplete (... beats)`** the index emit or the
+transfer ordering is wrong — that error is deliberate and arrives in 10 s (§9.20); read the beat
+count against ceil(N/32) = 1,874,565 for sf10.
+
+**Only sf10 fuses today**, so only sf10 exercises step 2 until the taxi streaming-guard work (§8.1)
+lands. Do not expect the other six rows to move.
+
+### Historical: build-16 validation (fusion, already done)
 
 ```bash
 head -12 ~/oasis/hardware/build-16/analysis.txt          # WNS negative is OK (build-14 shipped -0.773)
@@ -311,20 +363,18 @@ changed: pass 1 no longer crosses PCIe, and the window sample runs on the FPGA r
    one makes them streamable, which then also makes them fusable — **worth ~8 ms of copy plus the
    fusion saving on the two datasets furthest behind.**
 
-2. **Step 2 — send bin indices instead of values in pass 2.** `passes` is now 38.4 ms of sf10's
-   139.5, and all pass 2 does per element is compare against two constants — 8 bytes moved per 1 bit
-   produced. The histogram already computes the bin index ([IQR_detection.sv:205-208]), so shipping
-   that instead takes ~457.7 MB → ~97 MB and `passes` ~38 → ~8 ms, i.e. **`heavy` ~139.5 → ~109**.
-   **It can be bit-exact, and this is the part worth knowing:** Q1/Q3 are bin *lower edges*
-   ([IQR_detection.sv:580-581]), so IQR is an exact multiple of the bin width W, `1.5·IQR` is an exact
-   multiple of W/2, and both fences land on **half-bin boundaries** — store the index at half-bin
-   resolution and the comparison is *identical* to today's, not an approximation.
-   **The real hazard is saturation, not rounding:** an out-of-window value clamps, and `lo` can sit
-   below `bin_min`, so a naive 10-bit index would read a far-below outlier as "inside". The fence is
-   at most 1.5×1024 = 1536 bins outside the window, so use a **signed 13-bit half-bin index (±2048
-   bins)**. Get that width wrong and far-out outliers are silently missed — gate on `ov_drift`.
-   Needs a bitstream; adds ~97 MB of write traffic during decode, which should absorb (the device is
-   idle 56.5 of decode's 92.5 ms) but that is an assumption, not a measurement.
+2. **Step 2 — IMPLEMENTED, awaiting silicon (build-19).** Pass 2 re-reads a packed 16-bit index per
+   element instead of the 64-bit value: ~4x less traffic for that pass. `OASIS_IQR_IDX_PASS2=1`, off
+   by default, reported as `pass1=fused+idx`. Full design + sim evidence in **RESULTS.md §9.20**.
+   Expect sf10 `passes` 38.4 → ~10 ms, `heavy` ~139.5 → **~115-120**, e2e 1.05x → **~1.21x**.
+   **TWO CORRECTIONS to what this section used to say** — both found by working the algebra and then
+   confirmed with negative tests, and both would have shipped silent wrong answers:
+   - **16 bits/element, not 13.** In *half*-bins the fence indices span −3069..+5115, so 13-bit
+     signed (±4096) cannot reach +5115. At `IDX_W=13`: **844 mismatches**. It is 14-bit signed.
+   - **An `exact` bit is required.** Floor division collapses every value in
+     `(upper_fence, upper_fence + W/2)` onto the fence's own index, so an index-only compare reports
+     those as INSIDE. Dropping it: **5618 mismatches**. Hence 14 + 1 = 16 bits.
+   So the saving is **4x, not the 6.4x** an index-only 10-bit scheme suggested.
 3. **HOST MEMORY IS ENOUGH — do not build HBM for this.** With bin indices the intermediate is
    71.5 MB, so host round-trip costs ~5.7 ms vs HBM's ~4.5 ms. **HBM is worth ~1 ms.** And host
    writes/reads already exist (`OutputWriter` → `axis_host_send`, `LocalRead` → `axis_host_recv`), so
@@ -362,6 +412,10 @@ at ~92, so step 2 alone does not win outright on sf10 — the two together are w
 | `bench/sql/decoder_probe.sql` | per-lane decoder profilers, all four terms + load balance. |
 | `hardware/unit-tests/run_feed_tb.sh` | xsim, feed arbiter alone, 4 lanes uneven. Seconds. |
 | `hardware/unit-tests/run_fused_integration_tb.sh` | xsim, feed→mux→IQR_detection connected. Seconds. |
+| `hardware/unit-tests/run_index_tb.sh` | xsim, index vs value compare, 204884 combos. **Step 2's core proof.** |
+| `hardware/unit-tests/run_index_stream_tb.sh` | xsim, index pack/unpack round trip vs the value path. |
+| `hardware/unit-tests/run_idx_mode_tb.sh` | xsim, **same column both modes in the core → identical flags.** The step-2 gate. |
+| `hardware/unit-tests/run_flag_packer_tb.sh` | xsim, the bitmask packer. Old impl passes it too = bit-identical. |
 | `scripts/util/watch_build.sh` | `[-w]` watch a `hardware/build-*` without touching Vivado. |
 | `extension/src/oasis_iqr.cpp` | `DeriveWindowFromFpga` (§8.1b, `OASIS_IQR_WINDOW_FPGA=1`, off). |
 
@@ -377,3 +431,10 @@ at ~92, so step 2 alone does not win outright on sf10 — the two together are w
 - **Disclose:** the FPGA's remaining loss is a bus limit (12.5 vs 63 GB/s), not an operator limit —
   and the redundant PCIe pass we removed in RTL is the measured proof that it's addressable.
 - **Disclose:** the C++ baseline saturates ~3 cores and is not proven optimal; C++ spreads are 20–77 %.
+- **Methodology worth stating:** every RTL change since build-15 is gated by a testbench that FAILS
+  when the change is reverted, and where a rewrite claims equivalence, the OLD implementation is run
+  against the same testbench (FlagBitPacker, and index-vs-value mode). This exists because build-15
+  shipped an arbiter bug invisible at 1 decoder that hung the decoder silently — and because on this
+  operator a wrong flag still yields a plausible outlier count, so end-to-end benchmarks do not
+  catch correctness. Two of step 2's design parameters (14-bit width, the `exact` bit) were fixed by
+  negative tests, not by reasoning alone.

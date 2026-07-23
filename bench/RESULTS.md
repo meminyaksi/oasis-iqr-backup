@@ -2014,3 +2014,134 @@ Pass 1 is gone. **The next wall is decode's host feed**: `fetch` + `submit` = 56
 with the FPGA idle for it (`fpga_wait` 31.5). Step 2 (bin indices, §8.2 of `compact.md`) attacks
 `passes`; 8 lanes and FPGA-initiated reads attack `fetch`+`submit`. The IQR core itself is still
 never the limit — `stalled = 0.0 %`, `starved = 21.5 %`, input at 12.51 GB/s against PCIe's ~12.5.
+
+---
+
+## 9.20 Step 2: bin-index pass 2 — implemented and simulation-proven (2026-07-23)
+
+**Status: RTL + host complete, six testbenches green, awaiting silicon (build-19). No hardware
+numbers yet — everything below is design and simulation.**
+
+### The waste
+
+After §9.19 removed pass 1, `passes` is still 38.4 ms of sf10's 139.5 ms operator. All pass 2 does
+per element is compare it against two constants — **8 bytes moved across PCIe to produce 1 bit**. The
+histogram pass already derives a bin index for every element and then discards it.
+
+### Why it can be bit-exact, not approximate
+
+Q1 and Q3 are bin **lower edges** (`q1_val = bin_min + q1_bin<<bin_shift`), so with `W = 2**bin_shift`:
+
+```
+IQR      = (q3_bin - q1_bin) * W
+1.5*IQR  = IQR + IQR/2        -- exact, because W is even whenever bin_shift >= 1
+fences   = bin_min + (an exact multiple of W/2)
+```
+
+Both fences land on **half-bin boundaries**, so encoding at half-bin resolution makes the comparison
+an identity. That is what lets this be a pure traffic reduction rather than an accuracy trade.
+
+### Two corrections to the original plan, both caught before silicon
+
+The plan in §8.2 of `compact.md` said "10-bit bin index, 6.4x less data, ~6 ms". Working the algebra
+properly gave a different format, and **both errors would have produced silently wrong answers** —
+a misplaced flag still yields a plausible outlier count, so neither would have been caught
+downstream. Each is now pinned by a negative test:
+
+| claim | if wrong | mismatches |
+|---|---|--:|
+| index must be **14-bit** signed, not 13 | in *half*-bins the fence indices span **−3069..+5115**; 13-bit signed (±4096) cannot reach +5115, so far-out outliers on one side are missed | **844** |
+| an **`exact`** bit is required | floor division collapses every value in `(upper_fence, upper_fence + W/2)` onto the fence's own index, so an index-only compare reports them INSIDE the fence | **5618** |
+
+`d < f` is exact under floor division (`f` a multiple of `2**s`), but `d > g` is not — that asymmetry
+is the whole reason for the extra bit. Wire format is therefore **16 bits/element** (14-bit signed
+half-bin index + `exact` + 1 spare), i.e. **4x less pass-2 traffic, not 6.4x**.
+
+Saturation at ±8192 is safe *because* every reachable fence index is strictly inside that range: a
+saturated data index still compares on the correct side of both fences. Clamping a **fence** would
+not be safe, so `IqrFenceIndex` does not saturate.
+
+### Where the width change went, and why there
+
+Only the pass-2 **input** widens: one 512-bit beat carries 32 indices instead of 8 values. The flag
+**output** keeps its 8-lane shape and simply runs 4 beats per input beat, so `FlagBitPacker` and
+everything downstream of it are untouched. That was the cheapest place to absorb the change —
+restructuring the output too would have meant a second packer instantiation and a wider flag path.
+
+The index stream shares the **existing** output writer with the packed flags, because the two are
+disjoint in time (indices during HISTOGRAM plus the packer's flush; flags during FLAG). Steering on
+`iqr_idx_valid` rather than on the core's state is what makes the flush safe: the packer holds its
+last beat until accepted, and a state-based mux would stop routing it the moment HISTOGRAM ended.
+
+### The subtle bug simulation caught
+
+**FLAG must exit on the OUTPUT's `last`, not the input's.** One index beat yields up to 4 flag beats,
+so the final input beat is consumed several cycles before the last flag leaves. Leaving on the
+input's `last` truncates the tail of every column — which would have shipped as "slightly wrong
+counts everywhere", not as a visible failure.
+
+### Applying the build-15 lesson to the one path sim cannot reach
+
+The index **drain** is host-side: `BypassStreamReceiver::Handle::next()` waits on a condition
+variable with **no timeout**. If the device emitted fewer index beats than the host armed for, the
+query would hang with nothing printed — the same failure shape as the build-15 arbiter bug, where
+the diagnostic existed but sat *after* the hang and its 200 M-spin budget (~200 s) outlived any
+sane `timeout` on the query.
+
+So the lesson from that debugging session was applied directly: **make the device state observable
+and bound the wait in wall clock.** `IqrIndexPack` exposes `o_beats` → CSR read register 17
+(`NUM_IQR_CONFIG_REGS` 17 → 18), and `finish_fused` polls it against the armed count with a 10 s
+deadline *before* draining:
+
+```
+IqrRunner: index stream incomplete (1874 of 1875 beats for 59986052 elements;
+histogram_total 59986052). Is idx_mode supported by this bitstream?
+```
+
+That last sentence names the actual trap: **on build-16 and earlier, register 7 is silently ignored**,
+so `OASIS_IQR_IDX_PASS2=1` would make pass 2 read indices as if they were 64-bit values — and
+`histogram_total` cannot catch it, because pass 1 is unaffected. Hence off-by-default behind its own
+env var.
+
+### Simulation coverage (all green)
+
+| testbench | what it establishes | negative test |
+|---|---|---|
+| `run_index_tb.sh` | index compare == value compare over **204,884** (value, window) combinations: on/adjacent to both fences, far outside both ways, `bin_shift` 0..31, `q1_bin == q3_bin`, quartiles at the extremes, negative `bin_min`, 3000 random windows | 13-bit → 844; no exact bit → 5618 |
+| `run_index_stream_tb.sh` | pack → host round trip → unpack → flags matches the value path; beats = ceil(N/32), flags = N, `last` once. 12 scenarios incl. every awkward tail (+1/+7/+8/+31, single element) | reversed pack order → 159 |
+| `run_idx_mode_tb.sh` | **the same column through the core in both modes gives identical flags** — 8 scenarios | — |
+| `run_flag_packer_tb.sh` | the shift-register packer (§9.19a) | wrong shift direction fails |
+| `run_feed_tb.sh`, `run_fused_integration_tb.sh` | no regression in the fused path | — |
+
+`run_idx_mode_tb.sh` is the gate that matters: equality against the **real value path**, not a
+reference model, because that is the only check that catches a wrong answer here.
+
+### What silicon still has to settle
+
+- The **ordering of the two host transfers** (index receive armed before pass 1, drained before the
+  flag receive is armed). Now fenced and diagnosable, but not proven.
+- Whether the ~97 MB of index **write** traffic absorbs into decode's existing slack (the device is
+  idle 56.5 of decode's 92.5 ms). Assumed, not measured — if it does not, the saving shrinks from
+  ~29 ms to ~21 ms.
+- Timing closure with `--fast` (`BUILD_OPT=0`, ~4-5 h instead of ~9). The `FlagBitPacker` rewrite was
+  done partly to offset the slack that costs.
+
+**The gate on validation: every correctness number must match build-16 EXACTLY** (taxi_d1 1247,
+taxi_d2 2877, taxi_d3 162, taxi_d4 54921, tpch x3 zero, `ov_drift` 200). The claim is bit-identity,
+so any movement means the index path is wrong — not that it is "approximate".
+
+### 9.20a Also in this build: FlagBitPacker as a fixed shift register
+
+The packer accumulated flags with `acc_next[slot * NUM_ELEMENTS +: NUM_ELEMENTS] = beat_bits` — a
+variable-position write into a 512-bit register, i.e. a 64-way barrel-shifter cloud rebuilt every
+cycle. It was the design's **worst timing offender**: build-15 reported **330 of 1000 failing paths**
+in `inst_iqr_flag_packer`, averaging 15.6 logic levels at fanout 412.
+
+Now a fixed right shift with insertion at the top — pure wiring. The bit order falls out unchanged.
+A partial final word sits at the top and would need a variable shift down, so instead the packer
+shifts zeros until the word is full: **up to 63 cycles once per column**, against sf10's ~7.5 M output
+beats.
+
+Validated by running the **OLD implementation against the same testbench** — it also passes, which is
+what proves the rewrite is bit-identical rather than merely self-consistent. This is a **timing**
+change only; the flag output stream is 1.2 % busy and never the bottleneck.
