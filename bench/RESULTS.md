@@ -1894,3 +1894,123 @@ the only metric unaffected by both defects.
 - **C++ spreads are now 20–77 %** (taxi_d3 77 %, extprice 48 %). Allocator pooling misses on the first
   run of a session and hits thereafter. Medians reproduce across independent runs (taxi_d3 0.83 →
   0.80, taxi_d4 0.77 → 0.76), but the spread must be reported alongside them.
+
+---
+
+## 9.19 Fused pass 1 on silicon — build-16 (2026-07-23)
+
+The RTL that tees the decoder output into the IQR histogram (§6 of `compact.md`) is validated on
+hardware. **sf10's operator falls 169.6 → 137.0 ms (−19 %) and its end-to-end ratio flips 0.85× →
+1.05×, with every correctness number at its documented baseline.**
+
+### The build-15 hang, and what it cost to find
+
+build-15 flashed, `decoder_profiler` answered, and then a fused query **sat silent until `timeout`
+with no error at all**. Root cause in `IqrHistogramFeed`: `out.valid` followed `any_head` (ANY lane
+has a beat) while the payload came from `sk_data[grant]` — last cycle's winner, i.e. precisely the
+lane that had just run dry. Garbage `keep` bits inflated the element count, `fed` overshot
+`hist_expected`, `last` fired early, the core left HISTOGRAM, the top's mux parked the feed's ready
+at 0, the skids filled, and the tee **stopped the decoder**. The host never reached `finish_fused`,
+so its `histogram_total == N` check never ran.
+
+**Invisible at `N_LANES=1`**, where `grant` is always 0 — which is why no prior build caught it.
+
+Three lessons worth keeping:
+
+1. **The poll budget must be wall clock, not spins.** `finish_fused` spun 200 M times on an MMIO
+   read (~1 µs each) = ~200 s, longer than any sane `timeout` on the query. The diagnostic existed
+   and could never fire. Now 10 s.
+2. **A miscount must not be able to deadlock the decoder.** The feed now holds `o_ready` high once
+   `done` and drops late beats, so any future miscount degrades to the `histogram_total != N` error
+   the host already checks for, instead of a silent hang.
+3. **Two sims, written after the fact, would have caught it in seconds** —
+   `run_feed_tb.sh` (4 lanes, uneven rates) and `run_fused_integration_tb.sh` (feed → mux →
+   IQR_detection, two-pass, vs a reference). Both fail when the fix is reverted, so they are proven,
+   not merely passing. They also caught two bugs sim-only: a circular `beat_elems` dependency that
+   xsim resolves to X, and `$countones` returning X on the skid slot.
+
+### The window is the whole story
+
+Fusion deletes pass 1 (worth ~0.64 ms/Mrow) but the histogram window must be sized **before the
+first beat**, and that sample is a roughly fixed cost. Everything below follows from that tension.
+
+**Sampling on the FPGA beats sampling on the host.** `DeriveWindowSpanning` decompresses 16 groups'
+first `DataChunk` on the CPU — ~15 ms wall and ~51 ms host CPU for pages the FPGA is about to decode
+anyway. `DeriveWindowFromFpga` decodes the picks on the device instead:
+
+| window source | `win_derive` | sf10 `heavy` | sf10 CPU-work |
+|---|--:|--:|--:|
+| host sample | 14.93 ms | 145.70 | 4.74× |
+| **FPGA sample** | **7.22 ms** | **139.46** | **6.07×** |
+
+The CPU-seconds column is the point: the host sample nearly halved extprice's CPU-work advantage
+(4.26× → 2.02×); the FPGA sample gives it back in full.
+
+**Coverage matters, resolution does not.** taxi_d3 is wrong at 16 groups (finds 1,296,479 of
+1,328,270). Raising per-group density 2048 → 32768 returned the **identical** answer while
+`win_derive` went 4.72 → 20.32 ms. Raising *groups* 16 → 48 fixes it — but every extra group is
+another group decoded twice:
+
+| dataset | unfused | fused @16 grp | fused @48 grp |
+|---|--:|--:|--:|
+| taxi_d3 | 32.9 ms ✅ 162 | 33.0 ms ❌ 31791 | ~42 ms ✅ 162 |
+| taxi_d4 | 49.6 ms ✅ | **40.6 ms** ✅ | 51.6 ms ✅ |
+| sf10 | 169.6 ms ✅ | **137.2 ms** ✅ | 152.9 ms ✅ |
+
+**48 globally taxes the two columns that benefit in order to fix one that gains nothing from fusion
+at any setting.** (`WindowFromSample` now selects with two composed `nth_element` passes instead of
+sorting — O(n) for the only two order statistics needed. Kept because it is strictly cheaper, though
+it did not unlock the density that turned out not to matter.)
+
+### The two gates, and why conservative won
+
+```
+fuse = OASIS_IQR_FUSE && rows > 10M && streaming sink
+```
+
+Both read from the **cached footer** (`ReadFooterFacts`), so nothing is decoded to decide them and no
+window sample is taken for a fuse that is declined.
+
+- **Row count.** Below ~10 M the fixed window cost exceeds the saving: taxi_d1 1.67× → 1.27×,
+  extprice 1.00× → 0.86×. Same arithmetic that keeps `OASIS_IQR_OVERLAP` off (§9.15.1).
+- **Streaming sink.** A column the guard rejects uses the memcpy sink, and there `run()` derives the
+  window from the *whole decoded column* — free and exact. Fusing replaces that with a sampled
+  window, strictly worse.
+
+**taxi_d4 was sacrificed deliberately.** It is accurate at 16 groups and would gain 49.6 → 40.6 ms.
+But that accuracy is *observed, not predictable*: taxi_d3 is the same sink and the same shape and
+silently loses 2.4 % on identical settings. Non-streaming columns get a perfect window for nothing,
+so there is no reason to gamble on them. **Recorded as a known, deliberate ~10 ms left on the table**
+— revisit only with a cheap a-priori test for whether a sampled window matches the full-column one.
+
+### Final state (build-16, medians of 15, `--consume`)
+
+| dataset | rows | fused? | FPGA | C++ | e2e | operator | CPU-work |
+|---|--:|---|--:|--:|--:|--:|--:|
+| taxi_d1 | 3.0M | no (small) | 0.013 | 0.019 | **1.46×** | **1.70×** | 3.05× |
+| tpch_qty | 6.0M | no (small) | 0.019 | 0.019 | 1.00× | **1.07×** | 3.05× |
+| taxi_d2 | 6.0M | no (small) | 0.019 | 0.024 | **1.26×** | **1.32×** | 3.61× |
+| extprice | 6.0M | no (small) | 0.026 | 0.026 | 1.00× | **1.04×** | 4.16× |
+| taxi_d3 | 13.1M | no (memcpy) | 0.041 | 0.032 | 0.78× | 0.78× | 2.12× |
+| taxi_d4 | 20.3M | no (memcpy) | 0.059 | 0.043 | 0.73× | 0.72× | 2.21× |
+| sf10 | 60.0M | **yes** | 0.149 | 0.157 | **1.05×** | 0.68× | **6.07×** |
+
+sf10, the dataset the fusion targets: **e2e 0.88× → 1.05×, operator 0.58× → 0.68×, CPU-work 6.07×
+preserved.** Correctness at baseline everywhere: taxi_d1 1247, taxi_d2 2877, taxi_d3 **162**,
+taxi_d4 54921, tpch × 3 zero, and `ov_uniform`/`ov_drift` both exactly **200** (these are 20 M-row
+streaming files, so they fuse — the window path stays under test rather than gated out).
+
+**Caveat on reading the table:** FPGA spreads are 2–11 % but **C++ spreads reach 86 %** on
+taxi_d3/d4. The taxi_d3/d4 rows are unfused and should equal the §9.13 baseline; their apparent
+drift (0.80 → 0.78, 0.76 → 0.73) is C++ noise, not an FPGA change.
+
+### Where the remaining time goes (sf10, fused)
+
+```
+heavy 139.46 = win_derive 7.22 + decode 92.49 (fpga_wait 31.5 | fetch 36.8 | submit 19.8) + passes 38.37
+```
+
+Pass 1 is gone. **The next wall is decode's host feed**: `fetch` + `submit` = 56.5 ms of the 92.5 ms,
+with the FPGA idle for it (`fpga_wait` 31.5). Step 2 (bin indices, §8.2 of `compact.md`) attacks
+`passes`; 8 lanes and FPGA-initiated reads attack `fetch`+`submit`. The IQR core itself is still
+never the limit — `stalled = 0.0 %`, `starved = 21.5 %`, input at 12.51 GB/s against PCIe's ~12.5.

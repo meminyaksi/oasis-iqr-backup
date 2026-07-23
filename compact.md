@@ -1,16 +1,23 @@
-# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-23, after the build-15 hang + fix)
+# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-23, fused pass 1 validated)
 
-**Read this first after a compact.** Authoritative numbers: `bench/RESULTS.md` §9 (§9.1–§9.18).
+**Read this first after a compact.** Authoritative numbers: `bench/RESULTS.md` §9 (§9.1–§9.19).
 This file is state + next actions.
 
-> **NEWEST FIRST (2026-07-23, ~01:00):** build-15 flashed but **HUNG the decoder** — a fused query
-> sat silent until `timeout` with no error. Root cause: an arbiter bug in `IqrHistogramFeed`
-> (payload from last cycle's lane while `valid` followed *any* lane → early `last` → deadlock). Fixed
-> + proved with TWO standalone xsim testbenches (feed alone, and feed→mux→IQR_detection connected).
-> **build-16 is rebuilding on hacc-build-02 with the fix** (started 00:37, RTL on disk 00:00, so the
-> fix IS in it — verified). Also: the fused-pass-1 poll now times out in 10 s of wall clock instead
-> of ~200 s of spins, so a future stall reports instead of hanging. Full detail in §6. **When
-> build-16 lands, validate exactly as §6 — do NOT reuse build-15.**
+> **NEWEST FIRST (2026-07-23, 12:00): build-16 IS VALIDATED ON SILICON. The fusion works and is
+> DONE.** sf10's operator **169.6 → 137.0 ms (−19 %)**, end-to-end **0.85× → 1.05×**, CPU-work
+> **6.07× preserved**, and **every correctness number at its documented baseline** (taxi_d3 back to
+> 162, `ov_drift` exactly 200). Full write-up: **`bench/RESULTS.md` §9.19**.
+>
+> Getting there: build-15 hung the decoder silently (arbiter bug in `IqrHistogramFeed` — payload from
+> last cycle's granted lane while `valid` followed *any* lane → early `last` → deadlock). Fixed, and
+> proved with two xsim testbenches that both fail when the fix is reverted.
+>
+> Shipping config — fusion is **gated**, and that is deliberate:
+> ```
+> OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
+> ```
+> `fuse = FUSE && rows > 10M && streaming sink` → **only sf10 fuses today.** Both gates read the
+> cached footer, so no decode is wasted deciding. See §3 for why, and §8 for what is next.
 
 ---
 
@@ -23,9 +30,11 @@ long ago: `iqr_cpu_flags()` is a C++ CPU operator, bit-exact with the SQL on 118
 and the mechanism is a clean **crossover at ~10 M rows**. Host CPU-seconds (2.07–6.07×) survived
 every change and is the study's most defensible claim. The remaining wall-clock gap is a **bus
 limit** — the FPGA reads at 12.5 GB/s over PCIe, the CPU at 63 GB/s from DRAM. Card memory was
-disqualified as a workaround (8 MB/s). The current work removes the redundant PCIe traffic instead:
-**RTL fuses IQR pass 1 into decode. build-15 hung (arbiter bug, now fixed + sim-proved); build-16
-is rebuilding with the fix — see the banner at the top and §6.**
+disqualified as a workaround (8 MB/s). The redundant PCIe traffic was removed instead: **RTL that
+fuses IQR pass 1 into decode is DONE and validated on silicon (build-16, §9.19)** — on sf10, the one
+dataset where it both pays and is safe, the operator fell 169.6 → 137.0 ms and end-to-end flipped
+0.85× → **1.05×** with CPU-work held at 6.07×. Correctness is at baseline everywhere. The next wall
+is no longer pass 1 but **decode's host feed** (`fetch`+`submit` = 56.5 of 92.5 ms) — see §8.
 
 ---
 
@@ -47,9 +56,10 @@ is rebuilding with the fix — see the banner at the top and §6.**
 
 ---
 
-## 2. THE RESULT (medians of 15, `--consume`, build-14, streaming, overlap+fuse off)
+## 2. THE RESULT (medians of 15, `--consume`, **build-16, fused where gated on**)
 
-Two benchmark defects were fixed on 2026-07-22 (§9.18); **all earlier end-to-end numbers are void**:
+Two benchmark defects were fixed on 2026-07-22 (§9.18); **all end-to-end numbers older than that are
+void**:
 
 1. **`medians.py` timed `CREATE TABLE`**, and 92 % of that is DuckDB's single-threaded table append
    (438 ms of 647 ms on sf10) — a big constant added to *both* sides that dragged every ratio to 1.0.
@@ -57,15 +67,24 @@ Two benchmark defects were fixed on 2026-07-22 (§9.18); **all earlier end-to-en
 2. **The C++ baseline freed its column with `new[]`** outside DuckDB, so releasing 457.7 MB landed
    after the `heavy` timer as CPU-side "tax" (up to 27 ms). → `Allocator::Get(context).Allocate()`.
 
-| dataset | rows | FPGA | C++ | e2e | operator | CPU-work |
-|---|--:|--:|--:|--:|--:|--:|
-| taxi_d1 | 3.0M | 0.012 | 0.019 | **1.58×** | **1.97×** | 3.03× |
-| taxi_d2 | 6.0M | 0.018 | 0.023 | **1.28×** | **1.35×** | 3.64× |
-| tpch_qty | 6.0M | 0.018 | 0.019 | 1.06× | 1.11× | 3.12× |
-| extprice | 6.0M | 0.025 | 0.026 | 1.04× | 1.09× | 4.26× |
-| taxi_d3 | 13.1M | 0.040 | 0.032 | **0.80×** | 0.80× | 2.07× |
-| taxi_d4 | 20.3M | 0.058 | 0.044 | **0.76×** | 0.77× | 2.20× |
-| sf10 | 60.0M | 0.181 | 0.159 | **0.88×** | 0.58× | **6.07×** |
+**Current (build-16, §9.19).** Only sf10 fuses; the rest run the legacy path by design (§3).
+
+| dataset | rows | fused? | FPGA | C++ | e2e | operator | CPU-work |
+|---|--:|---|--:|--:|--:|--:|--:|
+| taxi_d1 | 3.0M | no (small) | 0.013 | 0.019 | **1.46×** | **1.70×** | 3.05× |
+| tpch_qty | 6.0M | no (small) | 0.019 | 0.019 | 1.00× | **1.07×** | 3.05× |
+| taxi_d2 | 6.0M | no (small) | 0.019 | 0.024 | **1.26×** | **1.32×** | 3.61× |
+| extprice | 6.0M | no (small) | 0.026 | 0.026 | 1.00× | **1.04×** | 4.16× |
+| taxi_d3 | 13.1M | no (memcpy) | 0.041 | 0.032 | 0.78× | 0.78× | 2.12× |
+| taxi_d4 | 20.3M | no (memcpy) | 0.059 | 0.043 | 0.73× | 0.72× | 2.21× |
+| sf10 | 60.0M | **yes** | 0.149 | 0.157 | **1.05×** | 0.68× | **6.07×** |
+
+**What fusion bought, on the one dataset it applies to:** sf10 operator 169.6 → **137.0 ms (−19 %)**,
+e2e 0.88× → **1.05×**, CPU-work 6.07× unchanged. Everything else is baseline by construction.
+
+**Read the spreads before believing a delta.** FPGA 2–11 %, but **C++ reaches 86 %** on taxi_d3/d4.
+Those two rows are unfused and should equal the pre-fusion baseline; their apparent drift
+(0.80 → 0.78, 0.76 → 0.73) is C++ noise, not an FPGA regression.
 
 **Report BOTH benchmarks.** `--consume` isolates the operators; the default (`CREATE TABLE`) is what
 a user typing SQL experiences. Quoting only one invites a fair objection either way.
@@ -98,6 +117,32 @@ cd ~/oasis && ./extension/build/release/duckdb < bench/sql/cpu_op_correctness.sq
 | taxi_d4 | 2112164 | 54921 | **0** |
 | tpch × 3 | 0 | 0 | **0** |
 
+**These exact values are reproduced by build-16 with fusion on** (2026-07-23) — they are the gate.
+`fpga_vs_cpp` is non-zero by design: the FPGA's quartiles come from a 1024-bin histogram, the C++
+reference is exact. `cpp_vs_sql = 0` is what proves the reference itself.
+
+### Why fusion is gated (§9.19) — do not "fix" this by widening it
+
+```
+fuse = OASIS_IQR_FUSE && rows > 10M && streaming sink
+```
+
+The fused path must size the histogram window **before the first beat**, from a sample. That sample
+is a fixed cost, and a sampled window is worse than one derived from the whole column:
+
+- **rows > 10M** — below it the window costs more than the pass it saves: taxi_d1 1.67× → 1.27×,
+  extprice 1.00× → 0.86×.
+- **streaming sink** — a memcpy-sink column gets a **free, exact** full-column window from `run()`.
+  Fusing throws that away. taxi_d3 fused finds 1,296,479 of 1,328,270 (2.4 % low), and the 48-group
+  fix that corrects it makes taxi_d3 *slower than not fusing* (~42 vs 32.9 ms).
+- **taxi_d4 is a deliberate ~10 ms sacrifice.** It is accurate at 16 groups and would gain
+  49.6 → 40.6 ms, but that accuracy is *observed, not predictable* — taxi_d3 is the same sink and
+  shape and silently loses 2.4 %. Revisit only with a cheap a-priori test that a sampled window
+  matches the full-column one.
+- **Window knobs:** `WINDOW_GROUPS=16` is the floor (8 regresses taxi_d1 to 1348) and raising it is
+  a bad global trade. **Density is not a lever at all** — 2048 → 32768 per group gave the *identical*
+  answer while `win_derive` went 4.72 → 20.32 ms. Coverage matters, resolution does not.
+
 - **TRAP:** the tpch sets have zero outliers by nature and taxi_d2/d3/d4 mostly use the memcpy sink,
   so this suite is **structurally blind** to anything touching the histogram window. It caught
   nothing when a prefix window flagged 20 M of 20 M rows.
@@ -108,12 +153,16 @@ cd ~/oasis && ./extension/build/release/duckdb < bench/sql/cpu_op_correctness.sq
 
 ---
 
-## 4. Where the time goes (sf10, measured, §9.16)
+## 4. Where the time goes (sf10, measured)
 
 ```
-FPGA heavy 169.7 = decode 92.8 (fetch 38.5 | submit 19.9 | fpga_wait 30.1) + passes 76.6
-CPU  heavy  91.7 = read 58.9 + quart 25.2 + flags 7.6
+BEFORE (§9.16)   FPGA heavy 169.7 = decode 92.8 (fetch 38.5 | submit 19.9 | fpga_wait 30.1) + passes 76.6
+NOW    (§9.19)   FPGA heavy 139.5 = win_derive 7.2 + decode 92.5 (fetch 36.8 | submit 19.8 | fpga_wait 31.5) + passes 38.4
+                 CPU  heavy  91.7 = read 58.9 + quart 25.2 + flags 7.6
 ```
+
+**Pass 1 is gone; `fetch`+`submit` = 56.5 ms of decode's 92.5 is the new wall**, with the FPGA idle
+for it. The table below is the pre-fusion decomposition, still the right way to see WHY.
 
 | phase | CPU | FPGA | |
 |---|--:|--:|---|
@@ -146,7 +195,7 @@ IQR lane as separate streams that never meet on-chip.
 
 ---
 
-## 6. IN FLIGHT — build-16, the fused-pass-1 bitstream (build-15 hung; fixed)
+## 6. DONE — build-16, the fused-pass-1 bitstream (validated on silicon 2026-07-23)
 
 **build-15 hung the decoder on silicon.** Flashed fine, `decoder_profiler` returned 0–3, but a fused
 query sat SILENT until `timeout` — no error at all. **build-15 is dead; use build-16.**
@@ -247,49 +296,57 @@ the candidate replacement. **Flashing it replaces the IQR bitstream** — reflas
 
 ---
 
-## 8. Next steps after build-16, in priority order
+## 8. Next steps, in priority order
 
-1. **Validate build-16** (§6). Expect `heavy` 169.7 → **~150**, `passes` 76.6 → ~38, `decode`
-   unchanged, `win_derive` ~18. Run with `OASIS_IQR_WINDOW_FPGA` **unset** so the window path is the
-   one already trusted — a changed window would confound the RTL verdict.
+**Fusion is done (§6, §9.19). Steps 1 and 1b of the old plan are COMPLETE and shipped.** What they
+changed: pass 1 no longer crosses PCIe, and the window sample runs on the FPGA rather than burning
+~51 ms of host CPU. What they did NOT change: `decode`, which is now the wall.
 
-1b. **Derive the window on the FPGA instead of the CPU** (`OASIS_IQR_WINDOW_FPGA=1`, pure software,
-   already implemented). Today `DeriveWindowSpanning` decompresses the first `DataChunk` of 16
-   spanning row groups **on the host** — and because you cannot decode 2048 rows out of a compressed
-   page, that means fully decompressing 16 pages to keep 0.05 % of the column: ~18 ms wall and
-   **~51 ms of host CPU**, duplicating work the FPGA is about to do anyway. §9.15.1 measured the
-   damage to the study's headline: CPU-work on extprice fell **3.70× → 1.91×**.
-   Instead: decode 16 spanning groups **on the FPGA** (fuse off), stride-sample their output, derive
-   the window, then decode the whole column with the bins already set. The 16 groups decode twice —
-   ~3 ms — which is deliberate: the alternative (replaying them from host memory into the idle
-   `iqr_host_in` port) saves 1.7 ms but requires flipping `fuse_enable` mid-`HISTOGRAM`, i.e. a posted
-   CSR write racing the data plane. That is the hazard class that already forced the histogram-clear
-   fence. Not worth 1.7 ms.
-   **Expect `heavy` ~150 → ~135 and host CPU back to baseline**, and fusion becomes a win on *every*
-   dataset rather than only above ~20 M rows. Re-run `overlap_ab.sh accuracy` after: the sample
-   differs from the CPU one, so `bin_min`/`bin_shift` may land a step apart and counts can shift
-   (taxi_d2 moved 2877 → 2617 when the prefix window was replaced). **`ov_drift` must still be 200.**
-   *Metadata cannot replace this.* Footer min/max is free and was tested: taxi_d4 spans
-   −128540..33407632, so 1024 bins are 32768 wide while fares live in 0..5000 ⇒ everything in bin 0
-   ⇒ q1 = q3 ⇒ degenerate. Percentiles over per-group extremes fail too (outliers in ~every group),
-   page-level `ColumnIndex` fails for the same reason at finer grain, and dictionary pages give the
-   value *domain* without frequencies and don't exist on PLAIN-encoded sf10/extprice. What is needed
-   is a robust **quantile**; Parquet only stores **extremes**.
-2. **Step 2 — store bin indices instead of values.** Pass 2 only needs "is v below lo / above hi".
-   The histogram already computes a 10-bit bin index, so storing that instead of the 64-bit value is
-   **6.4× less data: 457.7 MB → 71.5 MB**, taking pass 2 from ~38 ms to ~6 ms and `heavy` to ~98.
-   **Open question:** `lo = q1 − 1.5·IQR` can land mid-bin, so bin comparison isn't exact — either
-   round fences outward to bin edges or store 11 bits (half-bin). Measure against `ov_drift`.
+1. **Reclaim taxi_d3/d4 — the biggest win still available, and pure software.** They fall back to
+   `sink=memcpy`, which costs them `copy` (8.0 ms of taxi_d3's 38.7) *and* excludes them from fusion
+   (§3), so they are the two worst rows in §2 at 0.78×/0.73×. The streaming guard rejects them only
+   because some row group has `num_values % 8 != 0`. Two ways in, both without touching RTL:
+   (a) teach `IqrRunner` to stream per-chunk buffers in sequence instead of gathering, so ragged
+   groups stop mattering; (b) pad the ragged chunk's flag beat and drop the pad on the host. Either
+   one makes them streamable, which then also makes them fusable — **worth ~8 ms of copy plus the
+   fusion saving on the two datasets furthest behind.**
+
+2. **Step 2 — send bin indices instead of values in pass 2.** `passes` is now 38.4 ms of sf10's
+   139.5, and all pass 2 does per element is compare against two constants — 8 bytes moved per 1 bit
+   produced. The histogram already computes the bin index ([IQR_detection.sv:205-208]), so shipping
+   that instead takes ~457.7 MB → ~97 MB and `passes` ~38 → ~8 ms, i.e. **`heavy` ~139.5 → ~109**.
+   **It can be bit-exact, and this is the part worth knowing:** Q1/Q3 are bin *lower edges*
+   ([IQR_detection.sv:580-581]), so IQR is an exact multiple of the bin width W, `1.5·IQR` is an exact
+   multiple of W/2, and both fences land on **half-bin boundaries** — store the index at half-bin
+   resolution and the comparison is *identical* to today's, not an approximation.
+   **The real hazard is saturation, not rounding:** an out-of-window value clamps, and `lo` can sit
+   below `bin_min`, so a naive 10-bit index would read a far-below outlier as "inside". The fence is
+   at most 1.5×1024 = 1536 bins outside the window, so use a **signed 13-bit half-bin index (±2048
+   bins)**. Get that width wrong and far-out outliers are silently missed — gate on `ov_drift`.
+   Needs a bitstream; adds ~97 MB of write traffic during decode, which should absorb (the device is
+   idle 56.5 of decode's 92.5 ms) but that is an assumption, not a measurement.
 3. **HOST MEMORY IS ENOUGH — do not build HBM for this.** With bin indices the intermediate is
    71.5 MB, so host round-trip costs ~5.7 ms vs HBM's ~4.5 ms. **HBM is worth ~1 ms.** And host
    writes/reads already exist (`OutputWriter` → `axis_host_send`, `LocalRead` → `axis_host_recv`), so
    Step 2 needs **no new data-movement machinery at all**.
-4. **8 lanes** — only after 1–3, and then `fetch`+`submit` (60.4 ms) becomes the wall.
-5. **Streaming guard for taxi's row groups** — taxi_d3/d4 fall back to `sink=memcpy` and pay
-   `copy` (7.6 ms of taxi_d3's 35.2). Pure software.
+4. **The host feed is the wall now — `fetch` + `submit` = 56.5 ms of decode's 92.5**, with the FPGA
+   idle (`fpga_wait` 31.5). Prefetching was already measured as a NO-OP (§9.11). The candidate is
+   FPGA-initiated reads (what `07_perf_fpga` demonstrates — §7), and **more decoder lanes are
+   pointless until this is fixed**: at 4 lanes the device already waits on the host.
+5. **Timing closure — deliberately NOT chased.** build-16 ships at WNS −0.559 (build-14 shipped
+   −0.773 and was bit-exact). The cause is decoder replication, not the fusion: build-11 with **1**
+   decoder MET timing at 0.000 while 2 decoders already missed at −0.456. It is congestion (74 %
+   route / 26 % logic), and `iqr_flag_packer` tops the failing clusters only because it is where the
+   congestion lands. If it ever needs fixing: pblock one decoder per SLR (free), and rewrite
+   `FlagBitPacker`'s `acc_next[slot*8 +: 8]` variable-position write as a fixed shift register.
+6. **Build time — `BUILD_OPT`.** `hardware/CMakeLists.txt:39` hardcodes `set(BUILD_OPT 1)`, which is
+   what turns on `AggressiveExplore` everywhere *and* the post-route `phys_opt_design` — together
+   worth ~9 h vs ~4–5 h. **Agreed plan: make it overridable, use `-DBUILD_OPT=0` for test builds and
+   `1` for the final one.** A `BUILD_OPT=1` rebuild places and routes differently, so it needs its
+   own pass through the §3 gates rather than inheriting the test build's.
 
-**Projected ceiling with all of the above: `heavy` ~66 ms vs the CPU's ~92 — the first design in this
-study that beats the CPU rather than reaching parity, because it attacks bytes moved, not throughput.**
+**Projected ceiling: `heavy` ~109 after step 2, then bounded by the host feed until step 4. The CPU is
+at ~92, so step 2 alone does not win outright on sf10 — the two together are what would.**
 
 ---
 
@@ -313,6 +370,10 @@ study that beats the CPU rather than reaching parity, because it attacks bytes m
 - **Lead with host CPU-seconds (2.07–6.07×)** — unaffected by both benchmark defects, latency-independent.
 - **Report both benchmarks** (`--consume` and materialised) and say which is which.
 - **The story is the crossover at ~10 M rows**, not encoding.
+- **The fusion is the constructive result**: a measured, bit-exact −19 % on the operator by deleting a
+  redundant PCIe pass, which is the evidence that the remaining gap is addressable rather than
+  fundamental. Disclose that it is **gated to streaming columns above 10 M rows** and why (§3) — the
+  gate is a finding, not a limitation to hide.
 - **Disclose:** the FPGA's remaining loss is a bus limit (12.5 vs 63 GB/s), not an operator limit —
   and the redundant PCIe pass we removed in RTL is the measured proof that it's addressable.
 - **Disclose:** the C++ baseline saturates ~3 cores and is not proven optimal; C++ spreads are 20–77 %.
