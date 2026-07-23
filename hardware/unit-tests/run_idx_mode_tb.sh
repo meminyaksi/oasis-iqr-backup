@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Standalone xsim run for tb_flag_bit_packer.sv -- the flag stream -> dense bitmask packer.
+# Standalone xsim run for tb_iqr_idx_mode.sv -- feed -> mux -> IQR_detection connected.
 #
 #   module load vivado/2024.2
-#   hardware/unit-tests/run_flag_packer_tb.sh
+#   hardware/unit-tests/run_fused_integration_tb.sh
 #
-# FlagBitPacker lives inside IQR_detection.sv (deliberately -- see the comment there), so that
-# file is compiled for it. Its ILAs are behind `ifdef IQR_DEBUG_ILA, left undefined here.
+# IQR_detection's count-loss ILAs are behind `ifdef IQR_DEBUG_ILA (left undefined here) so the
+# operator compiles clean under xsim, exactly as it does in iqr_detection_test.
 set -euo pipefail
 
 ROOT="${OASIS_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 LIBSTF="$ROOT/parcore/libstf/hardware/src/hdl"
-WORK="${TMPDIR:-/tmp}/packer_tb.$$"
+WORK="${TMPDIR:-/tmp}/idxmode_tb.$$"
 
 command -v xvlog >/dev/null || { echo "xvlog not on PATH -- run: module load vivado/2024.2" >&2; exit 2; }
 
@@ -27,9 +27,9 @@ xvlog -sv -i "$LIBSTF" -i "$ROOT/hardware/iqr_app/hdl" \
     "$ROOT/hardware/src/hdl/iqr_index.sv" \
     "$ROOT/hardware/src/hdl/iqr_index_stream.sv" \
     "$ROOT/hardware/iqr_app/hdl/IQR_detection.sv" \
-    "$ROOT/hardware/unit-tests/tb_flag_bit_packer.sv"
+    "$ROOT/hardware/unit-tests/tb_iqr_idx_mode.sv"
 
-xelab -debug typical tb_flag_bit_packer -s packer_tb
-xsim packer_tb -runall
+xelab -debug typical tb_iqr_idx_mode -s idxmode_tb
+xsim idxmode_tb -runall
 
 echo "workdir: $WORK"

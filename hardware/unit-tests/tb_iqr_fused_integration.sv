@@ -105,6 +105,11 @@ module tb_iqr_fused_integration;
         .dbg_accepted(dbg_accepted), .dbg_committed(dbg_committed),
         .dbg_flushes(dbg_flushes), .dbg_collisions(dbg_collisions),
         .o_hist_active(hist_active),
+        // Step 2 ports: index mode stays OFF here -- this testbench is the value-path reference
+        // that tb_iqr_index_stream's index path is checked against.
+        .i_idx_mode(1'b0),
+        .i_expected(64'(N)),
+        .o_idx_data(), .o_idx_valid(), .i_idx_ready(1'b1), .o_idx_last(),
         .in(iqr_in), .out(flag_out)
     );
 

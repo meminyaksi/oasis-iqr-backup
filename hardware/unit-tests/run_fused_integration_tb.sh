@@ -24,6 +24,8 @@ xvlog -sv -i "$LIBSTF" -i "$ROOT/hardware/iqr_app/hdl" \
     "$LIBSTF/common.sv" \
     "$LIBSTF/data_interfaces.sv" \
     "$LIBSTF/util/reset_resync.sv" \
+    "$ROOT/hardware/src/hdl/iqr_index.sv" \
+    "$ROOT/hardware/src/hdl/iqr_index_stream.sv" \
     "$ROOT/hardware/iqr_app/hdl/IQR_detection.sv" \
     "$ROOT/hardware/src/hdl/iqr_histogram_feed.sv" \
     "$ROOT/hardware/unit-tests/tb_iqr_fused_integration.sv"
