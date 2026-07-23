@@ -123,6 +123,11 @@ class IqrConfig : public libstf::Config {
     uint64_t fed_elements()            { return read_register(15).value(); }
     bool     feed_done()               { return read_register(16).value() != 0; }
 
+    // Step 2: index beats the device has handed to the output writer this column. Polled before
+    // draining the index transfer, because the bypass receiver's next() blocks on a completion
+    // interrupt with NO timeout -- a short stream would hang the query with nothing to report.
+    uint64_t index_beats()             { return read_register(17).value(); }
+
     static constexpr uint64_t ID = IQR_CONFIG_ID;
 };
 

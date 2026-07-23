@@ -74,6 +74,8 @@ module IQR_detection #(
     output logic                                  o_idx_valid,
     input  logic                                  i_idx_ready,
     output logic                                  o_idx_last,
+    // Index beats emitted this column, for the host to poll before draining the transfer.
+    output logic [63:0]                           o_idx_beats,
 
     ndata_i.s in,   // #(value_t, NUM_ELEMENTS) input values
     ndata_i.m out   // #(value_t, NUM_ELEMENTS) results (driven later)
@@ -549,7 +551,9 @@ module IQR_detection #(
         // Flush at the end of pass 1: last_seen is held through the drain, and the packer latches
         // the request once and clears it after emitting, so this cannot double-emit.
         .i_flush((state == HISTOGRAM) && last_seen),
-        .o_data(o_idx_data), .o_valid(o_idx_valid), .o_ready_in(i_idx_ready), .o_last(o_idx_last)
+        .i_restart(clear_req),
+        .o_data(o_idx_data), .o_valid(o_idx_valid), .o_ready_in(i_idx_ready), .o_last(o_idx_last),
+        .o_beats(o_idx_beats)
     );
     logic [3:0] drain_cnt;
 

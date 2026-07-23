@@ -76,8 +76,8 @@ module tb_iqr_index_stream;
     IqrIndexPack #(.NUM_ELEMENTS(NUM_ELEMENTS), .IDX_BITS(IDX_BITS), .OUT_W(OUT_W)) packer (
         .clk(clk), .rst_n(rst_n),
         .i_data(enc_packed), .i_keep(pk_keep), .i_valid(pk_valid), .o_ready(pk_ready),
-        .i_flush(pk_flush),
-        .o_data(pk_data), .o_valid(pk_out_valid), .o_ready_in(pk_out_ready), .o_last(pk_out_last)
+        .i_flush(pk_flush), .i_restart(1'b0),
+        .o_data(pk_data), .o_valid(pk_out_valid), .o_ready_in(pk_out_ready), .o_last(pk_out_last), .o_beats()
     );
 
     // -- The "host round trip": capture packed beats, replay them ---------------------------------

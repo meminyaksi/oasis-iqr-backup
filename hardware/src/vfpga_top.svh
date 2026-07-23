@@ -344,6 +344,7 @@ logic [DATABEAT_SIZE*8 - 1:0] iqr_idx_data;
 logic                        iqr_idx_valid;
 logic                        iqr_idx_ready;
 logic                        iqr_idx_last;
+logic [63:0]                 iqr_idx_beats;
 
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_feed_in();
 IqrHistogramFeed #(
@@ -439,7 +440,8 @@ IqrConfig inst_iqr_config (
     .feed_done(iqr_feed_done),
     .fuse_enable(iqr_fuse_enable),
     .hist_expected(iqr_hist_expected),
-    .idx_mode(iqr_idx_mode)
+    .idx_mode(iqr_idx_mode),
+    .idx_beats(iqr_idx_beats)
 );
 
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_flags_nd();
@@ -471,6 +473,7 @@ IQR_detection #(
     .o_idx_valid(iqr_idx_valid),
     .i_idx_ready(iqr_idx_ready),
     .o_idx_last(iqr_idx_last),
+    .o_idx_beats(iqr_idx_beats),
 
     .in(iqr_in),
     .out(iqr_flags_nd)

@@ -310,6 +310,26 @@ IqrRunner::Result IqrRunner::finish_fused(const std::vector<InputChunk> &inputs)
     std::vector<InputChunk>         pass2_chunks = inputs;
     std::shared_ptr<libstf::Buffer> idx_buffer;
     if (idx_mode_) {
+        // FENCE THE DRAIN BEHIND AN OBSERVABLE COUNT. BypassStreamReceiver::Handle::next() waits on
+        // a condition variable with no timeout, so if the device emitted fewer index beats than the
+        // host armed for, the query hangs with nothing printed -- the same failure shape as the
+        // build-15 arbiter bug, where the diagnostic existed but could never be reached. Poll the
+        // device's own beat counter first, bounded in WALL CLOCK, so a shortfall is a readable error.
+        const uint64_t want_beats = idx_bytes_ / 64;
+        const auto     deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (iqr_config_->index_beats() < want_beats) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                iqr_config_->set_fuse_enable(false);
+                iqr_config_->set_idx_mode(false);
+                throw std::runtime_error(
+                    "IqrRunner: index stream incomplete (" +
+                    std::to_string(iqr_config_->index_beats()) + " of " +
+                    std::to_string(want_beats) + " beats for " +
+                    std::to_string(result.num_elements) + " elements; histogram_total " +
+                    std::to_string(iqr_config_->histogram_total()) +
+                    "). Is idx_mode supported by this bitstream?");
+            }
+        }
         idx_buffer = drain_to_buffer(*idx_handle_, idx_bytes_);
         idx_handle_.reset();
         pass2_chunks.assign(1, InputChunk {idx_buffer->ptr, idx_bytes_});

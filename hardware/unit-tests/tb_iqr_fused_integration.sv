@@ -109,7 +109,7 @@ module tb_iqr_fused_integration;
         // that tb_iqr_index_stream's index path is checked against.
         .i_idx_mode(1'b0),
         .i_expected(64'(N)),
-        .o_idx_data(), .o_idx_valid(), .i_idx_ready(1'b1), .o_idx_last(),
+        .o_idx_data(), .o_idx_valid(), .i_idx_ready(1'b1), .o_idx_last(), .o_idx_beats(),
         .in(iqr_in), .out(flag_out)
     );
 

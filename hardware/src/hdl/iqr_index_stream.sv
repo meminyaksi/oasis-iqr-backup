@@ -40,11 +40,19 @@ module IqrIndexPack #(
     output logic                               o_ready,
     // Emit a partial beat now (end of pass 1). Held until the beat is taken.
     input  logic                               i_flush,
+    // Re-arm the beat counter for a new column (tie to the histogram clear pulse).
+    input  logic                               i_restart,
 
     output logic [OUT_W - 1:0]                 o_data,
     output logic                               o_valid,
     input  logic                               o_ready_in,
-    output logic                               o_last
+    output logic                               o_last,
+
+    // Beats actually handed to the output writer this column. The host polls this before draining
+    // the index transfer: the bypass receiver's next() blocks on a completion interrupt with NO
+    // timeout, so a short stream would hang the query with nothing to report -- exactly the failure
+    // mode that made the build-15 arbiter bug so expensive to find. Reset by i_restart.
+    output logic [63:0]                        o_beats
 );
 
 `RESET_RESYNC
@@ -53,6 +61,7 @@ module IqrIndexPack #(
     localparam int GATHER  = OUT_W / IN_BITS;              // 4
     localparam int GCNT_W  = $clog2(GATHER + 1);
 
+    logic [63:0]         beats;
     logic [OUT_W - 1:0]  acc;
     logic [GCNT_W - 1:0] filled;
     logic                out_valid_r, out_last_r;
@@ -75,13 +84,19 @@ module IqrIndexPack #(
     assign o_data  = out_word;
     assign o_valid = out_valid_r;
     assign o_last  = out_last_r;
+    assign o_beats = beats;
 
     always_ff @(posedge clk) begin
         if (reset_synced == 1'b0) begin
             acc <= '0; filled <= '0; out_valid_r <= 1'b0; out_last_r <= 1'b0;
-            flush_pending <= 1'b0;
+            flush_pending <= 1'b0; beats <= '0;
         end else begin
-            if (out_valid_r && o_ready_in) out_valid_r <= 1'b0;
+            if (out_valid_r && o_ready_in) begin
+                out_valid_r <= 1'b0;
+                beats       <= beats + 64'd1;
+            end
+
+            if (i_restart) beats <= '0;
 
             if (i_flush && !flush_pending && filled != '0) begin
                 flush_pending <= 1'b1;

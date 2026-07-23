@@ -49,6 +49,7 @@ module tb_iqr_idx_mode;
     logic [NUM_ELEMENTS*64-1:0] idx_data;
     logic                       idx_valid, idx_last;
     logic                       idx_ready;
+    logic [63:0]                idx_beats;
 
     IQR_detection #(
         .value_t(data64_t), .NUM_ELEMENTS(NUM_ELEMENTS),
@@ -63,7 +64,7 @@ module tb_iqr_idx_mode;
         .o_hist_active(hist_active),
         .i_idx_mode(idx_mode), .i_expected(expected),
         .o_idx_data(idx_data), .o_idx_valid(idx_valid), .i_idx_ready(idx_ready),
-        .o_idx_last(idx_last),
+        .o_idx_last(idx_last), .o_idx_beats(idx_beats),
         .in(iqr_in), .out(flag_out)
     );
 

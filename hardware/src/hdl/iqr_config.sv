@@ -27,6 +27,7 @@ import oasis::IQR_CONFIG_ID;
 //   read  6 = clear_seq (clear-completion counter)
 //   read  7..10 = input  StreamProfiler: handshakes / starved / stalled / idle cycles
 //   read 11..14 = output StreamProfiler: handshakes / starved / stalled / idle cycles
+//   read 15 = fed_elements, 16 = feed_done, 17 = idx_beats (step 2)
 // The profiler counters accumulate across both passes of a run and are re-zeroed by the next run's
 // first input beat, so the host reads them after the passes complete (see iqr_runner / iqr_config.hpp).
 module IqrConfig (
@@ -58,6 +59,8 @@ module IqrConfig (
     // "pass 1 finished with the wrong count".
     input logic [63:0] fed_elements,
     input logic        feed_done,
+    // Step 2 diagnostic: index beats emitted this column (see the host poll in finish_fused).
+    input logic [63:0] idx_beats,
 
     // Runtime window outputs, driven to IQR_detection.
     output logic [63:0] bin_min,
@@ -102,6 +105,7 @@ assign values[13] = prof_out_stalled;
 assign values[14] = prof_out_idle;
 assign values[15] = fed_elements;   // elements the on-chip feed has pushed this run
 assign values[16] = {63'd0, feed_done};  // the terminating `last` has been sent
+assign values[17] = idx_beats;       // step 2: index beats handed to the output writer
 
 ConfigReadRegisterFile #(
     .NUM_REGS(NUM_IQR_CONFIG_REGS)
