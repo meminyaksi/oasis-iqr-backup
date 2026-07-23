@@ -226,15 +226,25 @@ constexpr int64_t IQR_HW_NUM_BINS = 1024;
 template <typename F>
 void ParallelRanges(size_t n, size_t nthreads, F &&fn);
 
-// How many row groups the window sample spans. Measured on build-16 (2026-07-23):
+// How many row groups the window sample spans. 16 is the MINIMUM SAFE value: at 8, taxi_d1
+// regresses from 1247 outliers to 1348 (§9.15.1).
 //
-//   groups | win_derive (sf10) | taxi_d3 fpga_vs_cpp
-//       16 |            8.68ms | 31791   <- WRONG: 1296479 of 1328270 outliers found
-//       48 |           19.21ms |   162   <- exactly the full-column-derive baseline
+// Raising it above 16 was tried and REJECTED (build-16, 2026-07-23). 48 groups fixes taxi_d3
+// (fpga_vs_cpp 31791 -> 162) but every extra group is another group decoded twice, so it taxes the
+// datasets that actually benefit from fusing:
 //
-// 48 costs ~10.5 ms on sf10 (heavy 140.65 -> 149.60, still -12% vs the 169.6 unfused baseline) and
-// buys a correct answer on taxi_d3. A wrong answer is not worth 10 ms, so accuracy wins.
-// Do NOT lower this: 16 loses taxi_d3, and 8 regresses taxi_d1 to 1348 (§9.15.1).
+//   dataset | unfused | fused @16 grp    | fused @48 grp
+//   taxi_d3 | 32.9 ms | 33.0 ms  WRONG   | ~42 ms  correct   <- gains nothing from fusing either way
+//   taxi_d4 | 49.6 ms | 40.6 ms  correct | 51.6 ms correct
+//   sf10    |169.6 ms |137.2 ms  correct |152.9 ms correct
+//
+// taxi_d3 does not benefit from fusion at ANY group count, so paying for it globally is a bad
+// trade. It is excluded by the streaming-sink gate instead (see the fuse decision in RunHeavyPhase),
+// which gets it a free, exact, full-column window.
+//
+// Sample DENSITY is not the lever either: 2048 -> 32768 values per group returned the identical
+// answer on taxi_d3 (1296479) while win_derive went 4.72 -> 20.32 ms. Coverage matters, resolution
+// does not.
 size_t window_groups() {
     static const size_t k = [] {
         const char *e = std::getenv("OASIS_IQR_WINDOW_GROUPS");
@@ -244,7 +254,7 @@ size_t window_groups() {
                 return static_cast<size_t>(v);
             }
         }
-        return static_cast<size_t>(48);
+        return static_cast<size_t>(16);
     }();
     return k;
 }
@@ -451,18 +461,45 @@ bool DeriveWindowSpanning(ClientContext &context, const IqrFlagsBindData &bind, 
     return WindowFromSample(sample, bin_min_out, bin_shift_out);
 }
 
-// Total non-null values in the target column, read from the CACHED FOOTER -- no decoding, no page
-// reads. Needed before decode starts, because whether to fuse depends on the row count (see
-// fuse_min_rows) and the window sample must not be taken if we are not going to fuse.
-size_t ColumnRowCountFromFooter(ClientContext &context, const IqrFlagsBindData &bind) {
+// What the fuse decision needs to know before any decoding happens, read from the CACHED FOOTER --
+// no page reads, no decompression. Both facts have to be known up front: the row count because
+// fusion is a net loss on small columns (fuse_min_rows), and the streaming verdict because a
+// memcpy-sink column gets a free, exact window from run() and must not be fused (see the fuse
+// decision in RunHeavyPhase). Deciding after decode would mean paying for a window sample we then
+// throw away.
+struct FooterFacts {
+    size_t rows      = 0;
+    bool   stream_ok = false;   // would DecodeColumnAllGroups' streaming guard accept this column?
+};
+
+FooterFacts ReadFooterFacts(ClientContext &context, const IqrFlagsBindData &bind) {
     ParquetOptions parquet_opts(context);
     ParquetReader  reader(context, OpenFileInfo {bind.filename}, parquet_opts, bind.parquet_metadata);
-    auto           meta  = BuildParcoreMetadata(reader);
-    size_t         total = 0;
-    for (const auto &g : meta.groups) {
-        total += g.chunks[bind.column_id].num_values;
+    auto           meta = BuildParcoreMetadata(reader);
+
+    FooterFacts         f;
+    std::vector<size_t> live;
+    for (size_t gi = 0; gi < meta.groups.size(); gi++) {
+        const size_t nv = meta.groups[gi].chunks[bind.column_id].num_values;
+        if (nv == 0) {
+            continue;
+        }
+        live.push_back(gi);
+        f.rows += nv;
     }
-    return total;
+
+    // Mirrors DecodeColumnAllGroups exactly: FlagBitPacker emits 8 flags per beat, so only the FINAL
+    // chunk may be partial or every flag after a ragged one is misaligned.
+    f.stream_ok = stream_enabled() && !bind.needs_values && !live.empty();
+    if (f.stream_ok) {
+        for (size_t i = 0; i + 1 < live.size(); i++) {
+            if (meta.groups[live[i]].chunks[bind.column_id].num_values % 8 != 0) {
+                f.stream_ok = false;
+                break;
+            }
+        }
+    }
+    return f;
 }
 
 // Derives the histogram window from a sample decoded BY THE FPGA, so the host never decompresses
@@ -866,15 +903,36 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     // available (no PCIe traffic, no host CPU) and works with either sink.
     bool fuse = fuse_enabled() && !use_card;
 
-    // Row-count gate. Fusion's saving scales with N while its window sample is a fixed cost, so
-    // below fuse_min_rows() it is a measured NET LOSS (taxi_d1 1.67x -> 1.27x, extprice 1.00x ->
-    // 0.86x). Counted from the footer, so no decoding is wasted deciding this. Skipping the gate
-    // when the count is unavailable (0) leaves the previous behaviour.
-    size_t fuse_rows = 0;
+    // Two gates on fusing, both decided from the footer so no decoding is wasted on a fuse we then
+    // decline, and no window sample is taken that we then throw away.
+    //
+    // 1. ROW COUNT. Fusion's saving scales with N (~0.64 ms/Mrow) while the window sample is a
+    //    roughly fixed cost, so below fuse_min_rows() it is a measured net loss:
+    //    taxi_d1 1.67x -> 1.27x, extprice 1.00x -> 0.86x.
+    //
+    // 2. STREAMING SINK. A column the streaming guard rejects falls back to the memcpy sink, and
+    //    on that path run() derives the window from the WHOLE decoded column -- free, and exactly
+    //    right. Fusing forces a sampled window instead, which is strictly worse there. taxi_d3 is
+    //    the case in point: fused it finds 1296479 of 1328270 outliers (2.4% low) at 16 groups, and
+    //    fixing that with 48 groups makes it SLOWER than not fusing (42 vs 32.9 ms) -- it gains
+    //    nothing from fusion at any setting. taxi_d4 happens to be accurate at 16 groups and would
+    //    gain 49.6 -> 40.6 ms, but that accuracy is observed, not predictable: taxi_d3 shows a
+    //    same-sink, same-shape column can silently lose 2.4% on identical settings. Non-streaming
+    //    columns get a perfect window for free, so there is no reason to gamble on them.
+    //
+    // Both fall through to the previous behaviour if the footer read yields nothing (rows == 0).
+    size_t fuse_rows      = 0;
+    bool   fuse_small     = false;
+    bool   fuse_no_stream = false;
     if (fuse) {
-        fuse_rows = ColumnRowCountFromFooter(context, bind);
-        if (fuse_rows > 0 && fuse_rows < fuse_min_rows()) {
-            fuse = false;
+        const FooterFacts facts = ReadFooterFacts(context, bind);
+        fuse_rows               = facts.rows;
+        if (fuse_rows > 0) {
+            fuse_small     = fuse_rows < fuse_min_rows();
+            fuse_no_stream = !facts.stream_ok;
+            if (fuse_small || fuse_no_stream) {
+                fuse = false;
+            }
         }
     }
 
@@ -992,13 +1050,12 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
                      // overlapped: pass 1 is inside `decode`, so `passes` below is pass 2 only.
                      // win_derive is the spanning sample, charged to `heavy` but not to decode; its
                      // source is host (CPU page decompress) or fpga (device decode of the picks).
-                     // "serial(small)" distinguishes the row-count gate from a fuse that was simply
-                     // not requested -- otherwise a small file looks like OASIS_IQR_FUSE was ignored.
-                     !pass1_started
-                         ? (fuse_enabled() && fuse_rows > 0 && fuse_rows < fuse_min_rows()
-                                ? "serial(small)"
-                                : "serial")
-                         : (fuse ? "fused" : "overlapped"),
+                     // Name the reason fusion was declined, so a run that asked for it and did not
+                     // get it does not look like OASIS_IQR_FUSE was ignored.
+                     !pass1_started ? (fuse_small        ? "serial(small)"
+                                       : fuse_no_stream  ? "serial(no-stream)"
+                                                         : "serial")
+                                    : (fuse ? "fused" : "overlapped"),
                      window_ms, win_src,
                      decode_ms,
                      tm.wait_ms, tm.fetch_ms, tm.submit_ms, tm.copy_ms, iqr_ms, res.stage_ms,
