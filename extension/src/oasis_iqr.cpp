@@ -226,8 +226,15 @@ constexpr int64_t IQR_HW_NUM_BINS = 1024;
 template <typename F>
 void ParallelRanges(size_t n, size_t nthreads, F &&fn);
 
-// How many row groups the window sample spans. 16 is the MINIMUM SAFE value, not a default to tune
-// down: at OASIS_IQR_WINDOW_GROUPS=8 taxi_d1 regresses from 1247 outliers to 1348 (§9.15.1).
+// How many row groups the window sample spans. Measured on build-16 (2026-07-23):
+//
+//   groups | win_derive (sf10) | taxi_d3 fpga_vs_cpp
+//       16 |            8.68ms | 31791   <- WRONG: 1296479 of 1328270 outliers found
+//       48 |           19.21ms |   162   <- exactly the full-column-derive baseline
+//
+// 48 costs ~10.5 ms on sf10 (heavy 140.65 -> 149.60, still -12% vs the 169.6 unfused baseline) and
+// buys a correct answer on taxi_d3. A wrong answer is not worth 10 ms, so accuracy wins.
+// Do NOT lower this: 16 loses taxi_d3, and 8 regresses taxi_d1 to 1348 (§9.15.1).
 size_t window_groups() {
     static const size_t k = [] {
         const char *e = std::getenv("OASIS_IQR_WINDOW_GROUPS");
@@ -237,9 +244,38 @@ size_t window_groups() {
                 return static_cast<size_t>(v);
             }
         }
-        return static_cast<size_t>(16);
+        return static_cast<size_t>(48);
     }();
     return k;
+}
+
+// Row count below which fusing pass 1 is a NET LOSS, so the legacy path is used instead.
+//
+// Fusion deletes pass 1, worth ~0.64 ms per million rows (8 bytes/row at the measured 12.5 GB/s).
+// But the histogram window must be sized BEFORE the first beat, and that sample is a roughly FIXED
+// cost (~9-19 ms). Below the break-even the window costs more than the pass it saves. Measured
+// end-to-end ratios, build-16, fused+FPGA window vs the same bitstream unfused:
+//
+//   taxi_d1   3.0M   1.67x -> 1.27x   LOST    (saved ~2 ms, paid ~9)
+//   extprice  6.0M   1.00x -> 0.86x   LOST    (saved ~4 ms, paid ~9)
+//   taxi_d3  13.1M   0.82x -> 0.86x   won
+//   taxi_d4  20.3M   0.78x -> 0.90x   won
+//   sf10     60.0M   0.85x -> 1.06x   won
+//
+// This is the same fixed-cost-vs-scaling-benefit arithmetic that keeps OASIS_IQR_OVERLAP off
+// (§9.15.1). 10M sits in the measured gap between extprice (lost) and taxi_d3 (won).
+size_t fuse_min_rows() {
+    static const size_t n = [] {
+        const char *e = std::getenv("OASIS_IQR_FUSE_MIN_ROWS");
+        if (e) {
+            long long v = std::strtoll(e, nullptr, 10);
+            if (v >= 0) {
+                return static_cast<size_t>(v);
+            }
+        }
+        return static_cast<size_t>(10000000);
+    }();
+    return n;
 }
 
 // OASIS_IQR_WINDOW_FPGA=1 takes the window sample from the FPGA decoder instead of decompressing it
@@ -378,6 +414,20 @@ bool DeriveWindowSpanning(ClientContext &context, const IqrFlagsBindData &bind, 
         sample.insert(sample.end(), part.begin(), part.end());
     }
     return WindowFromSample(sample, bin_min_out, bin_shift_out);
+}
+
+// Total non-null values in the target column, read from the CACHED FOOTER -- no decoding, no page
+// reads. Needed before decode starts, because whether to fuse depends on the row count (see
+// fuse_min_rows) and the window sample must not be taken if we are not going to fuse.
+size_t ColumnRowCountFromFooter(ClientContext &context, const IqrFlagsBindData &bind) {
+    ParquetOptions parquet_opts(context);
+    ParquetReader  reader(context, OpenFileInfo {bind.filename}, parquet_opts, bind.parquet_metadata);
+    auto           meta  = BuildParcoreMetadata(reader);
+    size_t         total = 0;
+    for (const auto &g : meta.groups) {
+        total += g.chunks[bind.column_id].num_values;
+    }
+    return total;
 }
 
 // Derives the histogram window from a sample decoded BY THE FPGA, so the host never decompresses
@@ -778,7 +828,20 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
     // If the spanning sample cannot be taken we simply do not overlap.
     // Fused pass 1 (RTL) takes precedence over the software overlap: it is strictly better where
     // available (no PCIe traffic, no host CPU) and works with either sink.
-    bool       fuse    = fuse_enabled() && !use_card;
+    bool fuse = fuse_enabled() && !use_card;
+
+    // Row-count gate. Fusion's saving scales with N while its window sample is a fixed cost, so
+    // below fuse_min_rows() it is a measured NET LOSS (taxi_d1 1.67x -> 1.27x, extprice 1.00x ->
+    // 0.86x). Counted from the footer, so no decoding is wasted deciding this. Skipping the gate
+    // when the count is unavailable (0) leaves the previous behaviour.
+    size_t fuse_rows = 0;
+    if (fuse) {
+        fuse_rows = ColumnRowCountFromFooter(context, bind);
+        if (fuse_rows > 0 && fuse_rows < fuse_min_rows()) {
+            fuse = false;
+        }
+    }
+
     bool       overlap = !fuse && overlap_enabled() && stream_enabled() && !use_card && !bind.needs_values;
     int64_t     win_min   = 0;
     uint64_t    win_shift = 0;
@@ -893,7 +956,14 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
                      // overlapped: pass 1 is inside `decode`, so `passes` below is pass 2 only.
                      // win_derive is the spanning sample, charged to `heavy` but not to decode; its
                      // source is host (CPU page decompress) or fpga (device decode of the picks).
-                     !pass1_started ? "serial" : (fuse ? "fused" : "overlapped"), window_ms, win_src,
+                     // "serial(small)" distinguishes the row-count gate from a fuse that was simply
+                     // not requested -- otherwise a small file looks like OASIS_IQR_FUSE was ignored.
+                     !pass1_started
+                         ? (fuse_enabled() && fuse_rows > 0 && fuse_rows < fuse_min_rows()
+                                ? "serial(small)"
+                                : "serial")
+                         : (fuse ? "fused" : "overlapped"),
+                     window_ms, win_src,
                      decode_ms,
                      tm.wait_ms, tm.fetch_ms, tm.submit_ms, tm.copy_ms, iqr_ms, res.stage_ms,
                      res.passes_ms, ms_since(t_all));
