@@ -930,13 +930,32 @@ module FlagBitPacker #(
     localparam int LANE_W = $bits(value_t);
     localparam int OUT_W  = NUM_ELEMENTS * LANE_W;       // bits per output beat (512)
     localparam int SLOTS  = OUT_W / NUM_ELEMENTS;        // input beats per output beat (64)
-    localparam int SLOT_W = (SLOTS > 1) ? $clog2(SLOTS) : 1;
+    localparam int CNT_W  = $clog2(SLOTS + 1);           // must hold SLOTS itself, not SLOTS-1
 
-    logic [OUT_W - 1:0]  acc;          // bit accumulator for the current output word
-    logic [SLOT_W - 1:0] slot;         // which NUM_ELEMENTS-bit group we fill next
-    logic [OUT_W - 1:0]  out_word;     // registered output payload
-    logic                out_valid_r;
-    logic                out_last_r;
+    // -- Why this is a SHIFT REGISTER and not an indexed write ------------------------------------
+    // The obvious form is  acc[slot * NUM_ELEMENTS +: NUM_ELEMENTS] = beat_bits  -- a variable-
+    // position write into a 512-bit register. That synthesises to a 64-way, 512-bit-wide
+    // barrel-shifter cloud rebuilt every cycle, and it was the WORST timing offender in the design:
+    // build-15 reported 330 of 1000 failing paths in inst_iqr_flag_packer, averaging 15.6 logic
+    // levels at fanout 412.
+    //
+    // A FIXED shift is pure wiring -- no mux, no select decode. Shifting right by NUM_ELEMENTS with
+    // new bits entering at the TOP reproduces the required bit order exactly: the first beat is
+    // pushed down by each subsequent one, so after SLOTS beats beat 0 sits in bits [7:0] and beat 63
+    // in [511:504], which is the layout the host expects (element e -> bit e).
+    //
+    // THE COST, and why it is free in practice: a partial final word leaves the bits at the TOP,
+    // needing a shift down by (SLOTS - filled) -- which would be a variable shift again, i.e. the
+    // very thing we removed. So instead the packer just keeps shifting zeros in until the word is
+    // full, then emits. That burns up to SLOTS-1 = 63 cycles ONCE PER COLUMN. Against sf10's ~7.5 M
+    // output beats it is unmeasurable, and it buys a completely mux-free datapath.
+    logic [OUT_W - 1:0] acc;           // bit accumulator, filled from the top down
+    logic [CNT_W - 1:0] filled;        // beats accumulated into acc, 0..SLOTS
+    logic               flushing;      // bottom-aligning a partial final word
+    logic [CNT_W - 1:0] flush_left;    // shifts still owed before acc is bottom-aligned
+    logic [OUT_W - 1:0] out_word;      // registered output payload
+    logic               out_valid_r;
+    logic               out_last_r;
 
     // This beat's NUM_ELEMENTS flag bits (unkept lanes contribute 0).
     logic [NUM_ELEMENTS - 1:0] beat_bits;
@@ -944,36 +963,62 @@ module FlagBitPacker #(
         for (int i = 0; i < NUM_ELEMENTS; i++)
             beat_bits[i] = in.keep[i] & in.data[i][0];
 
-    // acc with this beat's bits dropped into its slot.
-    logic [OUT_W - 1:0] acc_next;
-    always_comb begin
-        acc_next                                      = acc;
-        acc_next[slot * NUM_ELEMENTS +: NUM_ELEMENTS] = beat_bits;
-    end
+    // The whole datapath: a fixed right shift with insertion at the top.
+    function automatic logic [OUT_W - 1:0] shift_in(logic [OUT_W - 1:0]        cur,
+                                                    logic [NUM_ELEMENTS - 1:0] bits);
+        return {bits, cur[OUT_W - 1:NUM_ELEMENTS]};
+    endfunction
 
-    // Accept input unless a completed beat is still waiting to be taken.
-    assign in.ready = !out_valid_r || out.ready;
+    // Accept input unless a completed beat is still waiting to be taken, or we are mid-flush (the
+    // flush is self-driven and must not race new input into acc).
+    wire out_free = !out_valid_r || out.ready;
+    assign in.ready = out_free && !flushing;
 
-    wire fire      = in.valid && in.ready;
-    wire last_slot = (slot == SLOT_W'(SLOTS - 1));
-    wire emit      = fire && (last_slot || in.last);
+    wire fire = in.valid && in.ready;
 
     always_ff @(posedge clk) begin
         if (reset_synced == 1'b0) begin
-            acc <= '0; slot <= '0; out_valid_r <= 1'b0; out_last_r <= 1'b0;
+            acc <= '0; filled <= '0; flushing <= 1'b0; flush_left <= '0;
+            out_valid_r <= 1'b0; out_last_r <= 1'b0;
         end else begin
             if (out_valid_r && out.ready) out_valid_r <= 1'b0;  // previous beat consumed
 
-            if (fire) begin
-                if (emit) begin
-                    out_word    <= acc_next;
+            if (flushing) begin
+                // Intermediate shifts touch only acc, so they never need the output to be free.
+                if (flush_left > CNT_W'(1)) begin
+                    acc        <= shift_in(acc, '0);
+                    flush_left <= flush_left - CNT_W'(1);
+                end else if (out_free) begin
+                    out_word    <= shift_in(acc, '0);   // the shift that lands bit 0 in [0]
+                    out_valid_r <= 1'b1;
+                    out_last_r  <= 1'b1;
+                    acc         <= '0;
+                    filled      <= '0;
+                    flushing    <= 1'b0;
+                    flush_left  <= '0;
+                end
+            end else if (fire) begin
+                logic [OUT_W - 1:0] nxt;
+                logic [CNT_W - 1:0] nfill;
+                nxt   = shift_in(acc, beat_bits);
+                nfill = filled + CNT_W'(1);
+
+                if (nfill == CNT_W'(SLOTS)) begin
+                    // Word complete on its own -- already bottom-aligned, no flush needed.
+                    out_word    <= nxt;
                     out_valid_r <= 1'b1;
                     out_last_r  <= in.last;
                     acc         <= '0;
-                    slot        <= '0;
+                    filled      <= '0;
+                end else if (in.last) begin
+                    // Partial final word: hold it and shift zeros until it is aligned.
+                    acc        <= nxt;
+                    filled     <= nfill;
+                    flushing   <= 1'b1;
+                    flush_left <= CNT_W'(SLOTS) - nfill;
                 end else begin
-                    acc  <= acc_next;
-                    slot <= slot + 1'b1;
+                    acc    <= nxt;
+                    filled <= nfill;
                 end
             end
         end
