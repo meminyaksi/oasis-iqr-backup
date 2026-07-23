@@ -289,6 +289,26 @@ bool window_fpga_enabled() {
     return on;
 }
 
+// How many values to keep per sampled row group. Raising this is NEARLY FREE on the FPGA window
+// path: DeriveWindowFromFpga already decodes each picked group in full, so a denser stride costs no
+// extra decode -- only the percentile step, which is O(n) (see WindowFromSample). Contrast with
+// window_groups(), where every extra group is another group decoded twice: at 48 groups taxi_d4's
+// fused operator went 40.6 -> 51.6 ms and sf10's 137.2 -> 152.9 ms, for accuracy gains only taxi_d3
+// needed. Resolution is the cheap axis; coverage is the expensive one.
+size_t window_samples_per_group() {
+    static const size_t n = [] {
+        const char *e = std::getenv("OASIS_IQR_WINDOW_SAMPLES");
+        if (e) {
+            long v = std::strtol(e, nullptr, 10);
+            if (v > 0) {
+                return static_cast<size_t>(v);
+            }
+        }
+        return static_cast<size_t>(2048);
+    }();
+    return n;
+}
+
 // The one place the (sample -> bin_min, bin_shift) rule lives. Both window derivations feed it, so
 // they cannot drift apart: whichever way the sample was collected, identical values must produce an
 // identical window. Same rule as IqrRunner::derive_window -- robust percentiles, NOT min/max, so a
@@ -299,10 +319,25 @@ bool WindowFromSample(std::vector<int64_t> &sample, int64_t &bin_min_out, uint64
     if (sample.size() < 2) {
         return false;
     }
-    std::sort(sample.begin(), sample.end());
-    const size_t  m     = sample.size();
-    const int64_t lo    = sample[m * 1 / 100];
-    const int64_t hi    = sample[std::min(m - 1, m * 99 / 100)];
+    // nth_element, not sort. Only two order statistics are needed (p1 and p99), and selection is
+    // O(n) against sort's O(n log n) -- which is what lets the sample be dense enough to place the
+    // window accurately. With a full sort, 16 groups x 32768 values would cost ~30 ms of host CPU
+    // and defeat the purpose of moving the sample onto the FPGA in the first place.
+    // The two selections compose: after the p1 pass everything below k1 sits left of it, so the p99
+    // selection only has to partition the remaining suffix.
+    const size_t m  = sample.size();
+    const size_t k1 = m * 1 / 100;
+    const size_t k99 = std::min(m - 1, m * 99 / 100);
+
+    std::nth_element(sample.begin(), sample.begin() + k1, sample.end());
+    const int64_t lo = sample[k1];
+    // k1 < k99 for every m >= 2, so the suffix range is non-empty; guard anyway rather than risk
+    // UB on an unexpected input.
+    if (k1 + 1 <= k99) {
+        std::nth_element(sample.begin() + k1 + 1, sample.begin() + k99, sample.end());
+    }
+    const int64_t hi = sample[k99];
+
     const int64_t range = hi - lo;
     if (range <= 0) {
         bin_min_out   = lo;
@@ -485,11 +520,12 @@ bool DeriveWindowFromFpga(ClientContext &context, oasis::OasisContext &ctx,
     }
     picks.erase(std::unique(picks.begin(), picks.end()), picks.end());
 
-    // STRIDE-SAMPLE, do not keep everything. The FPGA decodes whole row groups, so these picks yield
-    // ~2 M values on sf10 -- and std::sort on 2 M int64 costs ~100 ms, which would swallow the entire
-    // saving. ~2048 per group matches what the host path sampled and is far more than the ~8192 the
-    // serial derive_window() uses.
-    constexpr size_t PER_GROUP_SAMPLE = 2048;
+    // STRIDE-SAMPLE across each group rather than keeping everything: the picks yield ~2 M values on
+    // sf10 and the percentile step is host work. Keeping all of it was never the constraint on
+    // ACCURACY though -- the groups are decoded in full either way, so density here is cheap and
+    // WindowFromSample selects in O(n). Raise OASIS_IQR_WINDOW_SAMPLES before reaching for more
+    // groups; see window_samples_per_group().
+    const size_t PER_GROUP_SAMPLE = window_samples_per_group();
 
     struct InFlight {
         oasis::SplinterResultHandle result;
