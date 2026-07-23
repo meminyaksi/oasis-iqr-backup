@@ -34,9 +34,28 @@ else()
     math(EXPR N_STRM_AXI "${N_DECODERS} + 1")
 endif()
 
-# Build with optimization, since timing closure can be difficult
+# Build with optimization, since timing closure can be difficult.
+#
+# BUILD_OPT=1 is what turns on the slow Vivado directives at EVERY stage (opt_design -Explore,
+# place_design -Auto_1, phys_opt/route -AggressiveExplore) *and* the post-route phys_opt_design pass,
+# which BUILD_OPT=0 skips entirely. Measured on build-16: ~9 h at 1. Expect ~4-5 h at 0, for roughly
+# 0.2-0.5 ns less slack.
+#
+# Plain set(), not a cache entry: find_package(CoyoteHW) above already seeded BUILD_OPT=0 in the
+# cache, so a CACHE form here would never take effect. Hence the separate user-facing switch.
+#
+# Use -DOASIS_FAST_BUILD=ON (or scripts/synthesize.sh --fast) for iteration bitstreams; leave it OFF
+# for anything whose timing numbers get reported. A fast build places and routes DIFFERENTLY, so it
+# needs its own pass through the correctness gates rather than inheriting another build's.
+option(OASIS_FAST_BUILD "Skip the slow Vivado directives: ~half the build time, worse WNS" OFF)
+
 set(COMP_CORES 64)
-set(BUILD_OPT 1)
+if(OASIS_FAST_BUILD)
+    set(BUILD_OPT 0)
+    message(STATUS "OASIS_FAST_BUILD=ON -> BUILD_OPT=0 (fast directives, expect worse WNS)")
+else()
+    set(BUILD_OPT 1)
+endif()
 
 # Target FPGA device (override with -DFDEV_NAME=v80 for the Alveo V80)
 set(FDEV_NAME u55c CACHE STRING "Target FPGA device (u55c, v80, ...)")

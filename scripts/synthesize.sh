@@ -12,6 +12,10 @@ build finishes, reports are generated, analyzed, and emailed (if configured).
 
 Options:
   --no-rdma            Disable the Coyote RDMA stack (default: enabled).
+  --fast               Skip the slow Vivado directives (BUILD_OPT=0): roughly
+                       halves build time (~9 h -> ~4-5 h) at the cost of ~0.2-0.5 ns
+                       of slack. For iteration bitstreams. A fast build places and
+                       routes differently, so re-run the correctness gates on it.
   --decoders N         Number of ColumnChunkDecoders (default: 1).
   --device NAME        Target FPGA device: u55c, v80, ... (default: u55c).
   --v80                Shortcut for --device v80 (Alveo V80).
@@ -35,6 +39,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --no-rdma) cmake_args+=(-DENABLE_RDMA=OFF) ;;
+        --fast) cmake_args+=(-DOASIS_FAST_BUILD=ON) ;;
         --decoders) decoders="$2"; shift ;;
         --decoders=*) decoders="${1#*=}" ;;
         --v80) device=v80 ;;
