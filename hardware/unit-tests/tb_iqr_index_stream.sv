@@ -44,6 +44,8 @@ module tb_iqr_index_stream;
     int n_flags = 0;
     int n_last  = 0;
 
+    logic [63:0] fl_expected;   // element count; drives both the packer's o_last and the flagger
+
     // -- Encode (pass 1): one beat of NUM_ELEMENTS values -> packed indices ----------------------
     logic [VALUE_WIDTH-1:0]            enc_value [NUM_ELEMENTS];
     logic [NUM_ELEMENTS*IDX_BITS-1:0]  enc_packed;
@@ -76,32 +78,41 @@ module tb_iqr_index_stream;
     IqrIndexPack #(.NUM_ELEMENTS(NUM_ELEMENTS), .IDX_BITS(IDX_BITS), .OUT_W(OUT_W)) packer (
         .clk(clk), .rst_n(rst_n),
         .i_data(enc_packed), .i_keep(pk_keep), .i_valid(pk_valid), .o_ready(pk_ready),
-        .i_flush(pk_flush), .i_restart(1'b0),
+        .i_flush(pk_flush), .i_restart(1'b0), .i_expected(fl_expected),
         .o_data(pk_data), .o_valid(pk_out_valid), .o_ready_in(pk_out_ready), .o_last(pk_out_last), .o_beats()
     );
 
     // -- The "host round trip": capture packed beats, replay them ---------------------------------
     logic [OUT_W-1:0] idx_mem [0:MAX_N];   // one entry per packed beat
     int               n_beats;
+    int               n_pk_last;   // times the PACKER asserted o_last (drives the index DMA's close)
 
     assign pk_out_ready = 1'b1;            // host sink always accepts
     always_ff @(posedge clk) begin
         if (rst_n && pk_out_valid && pk_out_ready) begin
             idx_mem[n_beats] <= pk_data;
             n_beats          <= n_beats + 1;
+            // The packer's o_last is what closes the host index transfer. It MUST be asserted exactly
+            // once, on the final beat -- including when the column is an exact multiple of 32 and the
+            // final beat is a full (non-flush) one. Not checking this let the multiple-of-32 drain
+            // hang ship (ov_uniform, N=20,000,000): every scenario emitted its beats but the exact
+            // ones never asserted o_last, and the sink here ignored it.
+            if (pk_out_last) n_pk_last++;
         end
     end
 
-    // -- Unpack + compare (pass 2) ---------------------------------------------------------------
-    logic                    fl_enable, fl_restart;
-    logic [63:0]             fl_expected;
-    logic [OUT_W-1:0]        fl_data;
-    logic                    fl_valid, fl_ready;
-    logic [NUM_ELEMENTS-1:0] fl_flags, fl_keep;
-    logic                    fl_out_valid, fl_out_ready, fl_out_last;
+    // -- WIDE unpack + pack + compare (pass 2) ---------------------------------------------------
+    // Pass 2 now flags all IDX_PER_BEAT indices in one cycle (IqrIndexFlag emits a 32-wide beat) and
+    // packs them 32-at-a-time into 512-bit words (IqrWideFlagPack). The host reads element e at bit e
+    // exactly as with the 8-wide FlagBitPacker, so the check is: unpack every packed word and compare
+    // bit e against the value-space outlier test for element e.
+    logic                        fl_enable, fl_restart;
+    logic [OUT_W-1:0]            fl_data;
+    logic                        fl_valid, fl_ready;
+    logic [IDX_PER_BEAT-1:0]     fl_flags, fl_keep;
+    logic                        fl_out_valid, fl_out_ready, fl_out_last;
 
-    IqrIndexFlag #(.NUM_ELEMENTS(NUM_ELEMENTS), .IDX_BITS(IDX_BITS), .IDX_W(IDX_W),
-                   .FIDX_W(FIDX_W), .IN_W(OUT_W)) flagger (
+    IqrIndexFlag #(.IDX_BITS(IDX_BITS), .IDX_W(IDX_W), .FIDX_W(FIDX_W), .IN_W(OUT_W)) flagger (
         .clk(clk), .rst_n(rst_n),
         .i_enable(fl_enable), .i_expected(fl_expected), .i_restart(fl_restart),
         .i_lo_fidx(lo_fidx), .i_hi_fidx(hi_fidx),
@@ -110,34 +121,35 @@ module tb_iqr_index_stream;
         .o_ready_in(fl_out_ready), .o_last(fl_out_last)
     );
 
-    // Irregular back-pressure on the flag output.
+    logic [OUT_W-1:0] wp_data;
+    logic             wp_valid, wp_ready, wp_last;
+    IqrWideFlagPack #(.NUM_LANES(IDX_PER_BEAT), .OUT_W(OUT_W)) packer2 (
+        .clk(clk), .rst_n(rst_n),
+        .i_flags(fl_flags), .i_keep(fl_keep), .i_valid(fl_out_valid), .o_ready(fl_out_ready),
+        .i_last(fl_out_last),
+        .o_data(wp_data), .o_valid(wp_valid), .o_ready_in(wp_ready), .o_last(wp_last)
+    );
+
+    // Irregular back-pressure on the PACKED word output.
     logic [15:0] lfsr = 16'h1234;
     always_ff @(posedge clk) lfsr <= {lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10]};
-    assign fl_out_ready = rst_n && (lfsr[2:0] != 3'd0);
+    assign wp_ready = rst_n && (lfsr[2:0] != 3'd0);
 
-    // -- Flag checker ----------------------------------------------------------------------------
     function automatic bit ref_outlier(longint v);
         if (is_signed) return ($signed(v) < $signed(lo_fence)) || ($signed(v) > $signed(hi_fence));
         else           return ($signed({1'b0, v}) < $signed(lo_fence))
                            || ($signed({1'b0, v}) > $signed(hi_fence));
     endfunction
 
+    // Capture the packed 512-bit words; each holds OUT_W elements (element e -> word e/512, bit e%512).
+    localparam int MAX_WORDS = (MAX_N + OUT_W - 1) / OUT_W + 2;
+    logic [OUT_W-1:0] flag_words [0:MAX_WORDS];
+    int               n_words;
     always_ff @(posedge clk) begin
-        if (rst_n && fl_out_valid && fl_out_ready) begin
-            for (int j = 0; j < NUM_ELEMENTS; j++) begin
-                if (fl_keep[j]) begin
-                    if (n_flags < n_elems) begin
-                        automatic bit want = ref_outlier(col[n_flags]);
-                        if (fl_flags[j] !== want) begin
-                            $error("flag[%0d] = %0b, want %0b (value %0d)",
-                                   n_flags, fl_flags[j], want, $signed(col[n_flags]));
-                            errors++;
-                        end
-                    end
-                    n_flags++;
-                end
-            end
-            if (fl_out_last) n_last++;
+        if (rst_n && wp_valid && wp_ready) begin
+            flag_words[n_words] <= wp_data;
+            n_words             <= n_words + 1;
+            if (wp_last) n_last++;
         end
     end
 
@@ -188,12 +200,13 @@ module tb_iqr_index_stream;
                                 input int q1b, input int q3b, input bit sgn, input int pattern);
         automatic int errors0 = errors;
         automatic int want_beats;
+        automatic int want_words;
         automatic longint q1v, q3v, iqr;
 
         rst_n = 1'b0;
         pk_valid = 1'b0; pk_flush = 1'b0; pk_keep = '0;
         fl_valid = 1'b0; fl_enable = 1'b0; fl_restart = 1'b0;
-        n_flags = 0; n_last = 0; n_beats = 0;
+        n_flags = 0; n_last = 0; n_beats = 0; n_pk_last = 0; n_words = 0;
         repeat (6) @(posedge clk);
         rst_n = 1'b1;
         repeat (3) @(posedge clk);
@@ -230,16 +243,33 @@ module tb_iqr_index_stream;
             $error("%s: packed %0d index beats, expected %0d", name, n_beats, want_beats);
             errors++;
         end
-        if (n_flags != n) begin
-            $error("%s: emitted %0d flags, expected %0d", name, n_flags, n);
+        // Wide packed output: element e lives at bit e (word e/OUT_W, bit e%OUT_W). Check every one.
+        for (int e = 0; e < n; e++) begin
+            automatic bit got  = flag_words[e / OUT_W][e % OUT_W];
+            automatic bit want = ref_outlier(col[e]);
+            if (got !== want) begin
+                $error("%s: flag[%0d] = %0b, want %0b (value %0d)",
+                       name, e, got, want, $signed(col[e]));
+                errors++;
+            end
+            n_flags++;
+        end
+        want_words = (n + OUT_W - 1) / OUT_W;
+        if (n_words != want_words) begin
+            $error("%s: emitted %0d packed words, expected %0d", name, n_words, want_words);
             errors++;
         end
         if (n_last != 1) begin
-            $error("%s: `last` asserted %0d times, expected 1", name, n_last);
+            $error("%s: wide packer `last` asserted %0d times, expected 1", name, n_last);
             errors++;
         end
-        $display("  %-30s N=%4d beats=%3d flags=%4d last=%0d  %s",
-                 name, n, n_beats, n_flags, n_last,
+        if (n_pk_last != 1) begin
+            $error("%s: index PACKER o_last asserted %0d times, expected 1 (DMA would not close)",
+                   name, n_pk_last);
+            errors++;
+        end
+        $display("  %-30s N=%4d beats=%3d words=%2d flags=%4d last=%0d pk_last=%0d  %s",
+                 name, n, n_beats, n_words, n_flags, n_last, n_pk_last,
                  (errors == errors0) ? "PASS" : "*** FAIL ***");
     endtask
 
@@ -265,6 +295,10 @@ module tb_iqr_index_stream;
         run_scenario("bin_shift 0",          160,       0,  0, 100, 900, 0, 0);
         // Degenerate IQR.
         run_scenario("q1 == q3",             128,    1000,  3, 500, 500, 0, 1);
+        // MULTI-WORD: >512 elements spans two packed 512-bit words -- exercises the word boundary and
+        // proves element e still lands at bit e across words. Also an exact multiple of 512.
+        run_scenario("one word exact (512)", 512,       0,  4, 100, 900, 0, 1);
+        run_scenario("two words + tail",     540,       0,  5, 100, 300, 0, 3);
 
         $display("=== %s (%0d error%s) ===",
                  (errors == 0) ? "INDEX STREAM ROUND TRIP MATCHES VALUE PATH" : "FAILURES",

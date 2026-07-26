@@ -11,6 +11,8 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -172,7 +174,22 @@ class IqrRunner {
      * ignored, pass 2 would re-read indices as if they were values, and the histogram_total check
      * would not catch it. Off by default.
      */
-    void enable_index_pass2(bool on) { idx_mode_ = on; }
+    void enable_index_pass2(bool on) {
+        // Index mode's wire format is a 16-bit word: a 14-bit signed half-bin index (IDX_W=14) plus
+        // an `exact` bit. TRAP 2 (iqr_index.sv) proves 14 bits cover the reachable fence indices ONLY
+        // at NUM_BINS<=1024 (they reach +5115/-3069). At 4096 bins the fence indices reach ~+20475,
+        // which a 14-bit index (+-8191) SATURATES -- silently reporting far outliers as inside. The
+        // re-widen (IDX_W 14->16, IDX_BITS 16->32, host IDX_PER_BEAT, the o_flagw_data /16 sites) is
+        // deferred with index mode itself (shelved, RESULTS.md 9.23). Refuse it here rather than ship
+        // silently-wrong flags.
+        if (on && NUM_BINS > 1024) {
+            throw std::runtime_error(
+                "IqrRunner: index-mode pass 2 is only bit-exact for NUM_BINS<=1024; this bitstream is "
+                "built for " + std::to_string(NUM_BINS) + " bins. Re-widen IDX_W/IDX_BITS before "
+                "enabling index mode at >1024 bins.");
+        }
+        idx_mode_ = on;
+    }
 
     void   begin_overlapped(int64_t bin_min, uint64_t bin_shift);
     void   feed_pass1(const InputChunk &chunk, bool is_last);
@@ -189,7 +206,7 @@ class IqrRunner {
     bool     use_card_;   // read the two passes from card/HBM instead of re-DMAing from the host
 
     // Histogram bin count baked into the bitstream (must match the vFPGA top's IQR_NUM_BINS).
-    static constexpr int64_t NUM_BINS      = 1024;
+    static constexpr int64_t NUM_BINS      = 4096;
     static constexpr size_t  SAMPLE_TARGET = 8192;   // ~rows sampled to size the window
     // Card stream index the HBM-staged column is read on (matches axis_card_recv[0] in vfpga_top).
     static constexpr int64_t CARD_STREAM   = 0;
@@ -230,6 +247,14 @@ class IqrRunner {
     // the step-2 index drain.
     std::shared_ptr<libstf::Buffer> drain_to_buffer(BypassStreamReceiver::Handle &handle,
                                                     size_t total_bytes);
+
+    // Folds a byte-padded-per-chunk flag drain (produced when pass 2 streams ragged intermediate
+    // chunks) back into a dense, contiguous 1-bit-per-element bitmask. No-op unless a chunk before
+    // the last is not a multiple of 8 elements (has_intermediate_ragged). Verified offline against a
+    // brute-force reference; see the .cpp.
+    std::shared_ptr<libstf::Buffer> repack_ragged_flags(
+        const std::shared_ptr<libstf::Buffer> &padded,
+        const std::vector<InputChunk> &chunks, size_t num_elements);
 
     // Overlapped-mode state, live only between begin_overlapped() and finish_overlapped().
     bool overlapped_ = false;

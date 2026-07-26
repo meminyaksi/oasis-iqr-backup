@@ -29,6 +29,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace duckdb {
@@ -234,7 +235,7 @@ struct DecodeHooks {
 
 // Number of histogram bins baked into the bitstream. Must match IqrRunner::NUM_BINS and the vFPGA
 // top's IQR_NUM_BINS -- the window is only meaningful relative to it.
-constexpr int64_t IQR_HW_NUM_BINS = 1024;
+constexpr int64_t IQR_HW_NUM_BINS = 4096;
 
 // Defined below; declared here for DeriveWindowSpanning.
 template <typename F>
@@ -313,6 +314,47 @@ bool window_fpga_enabled() {
     return on;
 }
 
+// TEST ONLY (OASIS_IQR_FORCE_STREAM=1): bypass the ragged-chunk streaming guard so taxi_d3/d4 can be
+// FUSED for measurement. The pass-2 flag packer is bit-misaligned on ragged chunks, so per-row flags
+// are WRONG -- but the OUTLIER COUNT is preserved (raggedness shifts positions, not the number of set
+// bits), and the count is exactly the window-accuracy signal we want to sweep. NEVER enable for real
+// output; it produces mislabeled rows.
+bool force_stream() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_FORCE_STREAM");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+
+// OASIS_IQR_STREAM_RAGGED=1 lifts the ragged-chunk streaming guard the CORRECT way: taxi_d3/d4 (odd-
+// sized row groups) stream/fuse, and IqrRunner folds the byte-padded-per-chunk flag output back into a
+// dense bitmask (has_intermediate_ragged / repack_ragged_flags), so per-row flags are RIGHT -- unlike
+// force_stream(), which only preserves the count. Off by default until validated on silicon (the byte-
+// alignment of each chunk in the packed stream, which the stitch assumes, holds iff consecutive stream
+// transfers are beat-aligned; confirm with the taxi 3-way correctness test before making it default).
+bool stream_ragged_enabled() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_STREAM_RAGGED");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+
+// OASIS_IQR_WINDOW_IQR=1 sizes the histogram window from the sample's INTERQUARTILE spread
+// [Q1-2*IQR, Q3+2*IQR] instead of its [p1, p99] range. The p1/p99 range is tail-dominated on
+// heavy-tailed columns, so ceil(range/IQR_HW_NUM_BINS) lands on a power-of-2 boundary and bin_shift flips with the
+// sample (taxi_d3's count is bistable 1296479<->1328108 across group counts). Basing the width on the
+// IQR -- the quantity actually being resolved, from the densest/most stable percentiles -- keeps the
+// bins fine and stable. Off by default until validated against the trusted window path.
+bool window_iqr_rule() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_WINDOW_IQR");
+        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+    }();
+    return on;
+}
+
 // How many values to keep per sampled row group. Raising this is NEARLY FREE on the FPGA window
 // path: DeriveWindowFromFpga already decodes each picked group in full, so a denser stride costs no
 // extra decode -- only the percentile step, which is O(n) (see WindowFromSample). Contrast with
@@ -337,7 +379,7 @@ size_t window_samples_per_group() {
 // they cannot drift apart: whichever way the sample was collected, identical values must produce an
 // identical window. Same rule as IqrRunner::derive_window -- robust percentiles, NOT min/max, so a
 // stray outlier cannot blow up the bin width (footer min/max was tried and is degenerate: taxi_d4
-// spans -128540..33407632, which makes 1024 bins 32768 wide while the fares live in 0..5000).
+// spans -128540..33407632, which makes 4096 bins 8192 wide while the fares live in 0..5000).
 // Consumes `sample` (sorts it in place). Returns false if there is nothing usable to measure.
 bool WindowFromSample(std::vector<int64_t> &sample, int64_t &bin_min_out, uint64_t &bin_shift_out) {
     if (sample.size() < 2) {
@@ -350,17 +392,40 @@ bool WindowFromSample(std::vector<int64_t> &sample, int64_t &bin_min_out, uint64
     // The two selections compose: after the p1 pass everything below k1 sits left of it, so the p99
     // selection only has to partition the remaining suffix.
     const size_t m  = sample.size();
-    const size_t k1 = m * 1 / 100;
-    const size_t k99 = std::min(m - 1, m * 99 / 100);
 
-    std::nth_element(sample.begin(), sample.begin() + k1, sample.end());
-    const int64_t lo = sample[k1];
-    // k1 < k99 for every m >= 2, so the suffix range is non-empty; guard anyway rather than risk
-    // UB on an unexpected input.
-    if (k1 + 1 <= k99) {
-        std::nth_element(sample.begin() + k1 + 1, sample.begin() + k99, sample.end());
+    // Choose the span the window must cover. Default: robust [p1, p99]. With OASIS_IQR_WINDOW_IQR:
+    // [Q1-2*IQR, Q3+2*IQR] from p25/p75, which ties bin width to the IQR and removes the power-of-2
+    // bistability (see window_iqr_rule()). Falls back to p1/p99 when the IQR is degenerate.
+    int64_t lo, hi;
+    bool    used_iqr = false;
+    if (window_iqr_rule()) {
+        const size_t k25 = m / 4;
+        const size_t k75 = std::min(m - 1, m * 3 / 4);
+        std::nth_element(sample.begin(), sample.begin() + k25, sample.end());
+        const int64_t q1 = sample[k25];
+        if (k25 + 1 <= k75) {
+            std::nth_element(sample.begin() + k25 + 1, sample.begin() + k75, sample.end());
+        }
+        const int64_t q3  = sample[k75];
+        const int64_t iqr = q3 - q1;
+        if (iqr > 0) {
+            lo       = q1 - 2 * iqr;   // covers the +-1.5*IQR fences plus a 0.5*IQR estimation margin
+            hi       = q3 + 2 * iqr;
+            used_iqr = true;
+        }
     }
-    const int64_t hi = sample[k99];
+    if (!used_iqr) {
+        const size_t k1  = m * 1 / 100;
+        const size_t k99 = std::min(m - 1, m * 99 / 100);
+        std::nth_element(sample.begin(), sample.begin() + k1, sample.end());
+        lo = sample[k1];
+        // k1 < k99 for every m >= 2, so the suffix range is non-empty; guard anyway rather than risk
+        // UB on an unexpected input.
+        if (k1 + 1 <= k99) {
+            std::nth_element(sample.begin() + k1 + 1, sample.begin() + k99, sample.end());
+        }
+        hi = sample[k99];
+    }
 
     const int64_t range = hi - lo;
     if (range <= 0) {
@@ -391,7 +456,7 @@ bool WindowFromSample(std::vector<int64_t> &sample, int64_t &bin_min_out, uint64
 //     span only the early range, everything later clamps into the top bin, Q3 collapses and the
 //     fences flag 19,997,999 of 20,000,000 rows (RESULTS.md 9.15).
 //   * parquet footer min/max -- present on every row group of every dataset here, but NOT robust:
-//     taxi_d4 spans -128540..33407632, so 1024 bins are 32768 wide while the fares themselves live
+//     taxi_d4 spans -128540..33407632, so 4096 bins are 8192 wide while the fares themselves live
 //     in 0..5000. Every value lands in bin 0 => q1 == q3 => IQR 0 => degenerate fences.
 //   * a percentile over the per-group footer min/max -- no better, because outliers are spread
 //     across essentially every row group (taxi_d4 is 10 % outliers), so every group's max is extreme.
@@ -502,10 +567,11 @@ FooterFacts ReadFooterFacts(ClientContext &context, const IqrFlagsBindData &bind
         f.rows += nv;
     }
 
-    // Mirrors DecodeColumnAllGroups exactly: FlagBitPacker emits 8 flags per beat, so only the FINAL
-    // chunk may be partial or every flag after a ragged one is misaligned.
+    // Mirrors DecodeColumnAllGroups exactly: FlagBitPacker emits 8 flags per beat, so a ragged
+    // intermediate chunk byte-pads mid-stream. STREAM_RAGGED lifts the guard correctly (IqrRunner
+    // repacks); FORCE_STREAM lifts it for measurement only (mislabeled flags -- see force_stream()).
     f.stream_ok = stream_enabled() && !bind.needs_values && !live.empty();
-    if (f.stream_ok) {
+    if (f.stream_ok && !force_stream() && !stream_ragged_enabled()) {
         for (size_t i = 0; i + 1 < live.size(); i++) {
             if (meta.groups[live[i]].chunks[bind.column_id].num_values % 8 != 0) {
                 f.stream_ok = false;
@@ -706,12 +772,13 @@ std::shared_ptr<libstf::Buffer> DecodeColumnAllGroups(
     tm.zero_copy = zero_copy;
 
     // Streaming precondition. FlagBitPacker emits 8 flags per beat, so a chunk that is not a whole
-    // number of 8 elements would make the packer insert padding bits *mid-stream* and misalign every
-    // flag after it. Only the FINAL chunk may be partial. DuckDB writes 122,880-row groups (a clean
-    // multiple of 8) so this normally holds, but taxi files carry odd-sized groups -- hence the check
-    // rather than an assumption. Falling back to the memcpy is always correct.
+    // number of 8 elements makes the packer byte-pad *mid-stream*. Only the FINAL chunk may be partial
+    // unless the host repacks. DuckDB writes 122,880-row groups (a clean multiple of 8) so this normally
+    // holds, but taxi files carry odd-sized groups -- hence the check. STREAM_RAGGED lifts it the correct
+    // way (IqrRunner folds the byte-padded flags back to dense). Falling back to the memcpy is always
+    // correct.
     bool stream = chunks_out && stream_enabled() && !bind.needs_values;
-    if (stream) {
+    if (stream && !stream_ragged_enabled()) {
         for (size_t i = 0; i + 1 < live.size(); i++) {
             if (meta.groups[live[i]].chunks[col].num_values % 8 != 0) {
                 stream = false;
@@ -1272,11 +1339,61 @@ void IqrFlagsOnlyFunction(ClientContext &, TableFunctionInput &data_p, DataChunk
 //   q3 = smallest v with (#elements <= v)*4 >= 3N ==  the ceil(3N/4)-th smallest value
 //   d = q3-q1;  lo = q1 - (d + (d>>1));  hi = q3 + (d + (d>>1))   (1.5*IQR, divider-free)
 //   flag[i] = (v[i] < lo) || (v[i] > hi)
-// so the quartiles are plain order statistics. We resolve them with a two-level histogram rather
-// than a sort: one parallel min/max pass, one parallel 65536-bin pass to find which bin holds each
-// rank, then one parallel pass collecting only the two winning bins and an nth_element inside them.
-// O(N), no sort, bounded memory, and the same shape as the hardware's windowed histogram.
+// so the quartiles are plain order statistics. We resolve them with an iterative histogram zoom
+// rather than a sort: one parallel min/max pass, then parallel binned passes that narrow the range
+// holding each rank one level at a time (both quartiles advanced in the SAME pass) until a bin holds
+// a single distinct value, which is then exact. O(N) per level, at most a handful of levels (two for
+// every dataset here), no sort, no candidate materialization, bounded memory -- and the same shape as
+// the hardware's windowed histogram. See SelectQuartiles / AdvanceRankQueries below.
 // =============================================================================================
+
+// OASIS_IQR_CPU_RAW_ALLOC=1 makes the CPU baseline allocate its materialised column with raw
+// new[]/delete[] instead of DuckDB's pooled allocator. Default is POOLED, because delete[] returns the
+// pages to the OS and that kernel unmap is pure overhead inside the operator -- measured (9.18):
+//
+//   column        pooled free    delete[] free
+//   48 MB sets    3.8-4.7 ms     9.4-11.6 ms
+//   taxi_d3 105MB 5.7 ms         19.6 ms
+//   taxi_d4 163MB 7.3 ms         27.0 ms
+//
+// The FPGA path already allocates through pooled buffers, so pooled is also the symmetric choice: it
+// gives both arms of the comparison the same memory machinery (9.18 Defect 2). The raw path is kept
+// switchable because it was requested explicitly (9.28) and because the difference is worth measuring.
+bool cpu_raw_alloc() {
+    static const bool raw = [] {
+        const char *e = std::getenv("OASIS_IQR_CPU_RAW_ALLOC");
+        return e && *e == '1';
+    }();
+    return raw;
+}
+
+// Owns the materialised column under either strategy. Neither value-initialises: `new int64_t[n]`
+// default-initialises (does nothing) and Allocate() does not touch the memory, so the parallel parquet
+// read is what first-touches the pages -- 32 workers absorbing the faults instead of one memset
+// (9.24 step 12c: a std::vector here would cost 82 ms on taxi_d4, 229 ms on sf10).
+struct CpuColumn {
+    AllocatedData              pooled;
+    std::unique_ptr<int64_t[]> raw;
+    int64_t                   *ptr = nullptr;
+
+    void Allocate(ClientContext &context, size_t n_elems) {
+        if (cpu_raw_alloc()) {
+            raw.reset(new int64_t[n_elems]);
+            ptr = raw.get();
+        } else {
+            pooled = Allocator::Get(context).Allocate(n_elems * sizeof(int64_t));
+            ptr    = reinterpret_cast<int64_t *>(pooled.get());
+        }
+    }
+    // Timed inside `heavy` on purpose (9.18 Defect 3): holding the whole column is a real cost of the
+    // CPU approach, so releasing it must be counted in the operator, not hidden as tax afterwards.
+    void Release() {
+        raw.reset();
+        pooled.Reset();
+        ptr = nullptr;
+    }
+    const char *Kind() const { return cpu_raw_alloc() ? "raw new[]" : "pooled"; }
+};
 
 // DuckDB's configured worker count (PRAGMA threads), so the CPU baseline gets exactly the
 // parallelism the user asked for -- the same knob that governs the SQL baseline.
@@ -1285,8 +1402,124 @@ size_t CpuThreadCount(ClientContext &context) {
     return n < 1 ? 1u : static_cast<size_t>(n);
 }
 
+// A persistent worker pool behind ParallelRanges.
+//
+// Why: the CPU operators call ParallelRanges several times per query (min/max, each histogram level,
+// the flag mask; or count, scatter, aggregate, flags on the GROUP BY path) and the original version
+// created and joined 32 fresh std::threads EVERY call. Measured at 32 threads with 4 calls per query
+// (bench/micro/threads_ab.cpp): **4.95 ms of pure dispatch, vs 0.61 ms with a pool -- 4.34 ms saved
+// per query, independent of dataset size.** That is ~20 % of taxi_d1's operator and ~3 % of sf10's,
+// so it matters most on the small datasets. RESULTS.md 9.32.
+//
+// Also fixes a latent crash: callers throw from inside the parallel region (ReadColumnCpu raises on a
+// short read), and an exception escaping a std::thread lambda calls std::terminate. The pool captures
+// the first exception and rethrows it on the caller's thread.
+class IqrThreadPool {
+public:
+    static IqrThreadPool &Get() {
+        static IqrThreadPool pool;
+        return pool;
+    }
+
+    // Runs body(worker_id, worker_count) on every pooled thread. The CALLER is responsible for
+    // mapping its logical ranges onto worker_count workers -- see ParallelRanges, which strides. Do
+    // NOT assume worker_count equals the caller's requested thread count; it is the pool size.
+    //
+    // Returns false if the pool is already in use (a nested or concurrent call), so the caller can
+    // fall back to spawning. Keeps this non-reentrant pool safe without serialising queries.
+    bool TryRun(const std::function<void(size_t, size_t)> &body) {
+        std::unique_lock<std::mutex> gate(run_mutex_, std::try_to_lock);
+        if (!gate.owns_lock()) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> l(m_);
+            body_   = &body;
+            err_    = nullptr;
+            pending_ = workers_.size();
+            gen_++;
+        }
+        cv_.notify_all();
+        {
+            std::unique_lock<std::mutex> l(m_);
+            done_cv_.wait(l, [this] { return pending_ == 0; });
+            body_ = nullptr;
+            if (err_) {
+                auto e = err_;
+                err_   = nullptr;
+                std::rethrow_exception(e);
+            }
+        }
+        return true;
+    }
+
+    size_t size() const { return workers_.size(); }
+
+private:
+    IqrThreadPool() {
+        const size_t k = std::max<unsigned>(1, std::thread::hardware_concurrency());
+        workers_.reserve(k);
+        for (size_t i = 0; i < k; i++) {
+            workers_.emplace_back([this, i] { Worker(i); });
+        }
+    }
+    ~IqrThreadPool() {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto &w : workers_) {
+            w.join();
+        }
+    }
+
+    void Worker(size_t id) {
+        size_t seen = 0;
+        for (;;) {
+            const std::function<void(size_t, size_t)> *body = nullptr;
+            {
+                std::unique_lock<std::mutex> l(m_);
+                cv_.wait(l, [&] { return stop_ || gen_ != seen; });
+                if (stop_) {
+                    return;
+                }
+                seen = gen_;
+                body = body_; // every worker participates; the caller strides
+
+            }
+            if (body) {
+                try {
+                    (*body)(id, workers_.size());
+                } catch (...) {
+                    std::lock_guard<std::mutex> l(m_);
+                    if (!err_) {
+                        err_ = std::current_exception();
+                    }
+                }
+            }
+            {
+                std::lock_guard<std::mutex> l(m_);
+                if (--pending_ == 0) {
+                    done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
+    std::vector<std::thread>           workers_;
+    std::mutex                         m_, run_mutex_;
+    std::condition_variable            cv_, done_cv_;
+    const std::function<void(size_t, size_t)> *body_ = nullptr;
+    std::exception_ptr                         err_;
+    size_t                                     gen_ = 0, pending_ = 0;
+    bool                               stop_ = false;
+};
+
 // Splits [0, n) into at most `nthreads` contiguous ranges and runs fn(thread_idx, lo, hi) on each.
-// thread_idx is always < nthreads, so callers can index per-thread scratch by it.
+// thread_idx is always < nthreads, so callers can index per-thread scratch by it. The chunking is
+// identical to the original spawn-per-call version, so passes that must agree on ranges (the GROUP BY
+// count and scatter passes) still do.
 template <class F>
 void ParallelRanges(size_t n, size_t nthreads, F &&fn) {
     if (n == 0) {
@@ -1296,7 +1529,24 @@ void ParallelRanges(size_t n, size_t nthreads, F &&fn) {
         fn(size_t(0), size_t(0), n);
         return;
     }
-    const size_t             chunk = (n + nthreads - 1) / nthreads;
+    const size_t chunk = (n + nthreads - 1) / nthreads;
+    // Each pooled worker takes every k-th logical range, so `nthreads` may be larger OR smaller than
+    // the pool. Mapping ranges 1:1 onto workers would silently DROP ranges when nthreads > pool size
+    // (caught by bench/micro/pool_test.cpp: n=1000, nt=100 left elements 640.. unvisited). Distinct
+    // logical ranges still get distinct `t`, so per-thread scratch indexed by `t` stays correct.
+    auto body = [&](size_t id, size_t k) {
+        for (size_t t = id; t < nthreads; t += k) {
+            const size_t lo = t * chunk;
+            if (lo >= n) {
+                break; // t increasing => lo increasing, so nothing later can be in range
+            }
+            fn(t, lo, std::min(n, lo + chunk));
+        }
+    };
+    if (IqrThreadPool::Get().TryRun(body)) {
+        return;
+    }
+    // Fallback: pool busy (nested or concurrent call). Same semantics, just pays the spawn.
     std::vector<std::thread> workers;
     workers.reserve(nthreads);
     for (size_t t = 0; t < nthreads; t++) {
@@ -1333,12 +1583,28 @@ void ParallelMinMax(const T *v, size_t n, size_t nt, T &out_min, T &out_max) {
     out_max = *std::max_element(maxs.begin(), maxs.end());
 }
 
-// 4096 bins x 4 B = 16 KB per table -- small enough to stay resident in L1 alongside the streaming
-// column. The previous 65536 x 8 B = 512 KB table overflowed L2, so every increment was a cache miss
-// and the histogram passes ran at ~11 GB/s against the ~40 GB/s this machine sustains on a plain scan.
-// Fewer bins means more levels in principle, but every real column here still resolves in two.
-// uint32 counters are safe up to 4.29e9 rows per thread.
-constexpr size_t IQR_CPU_HIST_BINS = 1u << 12;
+// 65536 bins x 8 B = 512 KB per table. This is a DELIBERATE configuration choice, not an oversight:
+// the 4096 x 4 B = 16 KB variant is faster (16 KB stays resident in L1 alongside the streaming column,
+// while 512 KB overflows L2 and makes every data-dependent increment a cache miss), and the cost of
+// the wider table is measured in RESULTS.md 9.26: quart is 1.28-2.59x slower across the seven
+// datasets (sf10 66.60 vs 36.76 ms; +19.3 ms from the bins, +8.5 ms from the counter width).
+// It is kept at 65536/uint64 by preference, so:
+//
+//   * DO NOT "fix" this back to 4096/uint32 as a performance cleanup without reading 9.26 first --
+//     the tradeoff is known and was chosen.
+//   * A slower CPU baseline flatters the FPGA. Whenever a speedup is quoted against this operator,
+//     9.26's delta has to be disclosed alongside it, or the comparison drifts back into exactly the
+//     class of unfairness 9.18 was written to remove.
+//
+// Correctness is unaffected either way: more bins means FEWER levels (65536 bins divide the range by
+// 2^16 per level, so <=4 levels for any 64-bit range vs <=6 at 4096), and both settings still resolve
+// every real column here in two. uint64 counters cannot overflow for any row count that fits in
+// memory (uint32 was already safe to 4.29e9 rows per thread).
+constexpr size_t IQR_CPU_HIST_BINS = 1u << 16;
+
+// Histogram counter type. uint64 doubles the table footprint versus uint32 (see above) and is kept by
+// preference; the merge loop widths below follow this typedef, so changing it here is sufficient.
+using IqrHistCount = uint64_t;
 
 // One "find the rank-th smallest value inside [lo,hi]" question, narrowed one histogram level at a
 // time. Several of these are advanced together so that q1 and q3 share a single pass over the column.
@@ -1356,7 +1622,7 @@ struct RankQuery {
 // [min,max]) share one histogram instead of building the same counts twice.
 template <class T>
 void AdvanceRankQueries(const T *v, size_t n, size_t nt, RankQuery<T> *q, size_t nq,
-                        std::vector<std::vector<uint32_t>> &scratch) {
+                        std::vector<std::vector<IqrHistCount>> &scratch) {
     using U                    = typename std::make_unsigned<T>::type;
     constexpr size_t MAX_ACTIVE = 4;
 
@@ -1422,7 +1688,7 @@ void AdvanceRankQueries(const T *v, size_t n, size_t nt, RankQuery<T> *q, size_t
         } else {
             std::fill(sc.begin(), sc.begin() + stride * nh, 0);
         }
-        uint32_t *sp = sc.data();
+        IqrHistCount *sp = sc.data();
         if (nh == 1) {
             // The first level always lands here (both quartiles share [min,max]). Keeping it a flat
             // loop over scalars, with nothing indexed by a loop variable, is worth a lot to the
@@ -1504,7 +1770,7 @@ void SelectQuartiles(const T *v, size_t n, size_t k1, size_t k3, size_t nt, T &q
     }
 
     RankQuery<T> q[2] = {{vmin, vmax, k1, false, T {}}, {vmin, vmax, k3, false, T {}}};
-    std::vector<std::vector<uint32_t>> scratch;
+    std::vector<std::vector<IqrHistCount>> scratch;
     while (!q[0].done || !q[1].done) {
         AdvanceRankQueries<T>(v, n, nt, q, 2, scratch);
     }
@@ -1551,7 +1817,7 @@ void ComputeFlagMask(const T *v, size_t n, T lo, T hi, uint8_t *mask, size_t nt)
 // CPU's best decoder, just as the FPGA path uses its own). Row counts come from the footer, so each
 // worker knows its destination offset up front and workers write disjoint ranges of `out`.
 size_t ReadColumnCpu(ClientContext &context, const IqrFlagsBindData &bind, size_t nt,
-                     AllocatedData &out) {
+                     CpuColumn &out) {
     ParquetOptions parquet_opts(context);
     ParquetReader  probe(context, OpenFileInfo {bind.filename}, parquet_opts, bind.parquet_metadata);
     auto           meta = BuildParcoreMetadata(probe);
@@ -1566,15 +1832,9 @@ size_t ReadColumnCpu(ClientContext &context, const IqrFlagsBindData &bind, size_
     if (total == 0) {
         return 0;
     }
-    // Allocated through DuckDB's own allocator rather than new[], so the column is pooled and freed
-    // the same way the FPGA path's buffers are. With new[], releasing 457.7 MB (sf10) landed AFTER
-    // the `heavy` timer stopped and showed up as a 63.8 ms "tax" against the CPU -- 5x the FPGA's
-    // 12.7 ms -- which flattered the FPGA's end-to-end numbers for a reason that was an artefact of
-    // this allocation choice, not a property of CPU execution. Like new[], this does NOT
-    // value-initialise: std::vector would memset the whole column single-threaded before the read
-    // overwrites it (82 ms on taxi_d4, 229 ms on sf10), and leaving it untouched also pushes
-    // first-touch page faulting into the parallel read where 32 workers absorb it.
-    out = Allocator::Get(context).Allocate(total * sizeof(int64_t));
+    // Pooled by default, raw new[] under OASIS_IQR_CPU_RAW_ALLOC=1 -- see CpuColumn above for the
+    // measured difference and why pooled is the symmetric choice.
+    out.Allocate(context, total);
 
     // One worker per contiguous block of row groups; each builds its own reader and scan state
     // (neither is thread-safe) but shares the already-parsed footer.
@@ -1600,7 +1860,7 @@ size_t ReadColumnCpu(ClientContext &context, const IqrFlagsBindData &bind, size_
         DataChunk chunk;
         chunk.Initialize(Allocator::Get(context), {bind.column_type});
 
-        int64_t *const start = reinterpret_cast<int64_t *>(out.get()) + group_off[ga];
+        int64_t *const start = out.ptr + group_off[ga];
         int64_t       *dst   = start;
         for (;;) {
             chunk.Reset();
@@ -1677,7 +1937,7 @@ void RunHeavyPhaseCpu(ClientContext &context, const IqrFlagsBindData &bind, IqrC
     const size_t nt    = CpuThreadCount(context);
     auto         t_all = TimingClock::now();
 
-    AllocatedData values;
+    CpuColumn     values;
     auto          t_read  = TimingClock::now();
     const size_t               n       = ReadColumnCpu(context, bind, nt, values);
     const double               read_ms = ms_since(t_read);
@@ -1689,21 +1949,41 @@ void RunHeavyPhaseCpu(ClientContext &context, const IqrFlagsBindData &bind, IqrC
     // ComputeFlagMask writes every byte, so this too is left uninitialized on purpose.
     gstate.flags.reset(new uint8_t[(n + 7) / 8]);
 
-    const int64_t *vals = reinterpret_cast<const int64_t *>(values.get());
+    const int64_t *vals = values.ptr;
     double      quart_ms = 0.0, flag_ms = 0.0;
     std::string fences =
         bind.is_signed
             ? IqrCpuCore<int64_t>(vals, n, nt, gstate.flags.get(), quart_ms, flag_ms)
             : IqrCpuCore<uint64_t>(vals, n, nt, gstate.flags.get(), quart_ms, flag_ms);
 
+    // FAIRNESS: release the materialised column HERE, inside the heavy span, and time it.
+    //
+    // The CPU baseline must hold the whole column in RAM for its histogram passes; the FPGA streams
+    // and never does. Releasing it is a real, unavoidable cost of the CPU approach -- but `values`
+    // is a local whose destructor runs on RETURN, i.e. *after* the heavy timer stopped, so it used
+    // to drop out of the operator number entirely (sf10: ~61 ms to free 457 MB -- RESULTS.md 9.18).
+    // That made "operator" a near-complete number for the FPGA (its teardown is a pooled-buffer
+    // return, ~0) but a partial one for the CPU, so a head-to-head `heavy` comparison understated the
+    // CPU by up to 61 ms. `vals` is no longer read (the flags live in gstate.flags), so freeing now
+    // is safe, and folding free_ms into heavy makes "operator" mean the same span on both sides.
+    // e2e already included this cost (it is real wall-clock), so only the operator table changes.
+    //
+    // NOTE (2026-07-24, 9.28): the allocator was reverted to raw new[]/delete[], so `free` is once
+    // again a kernel unmap rather than a pool return -- expect ~20 ms on taxi_d4 and ~61 ms on sf10.
+    // It is counted inside `heavy` (unlike before Defect 3), so it is visible, not hidden.
+    auto         t_free  = TimingClock::now();
+    values.Release();
+    const double free_ms = ms_since(t_free);
+
     if (timing_enabled()) {
         std::fprintf(stderr,
                      "[iqr-cpu] rows=%zu  threads=%zu  %s\n"
                      "[iqr-cpu]   read    %8.2f ms   <- DuckDB parquet decode of the target column\n"
-                     "[iqr-cpu]   quart   %8.2f ms   <- min/max + 2-level histogram + nth_element\n"
+                     "[iqr-cpu]   quart   %8.2f ms   <- min/max + iterative histogram zoom (exact)\n"
                      "[iqr-cpu]   flags   %8.2f ms   <- fence compare into the packed bitmask\n"
+                     "[iqr-cpu]   free    %8.2f ms   <- release the materialised column (FPGA streams, never pays this)\n"
                      "[iqr-cpu]   heavy   %8.2f ms   <- everything before DuckDB emits a single row\n",
-                     n, nt, fences.c_str(), read_ms, quart_ms, flag_ms, ms_since(t_all));
+                     n, nt, fences.c_str(), read_ms, quart_ms, flag_ms, free_ms, ms_since(t_all));
     }
 }
 
@@ -1735,6 +2015,296 @@ void IqrCpuFlagsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk 
     size_t emit = std::min<size_t>(STANDARD_VECTOR_SIZE, gstate.num_elements - start);
 
     EmitFlagSlice(gstate.flags.get(), start, emit, output);
+}
+
+// =============================================================================================
+// iqr_cpu_flags_groupby(path, column) -- the DIRECT C++ TRANSLITERATION of the SQL baseline
+//
+// Why this exists (RESULTS.md 9.29). `iqr_cpu_flags` shares the SQL's *rule* but not its *mechanics*:
+// it resolves the quartiles with an iterative histogram zoom, which is a different algorithm that
+// happens to produce the same answer. That conflates two effects in the SQL -> C++ speedup of 9.1:
+//
+//     (a) leaving DuckDB's parser / binder / optimizer / general-purpose executor
+//     (b) replacing GROUP BY + ORDER BY with a histogram
+//
+// This function is (a) alone. It transliterates the SQL statement for statement:
+//
+//     ecnt AS (SELECT v, count(*) c FROM s GROUP BY v)          -> per-thread hash tables + combine
+//     ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt) -> sort the DISTINCT values, scan
+//     eq   AS (min(v) WHERE cc*4>=t / cc*4>=3*t)                -> first hit in that scan
+//     ef   AS (q1-(d+(d>>1)), q3+(d+(d>>1)))                    -> IqrFences, unchanged
+//     SELECT (v < lo OR v > hi)                                 -> ComputeFlagMask, unchanged
+//
+// It deliberately shares ReadColumnCpu, IqrFences, ComputeFlagMask and the whole emit path with
+// iqr_cpu_flags, so a head-to-head measures the quartile computation and nothing else.
+//
+// Shape note: this is a hash aggregate over N followed by a sort over D (the distinct count) -- the
+// same shape DuckDB's plan has, and NOT a sort over N (that is 6.5's approach 4, 36.8x slower).
+// Memory is therefore O(D) per thread; on these datasets D <= ~2 M, so the per-thread tables can
+// reach a few tens of MB each. That is the same cost the SQL baseline pays.
+// =============================================================================================
+
+// Bottom-up parallel merge sort over the (value, count) pairs -- the `order` phase.
+//
+// This was a single-threaded std::sort and it is the dominant cost on high-cardinality columns:
+// **83.64 ms of tpch_extprice's 126.14 ms operator (66 %)** at D = 933,900, and 121 ms on sf10 at
+// D = 1.35 M (RESULTS.md 9.33). Low-cardinality columns are unaffected either way (tpch_qty's `order`
+// is 0.02 ms at D = 50), which is why this is the fix for extprice/sf10 specifically.
+//
+// Bottom-up rather than a K-way merge: each round merges disjoint adjacent pairs of runs, so every
+// round is embarrassingly parallel and needs no coordination. The final rounds have few pairs and so
+// less parallelism -- that is inherent to merge sort and is why the expected speedup is ~5-6x, not 32x.
+template <class T>
+void ParallelSortPairs(std::pair<T, uint64_t> *v, size_t n, size_t nt) {
+    auto cmp = [](const std::pair<T, uint64_t> &a, const std::pair<T, uint64_t> &b) {
+        return a.first < b.first;
+    };
+    // Below this the dispatch and the scratch allocation cost more than the sort saves.
+    if (n < 1u << 15 || nt <= 1) {
+        std::sort(v, v + n, cmp);
+        return;
+    }
+    const size_t runs  = std::min(nt, n / 4096);
+    const size_t chunk = (n + runs - 1) / runs;
+    ParallelRanges(n, runs, [&](size_t, size_t lo, size_t hi) { std::sort(v + lo, v + hi, cmp); });
+
+    // Scratch via new[]: std::pair<integral, uint64_t> is trivially default-constructible, so this
+    // does NOT initialise. A std::vector here would memset it first (9.24 step 12c, 9.31).
+    std::unique_ptr<std::pair<T, uint64_t>[]> scratch(new std::pair<T, uint64_t>[n]);
+    std::pair<T, uint64_t> *src = v, *dst = scratch.get();
+    for (size_t width = chunk; width < n; width *= 2) {
+        const size_t npairs = (n + 2 * width - 1) / (2 * width);
+        ParallelRanges(npairs, std::min(nt, npairs), [&](size_t, size_t plo, size_t phi) {
+            for (size_t q = plo; q < phi; q++) {
+                const size_t lo  = q * 2 * width;
+                if (lo >= n) {
+                    break;
+                }
+                const size_t mid = std::min(n, lo + width);
+                const size_t hi  = std::min(n, lo + 2 * width);
+                std::merge(src + lo, src + mid, src + mid, src + hi, dst + lo, cmp);
+            }
+        });
+        std::swap(src, dst);
+    }
+    if (src != v) {
+        std::copy(src, src + n, v);
+    }
+}
+
+// Returns the fence description; also reports the distinct count, which is the whole story of why
+// GROUP BY is or is not competitive on a given column.
+template <class T>
+std::string IqrCpuCoreGroupBy(const int64_t *raw, size_t n, size_t nt, uint8_t *mask,
+                              double &group_ms, double &order_ms, double &flag_ms,
+                              size_t &n_distinct, double &part_out, double &agg_out) {
+    using U = typename std::make_unsigned<T>::type;
+    const T *v = reinterpret_cast<const T *>(raw);
+
+    // ---- ecnt: GROUP BY v, RADIX-PARTITIONED --------------------------------------------------
+    // The first version of this built one hash table per thread and then combined them in a single
+    // loop on one core. That combine was 90 % of the whole phase (RESULTS.md 9.30): with D = 1.35 M
+    // distinct and 32 threads it performed ~31 M pointer-chasing probes into a growing
+    // multi-hundred-MB node-based table, single-threaded -- which is why sf10's GROUP BY operator
+    // took 6.4 s and average parallelism over the query was only 3.7x on 32 threads.
+    //
+    // A real hash aggregate does not have that step, because it partitions by hash first: partitions
+    // are disjoint, so each one aggregates independently and nothing has to be merged afterwards.
+    // Measured on sf10's shape (bench/micro/groupby_ab.cpp): 12209 ms -> 565 ms, **21.6x**, with an
+    // identical distinct count.
+    //
+    // Cost of the technique: one extra pass and a scatter buffer the size of the column (960 MB peak
+    // on sf10, column + buffer). In exchange every partition's working set fits in cache, so the
+    // aggregate pass stops missing on every probe.
+    constexpr size_t P    = 256;      // partitions; keeps each working set well under L2 at D ~ 1.4 M
+    constexpr size_t PMASK = P - 1;
+
+    auto hash_of = [](U x) {          // multiplicative hash; the low bits select the partition
+        uint64_t h = static_cast<uint64_t>(x) * 0x9E3779B97F4A7C15ull;
+        return static_cast<size_t>(h ^ (h >> 29));
+    };
+
+    auto t0 = TimingClock::now();
+
+    // NOTE: a low-cardinality fast path (skip partitioning below ~4096 distinct, RESULTS.md 9.33 "B")
+    // was implemented and REVERTED. It was a net negative: its probe allocates and frees ~131k
+    // unordered_map nodes before bailing out, costing **+3 ms on every column with D > 4096** (six of
+    // seven datasets) in order to speed up the one low-cardinality column by 17 ms -- which overshot,
+    // taking tpch_qty's C++ operator to 12.1 ms against the FPGA's 15.0. See 9.34.
+    std::vector<std::pair<T, uint64_t>> ord;
+
+    // Pass 1 -- per-thread, per-partition counts, so the scatter can write to exact offsets with no
+    // synchronisation at all.
+    std::vector<std::vector<size_t>> cnt(nt, std::vector<size_t>(P, 0));
+    ParallelRanges(n, nt, [&](size_t t, size_t lo, size_t hi) {
+        auto &c = cnt[t];
+        for (size_t i = lo; i < hi; i++) {
+            c[hash_of(static_cast<U>(v[i])) & PMASK]++;
+        }
+    });
+
+    // Exclusive prefix sums: pstart[p] is where partition p begins, off[t][p] where thread t writes.
+    std::vector<size_t> pstart(P + 1, 0);
+    for (size_t p = 0; p < P; p++) {
+        size_t sum = 0;
+        for (size_t t = 0; t < nt; t++) {
+            sum += cnt[t][p];
+        }
+        pstart[p + 1] = pstart[p] + sum;
+    }
+    std::vector<std::vector<size_t>> off(nt, std::vector<size_t>(P, 0));
+    for (size_t p = 0; p < P; p++) {
+        size_t run = pstart[p];
+        for (size_t t = 0; t < nt; t++) {
+            off[t][p] = run;
+            run += cnt[t][p];
+        }
+    }
+
+    // Pass 2 -- scatter. Disjoint destinations by construction, so no atomics.
+    //
+    // NOT std::vector: it value-initialises, i.e. memsets all 480 MB (sf10) on ONE thread before the
+    // scatter overwrites every byte of it -- 229 ms, which is 35 % of this operator. `new T[n]` on a
+    // trivially-constructible T default-initialises, i.e. does nothing. Same trap as 9.24 step 12c;
+    // measured in 9.31 (the scatter itself runs at 50 GB/s, already at memory bandwidth).
+    std::unique_ptr<T[]> buf_owner(new T[n]);
+    T *const             buf = buf_owner.get();
+    ParallelRanges(n, nt, [&](size_t t, size_t lo, size_t hi) {
+        auto local = off[t]; // by value: keeps the cursors in registers/L1 rather than shared memory
+        for (size_t i = lo; i < hi; i++) {
+            buf[local[hash_of(static_cast<U>(v[i])) & PMASK]++] = v[i];
+        }
+    });
+    const double part_ms = ms_since(t0);
+
+    // Pass 3 -- aggregate each partition independently. This is what replaces the serial merge.
+    auto                                              t_agg = TimingClock::now();
+    std::vector<std::vector<std::pair<T, uint64_t>>>  pairs(P);
+    const size_t                                      agg_nt = std::min<size_t>(nt, P);
+    ParallelRanges(P, agg_nt, [&](size_t, size_t plo, size_t phi) {
+        std::unordered_map<T, uint64_t> m;
+        for (size_t p = plo; p < phi; p++) {
+            const size_t len = pstart[p + 1] - pstart[p];
+            m.clear();
+            m.reserve(len / 4 + 16);
+            for (size_t i = pstart[p]; i < pstart[p + 1]; i++) {
+                m[buf[i]]++;
+            }
+            pairs[p].assign(m.begin(), m.end());
+        }
+    });
+    buf_owner.reset(); // release the scatter buffer before the sort allocates
+    const double agg_ms = ms_since(t_agg);
+
+    n_distinct = 0;
+    for (size_t p = 0; p < P; p++) {
+        n_distinct += pairs[p].size();
+    }
+    group_ms = ms_since(t0);
+    part_out = part_ms;
+    agg_out  = agg_ms;
+
+    // ---- ecum + eq: ORDER BY v, cumulative count, first value past each rank -------------------
+    // t1 starts BEFORE the concatenation on purpose. An earlier version started it after, which left
+    // the 15 MB gather (and its first-touch faults) in an untimed gap -- the phases then no longer
+    // summed to `heavy` (16.9 ms unaccounted on extprice) and made the parallel sort look better than
+    // it is. Same class of mistake as 9.31, so: every millisecond between t_all and the end must live
+    // inside exactly one phase timer.
+    auto t1 = TimingClock::now();
+    ord.reserve(n_distinct);
+    for (size_t p = 0; p < P; p++) {
+        ord.insert(ord.end(), pairs[p].begin(), pairs[p].end());
+        std::vector<std::pair<T, uint64_t>>().swap(pairs[p]);
+    }
+    ParallelSortPairs<T>(ord.data(), ord.size(), nt);
+
+    // The SQL's integer, divider-free percentile test: cc*4 >= t for q1 and cc*4 >= 3*t for q3,
+    // where t = sum(c) = n. cc <= n, so cc*4 cannot overflow uint64 for any realistic n.
+    const uint64_t t_total = static_cast<uint64_t>(n);
+    T              q1 = ord.empty() ? T {} : ord.back().first;
+    T              q3 = q1;
+    bool           have_q1 = false, have_q3 = false;
+    uint64_t       cc = 0;
+    for (const auto &e : ord) {
+        cc += e.second;
+        if (!have_q1 && cc * 4 >= t_total) {
+            q1      = e.first;
+            have_q1 = true;
+        }
+        if (!have_q3 && cc * 4 >= 3 * t_total) {
+            q3      = e.first;
+            have_q3 = true;
+            break; // q3 >= q1 always, so nothing after this can change either
+        }
+    }
+    T lo, hi;
+    IqrFences<T>(q1, q3, lo, hi);
+    // Release the pair array here, inside the phase that owns it. Left to the destructor at function
+    // return it would free ~15 MB (at D = 933,900) inside `heavy` but outside every phase timer -- a
+    // 2.09 ms residual that stopped the phases summing to `heavy`. See the t1 note above: every
+    // millisecond between t_all and the end must live inside exactly one phase timer.
+    std::vector<std::pair<T, uint64_t>>().swap(ord);
+    order_ms = ms_since(t1);
+
+    // ---- the labeling pass, byte-identical to iqr_cpu_flags ------------------------------------
+    auto t2 = TimingClock::now();
+    ComputeFlagMask<T>(v, n, lo, hi, mask, nt);
+    flag_ms = ms_since(t2);
+
+    return "q1=" + std::to_string(q1) + " q3=" + std::to_string(q3) + " lo=" + std::to_string(lo) +
+           " hi=" + std::to_string(hi);
+}
+
+void RunHeavyPhaseCpuGroupBy(ClientContext &context, const IqrFlagsBindData &bind,
+                             IqrCpuGlobalState &gstate) {
+    const size_t nt    = CpuThreadCount(context);
+    auto         t_all = TimingClock::now();
+
+    CpuColumn                  values;
+    auto                       t_read  = TimingClock::now();
+    const size_t               n       = ReadColumnCpu(context, bind, nt, values);
+    const double               read_ms = ms_since(t_read);
+    gstate.num_elements                = n;
+    if (n == 0) {
+        return;
+    }
+    gstate.flags.reset(new uint8_t[(n + 7) / 8]);
+
+    const int64_t *vals = values.ptr;
+    double         group_ms = 0.0, order_ms = 0.0, flag_ms = 0.0, part_ms = 0.0, agg_ms = 0.0;
+    size_t         n_distinct = 0;
+    std::string    fences =
+        bind.is_signed ? IqrCpuCoreGroupBy<int64_t>(vals, n, nt, gstate.flags.get(), group_ms,
+                                                    order_ms, flag_ms, n_distinct, part_ms, agg_ms)
+                          : IqrCpuCoreGroupBy<uint64_t>(vals, n, nt, gstate.flags.get(), group_ms,
+                                                        order_ms, flag_ms, n_distinct, part_ms, agg_ms);
+
+    // Same fairness rule as iqr_cpu_flags: the column release is a real cost of holding the whole
+    // column, so it is counted inside `heavy` (RESULTS.md 9.18 Defect 3).
+    auto         t_free  = TimingClock::now();
+    values.Release();
+    const double free_ms = ms_since(t_free);
+
+    if (timing_enabled()) {
+        std::fprintf(stderr,
+                     "[iqr-cpu-gb] rows=%zu  threads=%zu  distinct=%zu  %s\n"
+                     "[iqr-cpu-gb]   read    %8.2f ms   <- DuckDB parquet decode of the target column\n"
+                     "[iqr-cpu-gb]   group   %8.2f ms   <- GROUP BY v: radix-partitioned (partition %.2f + aggregate %.2f)\n"
+                     "[iqr-cpu-gb]   order   %8.2f ms   <- ORDER BY v over the %zu distinct + cumulative scan\n"
+                     "[iqr-cpu-gb]   flags   %8.2f ms   <- fence compare into the packed bitmask\n"
+                     "[iqr-cpu-gb]   free    %8.2f ms   <- release the materialised column\n"
+                     "[iqr-cpu-gb]   heavy   %8.2f ms   <- everything before DuckDB emits a single row\n",
+                     n, nt, n_distinct, fences.c_str(), read_ms, group_ms, part_ms, agg_ms,
+                     order_ms, n_distinct, flag_ms, free_ms, ms_since(t_all));
+    }
+}
+
+unique_ptr<GlobalTableFunctionState> IqrCpuGroupByInitGlobal(ClientContext &context,
+                                                             TableFunctionInitInput &input) {
+    auto &bind   = input.bind_data->Cast<IqrFlagsBindData>();
+    auto  gstate = make_uniq<IqrCpuGlobalState>();
+    RunHeavyPhaseCpuGroupBy(context, bind, *gstate);
+    return std::move(gstate);
 }
 
 // iqr_profiler() -> one row of the RAW StreamProfiler counters (regs 7-14), cumulative since the
@@ -1861,6 +2431,14 @@ void RegisterOasisIqrFunction(ExtensionLoader &loader) {
                                 IqrCpuFlagsFunction, IqrCpuFlagsBind, IqrCpuFlagsInitGlobal,
                                 IqrFlagsInitLocal);
     loader.RegisterFunction(iqr_cpu_flags);
+
+    // Direct transliteration of the SQL baseline (GROUP BY + ORDER BY) rather than the histogram
+    // zoom. Same bind, same schema, same read and emit paths as iqr_cpu_flags -- see RESULTS.md 9.29.
+    TableFunction iqr_cpu_flags_groupby("iqr_cpu_flags_groupby",
+                                        {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                        IqrCpuFlagsFunction, IqrCpuFlagsBind,
+                                        IqrCpuGroupByInitGlobal, IqrFlagsInitLocal);
+    loader.RegisterFunction(iqr_cpu_flags_groupby);
 
     // Raw StreamProfiler read (no args): SELECT * FROM iqr_profiler(); returns the cumulative regs 7-14
     // so you can snapshot/subtract manually around your own queries (accumulation under your control).

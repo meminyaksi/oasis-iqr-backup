@@ -187,3 +187,50 @@ class IqrDetectionTest(fpga_test_case.FPGATestCase):
             data[pos] = 15 if pos % 2 == 0 else 0
         self._run(data)
         self.assert_simulation_output()
+
+    # -- 4096-bin change -------------------------------------------------------
+    # These validate IQR_detection at NUM_BINS=4096 (the production bin count, up from
+    # 1024). BIN_IDX_WIDTH, the clear/quartile scan bound and scan_cnt all widen to
+    # $clog2(4096)=12; the histogram banks quadruple. The reference model already mirrors
+    # the hardware binning bit-for-bit, so `assert_simulation_output` at num_bins=4096
+    # proves the widened datapath is correct. Numbers below were computed offline with this
+    # file's own reference model. See compact.md (fence-vs-cluster: 1024 bins miss taxi_d3
+    # by 31,791; 4096 -> ~8 ppm).
+
+    def test_bins_above_1024_resolved(self):
+        # THE plumbing proof: values whose quartiles live ABOVE bin 1023 must be resolved,
+        # not clamped. With bin_shift=0 each integer is its own bin, so a spread with Q1/Q3
+        # in [1000,3000] only bins correctly at 4096 -- at 1024 every value >=1024 collapses
+        # into bin 1023, Q1==Q3==1023, IQR==0, the fences degenerate and ALL 384 rows flag
+        # (verified). At 4096 the fences are (-96, 4208) and exactly the 6 planted high
+        # outliers flag. If the bin index / scan bound were still 10 bits this fails.
+        rng = random.Random(4096)
+        data = [rng.randint(1000, 3000) for _ in range(378)]
+        data += [9000, 9000, 9000, 6000, 5000, 4300]   # 6 genuine outliers (> upper fence)
+        # Reference model at 4096: 6 outliers; at a clamped 1024 it would be 384.
+        assert sum(flags(data, 4096, 0, 0)) == 6
+        assert sum(flags(data, 1024, 0, 0)) == 384       # what a 10-bit index would produce
+        self._run(data, num_bins=4096, bin_shift=0, bin_min=0)
+        self.assert_simulation_output()
+
+    def test_fence_cluster_1024_misses_4096_resolves(self):
+        # Taxi_d3's failure mode in miniature, and the whole reason for the change. Pinned
+        # quartiles (Q1~2000, Q3~8000 -> upper fence 15668) with a dense 300-row cluster at
+        # 15670, one step past the fence. Over this range (span 13670) the coarse 1024-bin
+        # grid (bin_shift 4, width 16) rounds the fence ABOVE the cluster -> 0 outliers, a
+        # 300-row UNDERCOUNT. The 4096-bin grid (bin_shift 2, width 4) keeps the fence at
+        # 15668 and flags all 300 -- identical to the exact, unbinned answer. All three
+        # numbers verified offline against this file's reference model.
+        data = ([2000] * 250) + list(range(2000, 8000, 12)) + ([8000] * 250) + ([15670] * 300)
+        assert len(data) == 1300
+        lo = min(data)                                   # 2000
+        span = max(data) - lo                            # 13670
+        exact = sum(flags(data, span + 1, 0, lo))        # bin width 1 -> the true answer
+        count_4096 = sum(flags(data, 4096, 2, 2000))
+        count_1024 = sum(flags(data, 1024, 4, 2000))     # ceil(13670/1024)=14 -> shift 4
+        print(f"\n[fence-cluster] exact={exact}  4096-bin={count_4096}  1024-bin={count_1024}")
+        assert exact == 300 and count_4096 == 300        # 4096 == exact
+        assert count_1024 == 0                           # 1024 misses the entire cluster
+        # The RTL at 4096 must reproduce the exact answer (300 outliers, the cluster).
+        self._run(data, num_bins=4096, bin_shift=2, bin_min=2000)
+        self.assert_simulation_output()

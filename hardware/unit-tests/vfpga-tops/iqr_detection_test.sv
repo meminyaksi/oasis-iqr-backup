@@ -60,6 +60,15 @@ for (genvar I = 1; I < N_STRM_AXI; I++) begin
     always_comb axis_host_recv[I].tie_off_s();
 end
 
+// Card/HBM streams are unused by this operator; tie them off so their tvalid is defined (the coyote
+// AXI monitor fatals on an undriven tvalid). Mirrors the production vfpga_top.svh tie-off.
+for (genvar C = 0; C < N_CARD_AXI; C++) begin : g_card_send_tie
+    always_comb axis_card_send[C].tie_off_m();
+end
+for (genvar C = 0; C < N_CARD_AXI; C++) begin : g_card_recv_tie
+    always_comb axis_card_recv[C].tie_off_s();
+end
+
 // -- Fix clock and reset names -------------------------------------------------------------------
 logic clk;
 logic rst_n;

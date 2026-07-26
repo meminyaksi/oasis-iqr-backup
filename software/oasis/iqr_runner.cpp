@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -239,6 +240,71 @@ static size_t flag_bytes_for(size_t num_elements) {
     return beats * FLAG_BYTES_PER_BEAT;
 }
 
+// -- Ragged-chunk flag stitch -----------------------------------------------------------------------
+// When pass 2 streams several chunks (one Coyote transfer per row group), the device asserts `last`
+// only on the final chunk, and FlagBitPacker shifts in 8 bits per beat regardless of the beat's keep.
+// So each chunk c lands as 8*ceil(nv_c/8) bits -- its nv_c flags plus up to 7 zero PAD bits when the
+// chunk is not a whole number of 8 elements. The packing is dense (matches flag_bytes_for) only when
+// every chunk except the last is a multiple of 8; a ragged INTERMEDIATE chunk leaves pad bits mid-
+// stream that shift every later flag. These two helpers plus repack_ragged_flags() size the drain for
+// that padded footprint and fold it back into the dense 1-bit-per-element bitmask the caller expects.
+// (Byte-alignment of each chunk in the packed stream is the reason a host-only stitch suffices -- no
+// bitstream. It holds iff consecutive stream transfers are beat-aligned; validated by the taxi 3-way
+// correctness test with ragged streaming enabled.)
+static bool has_intermediate_ragged(const std::vector<IqrRunner::InputChunk> &chunks) {
+    if (chunks.size() < 2) return false;
+    for (size_t i = 0; i + 1 < chunks.size(); i++)
+        if ((chunks[i].second / sizeof(int64_t)) % 8 != 0) return true;
+    return false;
+}
+
+static size_t padded_flag_bytes(const std::vector<IqrRunner::InputChunk> &chunks) {
+    size_t padded_bits = 0;
+    for (const auto &c : chunks)
+        padded_bits += ((c.second / sizeof(int64_t) + 7) / 8) * 8;   // byte-padded per chunk
+    size_t beats = (padded_bits + FLAG_BITS_PER_BEAT - 1) / FLAG_BITS_PER_BEAT;
+    return beats * FLAG_BYTES_PER_BEAT;
+}
+
+// Fold a byte-padded-per-chunk flag buffer (see has_intermediate_ragged) into a dense, contiguous
+// 1-bit-per-element bitmask. Each chunk's flags start on a BYTE boundary in `padded` (the device
+// shifts whole bytes), so the source read is byte-aligned; the destination is fully packed. Verified
+// exhaustively offline against a brute-force reference (bench/repack_ragged_flags_test.cpp).
+std::shared_ptr<libstf::Buffer>
+IqrRunner::repack_ragged_flags(const std::shared_ptr<libstf::Buffer> &padded,
+                               const std::vector<InputChunk> &chunks, size_t num_elements) {
+    const uint8_t *src       = static_cast<const uint8_t *>(padded->ptr);
+    size_t         dst_bytes = flag_bytes_for(num_elements);
+    void          *ptr       = nullptr;
+    auto           status    = ctx_.memory_pool()->allocate(dst_bytes, &ptr);
+    if (!status.ok()) {
+        throw std::runtime_error("IqrRunner: failed to allocate flag repack buffer: " +
+                                 status.message());
+    }
+    auto    dst = static_cast<uint8_t *>(ptr);
+    std::memset(dst, 0, dst_bytes);
+
+    // OR the low n (<=8) bits of `bits` into dst at bit position `bit` (LSB-first, matching the emit
+    // loop's mask[i>>3]>>(i&7)). Spans at most two bytes.
+    auto put_bits = [](uint8_t *d, size_t bit, uint8_t bits, int n) {
+        for (int j = 0; j < n; j++)
+            if ((bits >> j) & 1u) d[(bit + j) >> 3] |= static_cast<uint8_t>(1u << ((bit + j) & 7));
+    };
+
+    size_t src_bit = 0;   // byte-aligned at each chunk boundary
+    size_t dst_bit = 0;   // contiguous
+    for (const auto &c : chunks) {
+        size_t         nv   = c.second / sizeof(int64_t);
+        const uint8_t *sb   = src + (src_bit >> 3);   // src_bit is a multiple of 8
+        size_t         full = nv >> 3;
+        int            rem  = static_cast<int>(nv & 7);
+        for (size_t b = 0; b < full; b++) { put_bits(dst, dst_bit, sb[b], 8); dst_bit += 8; }
+        if (rem) { put_bits(dst, dst_bit, sb[full], rem); dst_bit += static_cast<size_t>(rem); }
+        src_bit += ((nv + 7) / 8) * 8;               // past this chunk's byte-padded footprint
+    }
+    return libstf::make_buffer(ctx_.memory_pool(), ptr, dst_bytes, dst_bytes);
+}
+
 void IqrRunner::begin_fused(int64_t bin_min, uint64_t bin_shift, size_t expected_elements) {
     if (use_card_) {
         throw std::runtime_error("IqrRunner: begin_fused() is not supported with use_card");
@@ -335,14 +401,20 @@ IqrRunner::Result IqrRunner::finish_fused(const std::vector<InputChunk> &inputs)
         pass2_chunks.assign(1, InputChunk {idx_buffer->ptr, idx_bytes_});
     }
 
-    size_t out_bytes = flag_bytes_for(result.num_elements);
-    auto   handle    = ctx_.bypass_receiver().acquire(out_bytes);
+    // Pass 2 streams pass2_chunks (the value chunks, or a single index buffer in idx_mode). Ragged
+    // intermediate value chunks make the device byte-pad each one; size for that and fold back below.
+    // The idx_mode buffer is a single chunk, so this reduces to the dense path.
+    const bool ragged    = has_intermediate_ragged(pass2_chunks);
+    size_t     out_bytes = ragged ? padded_flag_bytes(pass2_chunks)
+                                   : flag_bytes_for(result.num_elements);
+    auto       handle    = ctx_.bypass_receiver().acquire(out_bytes);
 
     auto t_pass0 = std::chrono::steady_clock::now();
     stream_pass(pass2_chunks, coyote::STRM_HOST, static_cast<int64_t>(ctx_.iqrStream())); // pass 2
 
     auto t_drained   = collect_result(result, out_bytes, *handle);
     result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
+    if (ragged) result.flags = repack_ragged_flags(result.flags, pass2_chunks, result.num_elements);
 
     iqr_config_->set_fuse_enable(false);   // leave the device on the legacy path
     iqr_config_->set_idx_mode(false);
@@ -399,7 +471,9 @@ IqrRunner::Result IqrRunner::finish_overlapped(const std::vector<InputChunk> &in
         return result;
     }
 
-    size_t out_bytes = flag_bytes_for(result.num_elements);
+    const bool ragged    = has_intermediate_ragged(inputs);
+    size_t     out_bytes = ragged ? padded_flag_bytes(inputs)
+                                  : flag_bytes_for(result.num_elements);
 
     // The flag destination must be enqueued before the FLAG pass emits. Pass 1 is already in flight
     // but emits nothing, so acquiring here -- after the histogram, before pass 2 -- is in time.
@@ -412,6 +486,7 @@ IqrRunner::Result IqrRunner::finish_overlapped(const std::vector<InputChunk> &in
 
     auto t_drained = collect_result(result, out_bytes, *handle);
     result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
+    if (ragged) result.flags = repack_ragged_flags(result.flags, inputs, result.num_elements);
     return result;
 }
 
@@ -452,8 +527,13 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     const uint32_t strm_kind = use_card_ ? coyote::STRM_CARD : coyote::STRM_HOST;
     const int64_t  dest      = use_card_ ? CARD_STREAM : static_cast<int64_t>(ctx_.iqrStream());
 
-    // 2. Flag output size (dense 1-bit-per-element bitmask, whole 512-bit beats).
-    size_t out_bytes = flag_bytes_for(result.num_elements);
+    // 2. Flag output size (dense 1-bit-per-element bitmask, whole 512-bit beats). When pass 2 streams
+    // ragged intermediate chunks the device byte-pads each one, so the drain must be sized for that
+    // larger footprint and folded back to dense below. Card mode stages one contiguous buffer, so
+    // pass_inputs is a single chunk and this reduces to the dense size.
+    const bool ragged    = has_intermediate_ragged(*pass_inputs);
+    size_t     out_bytes = ragged ? padded_flag_bytes(*pass_inputs)
+                                  : flag_bytes_for(result.num_elements);
 
     // 3. Zero the histogram, fenced ahead of the input DMA.
     clear_histogram_fenced();
@@ -476,6 +556,7 @@ IqrRunner::Result IqrRunner::run(const std::vector<InputChunk> &inputs) {
     // 6. Drain the flags and read back the diagnostics.
     auto t_drained = collect_result(result, out_bytes, *handle);
     result.passes_ms = std::chrono::duration<double, std::milli>(t_drained - t_pass0).count();
+    if (ragged) result.flags = repack_ragged_flags(result.flags, *pass_inputs, result.num_elements);
     return result;
 }
 

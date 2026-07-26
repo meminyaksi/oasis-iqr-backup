@@ -77,6 +77,20 @@ module IQR_detection #(
     // Index beats emitted this column, for the host to poll before draining the transfer.
     output logic [63:0]                           o_idx_beats,
 
+    // -- Step-2 WIDE flag output (index mode only) ---------------------------------------------
+    // In index mode, pass 2 compares all 32 indices of a beat in one cycle and emits their outlier
+    // bits here, 32 lanes wide, instead of dribbling 8 per cycle onto the value `out`. vFPGA top
+    // packs them with IqrWideFlagPack (32 bits/beat). This is the step-2 speedup: ~4x the flag
+    // throughput, so pass 2 finally runs faster and not just with less traffic (RESULTS.md 9.21).
+    // Idle when i_idx_mode is low (the value path uses `out`).
+    // Lane count = beat bits / IDX_BITS = 512/16 = 32 (IDX_BITS is a localparam declared below, so
+    // the wire-format 16 is written literally here).
+    output logic [$bits(value_t)*NUM_ELEMENTS/16 - 1:0] o_flagw_data,
+    output logic [$bits(value_t)*NUM_ELEMENTS/16 - 1:0] o_flagw_keep,
+    output logic                                  o_flagw_valid,
+    input  logic                                  i_flagw_ready,
+    output logic                                  o_flagw_last,
+
     ndata_i.s in,   // #(value_t, NUM_ELEMENTS) input values
     ndata_i.m out   // #(value_t, NUM_ELEMENTS) results (driven later)
 );
@@ -89,9 +103,23 @@ module IQR_detection #(
     // Step 2 wire format, fixed by hardware/src/hdl/iqr_index.sv: 16 bits per element =
     // 14-bit signed half-bin index + an `exact` bit. 14 is not negotiable -- 13 loses outliers
     // (tb_iqr_index: 844 mismatches). FIDX_W is the wider space the fences live in.
+    //
+    // WIDTH IS ONLY EXACT FOR NUM_BINS <= 1024. TRAP 2 in iqr_index.sv bounds the reachable fence
+    // index at ~5*(NUM_BINS-1): +5115 at 1024 bins (fits IDX_W=14, +-8191), but ~+20475 at 4096 bins
+    // -- which a 14-bit index SATURATES, silently missing far outliers. The value/histogram path
+    // (what ships) does NOT use these encoders, so 4096 bins are safe there; index mode is refused at
+    // >1024 bins in the host (IqrRunner::enable_index_pass2). Re-widen IDX_W->16 / IDX_BITS->32 (and
+    // the /16 sites: o_flagw_data, IQR_FLAGW_LANES, host IDX_PER_BEAT) before enabling it at 4096.
     localparam int IDX_BITS = 16;
     localparam int IDX_W    = 14;
     localparam int FIDX_W   = 20;
+
+    // Step-2 wide flag consumer signals (instance further below). Declared here because the FLAG-state
+    // FSM references idxf_valid/idxf_last for its index-mode exit.
+    localparam int IDXF_LANES = (VALUE_WIDTH*NUM_ELEMENTS) / IDX_BITS;   // 32
+    logic                     idxf_in_valid, idxf_in_ready;
+    logic [IDXF_LANES - 1:0]  idxf_flags, idxf_keep;
+    logic                     idxf_valid, idxf_last;
 
     typedef enum logic [1:0] {
         HISTOGRAM,
@@ -552,6 +580,9 @@ module IQR_detection #(
         // the request once and clears it after emitting, so this cannot double-emit.
         .i_flush((state == HISTOGRAM) && last_seen),
         .i_restart(clear_req),
+        // So the final full beat carries o_last when the column is an exact multiple of 32 elements
+        // (no flush beat). Without it the host's index drain hangs -- the ov_uniform silicon failure.
+        .i_expected(i_expected),
         .o_data(o_idx_data), .o_valid(o_idx_valid), .o_ready_in(i_idx_ready), .o_last(o_idx_last),
         .o_beats(o_idx_beats)
     );
@@ -733,10 +764,12 @@ module IQR_detection #(
                     // (combinational passthrough below). Finish on the last beat
                     // actually transferred (in.ready == out.ready here).
                     //
-                    // Index mode finishes on the OUTPUT's last instead: one input beat yields up to
-                    // 4 flag beats, so the final input beat is consumed several cycles before the
-                    // last flag leaves. Leaving on the input's last would truncate the column.
-                    if (i_idx_mode ? (out.valid && out.ready && out.last)
+                    // Index mode finishes on the WIDE flag output's last: the value `out` is idle in
+                    // index mode, and one input index beat is consumed the same cycle its 32 flags are
+                    // handed to the wide packer, so idxf_last on an accepted wide beat is the column's
+                    // end. (The wide packer's own tail flush drains afterwards, steered on valid in the
+                    // top -- see vfpga_top.)
+                    if (i_idx_mode ? (idxf_valid && i_flagw_ready && idxf_last)
                                    : (in.valid && in.ready && in.last)) begin
                         state      <= HISTOGRAM;
                         clearing   <= 1'b1;        // re-clear banks for next dataset
@@ -747,14 +780,11 @@ module IQR_detection #(
         end
     end
 
-    // -- Step 2: pass-2 index consumer ---------------------------------------------------------
-    // Active only in FLAG and only in index mode. It takes one 512-bit beat of 32 indices and
-    // hands back 4 beats of NUM_ELEMENTS flags, which is exactly the shape the value path emits --
-    // so everything downstream of `out` (FlagBitPacker included) is unchanged.
-    logic                      idxf_in_valid, idxf_in_ready;
-    logic [NUM_ELEMENTS - 1:0] idxf_flags, idxf_keep;
-    logic                      idxf_valid, idxf_last;
-
+    // -- Step 2: pass-2 index consumer (WIDE) --------------------------------------------------
+    // Active only in FLAG and only in index mode. It takes one 512-bit beat of 32 indices, compares
+    // them all in one cycle, and emits all 32 outlier bits as one wide flag beat on o_flagw_* (packed
+    // by IqrWideFlagPack in the top). This is the step-2 speedup: the value path's `out` is left idle
+    // in index mode, and pass 2 produces ~32 flags/cycle instead of 8.
     logic [VALUE_WIDTH*NUM_ELEMENTS - 1:0] in_flat;
     always_comb for (int i = 0; i < NUM_ELEMENTS; i++) in_flat[i*VALUE_WIDTH +: VALUE_WIDTH] = in.data[i];
 
@@ -762,7 +792,7 @@ module IQR_detection #(
     assign idxf_in_valid = idx_flag_active && in.valid;
 
     IqrIndexFlag #(
-        .NUM_ELEMENTS(NUM_ELEMENTS), .IDX_BITS(IDX_BITS), .IDX_W(IDX_W), .FIDX_W(FIDX_W),
+        .IDX_BITS(IDX_BITS), .IDX_W(IDX_W), .FIDX_W(FIDX_W),
         .IN_W(VALUE_WIDTH*NUM_ELEMENTS)
     ) inst_idx_flag (
         .clk(clk), .rst_n(rst_n),
@@ -773,8 +803,14 @@ module IQR_detection #(
         .i_lo_fidx(lo_fidx_r), .i_hi_fidx(hi_fidx_r),
         .i_data(in_flat), .i_valid(idxf_in_valid), .o_ready(idxf_in_ready),
         .o_flags(idxf_flags), .o_keep(idxf_keep), .o_valid(idxf_valid),
-        .o_ready_in(out.ready), .o_last(idxf_last)
+        .o_ready_in(i_flagw_ready), .o_last(idxf_last)
     );
+
+    // Drive the wide flag output straight from the consumer (the top packs it).
+    assign o_flagw_data  = idxf_flags;
+    assign o_flagw_keep  = idxf_keep;
+    assign o_flagw_valid = idxf_valid;
+    assign o_flagw_last  = idxf_last;
 
     // -- Input ready ----------------------------------------------------------
     // Combinational so FLAG can backpressure straight from out.ready (zero-buffer
@@ -807,25 +843,17 @@ module IQR_detection #(
         out.keep  = '0;
         out.data  = '0;
 
-        if (state == FLAG) begin
-            if (i_idx_mode) begin
-                // Step 2: flags come from the index consumer, already 0/1 per lane.
-                out.valid = idxf_valid;
-                out.last  = idxf_last;
-                for (int i = 0; i < NUM_ELEMENTS; i++) begin
-                    out.data[i] = idxf_flags[i] ? value_t'(1) : value_t'(0);
-                    out.keep[i] = idxf_keep[i];
-                end
-            end else begin
-                out.valid = in.valid;
-                out.last  = in.last;
-                for (int i = 0; i < NUM_ELEMENTS; i++) begin
-                    sval        = is_signed ? $signed({{3{in.data[i][VALUE_WIDTH-1]}}, in.data[i]})
-                                            : $signed({3'b0, in.data[i]});
-                    is_outlier  = (sval < lower_fence) || (sval > upper_fence);
-                    out.data[i] = is_outlier ? value_t'(1) : value_t'(0);  // flag, not the value
-                    out.keep[i] = in.keep[i];                              // dense: no holes
-                end
+        // Only the VALUE path drives `out`. In index mode the flags leave on the wide o_flagw_*
+        // stream (packed by IqrWideFlagPack in the top), so `out` stays idle.
+        if ((state == FLAG) && !i_idx_mode) begin
+            out.valid = in.valid;
+            out.last  = in.last;
+            for (int i = 0; i < NUM_ELEMENTS; i++) begin
+                sval        = is_signed ? $signed({{3{in.data[i][VALUE_WIDTH-1]}}, in.data[i]})
+                                        : $signed({3'b0, in.data[i]});
+                is_outlier  = (sval < lower_fence) || (sval > upper_fence);
+                out.data[i] = is_outlier ? value_t'(1) : value_t'(0);  // flag, not the value
+                out.keep[i] = in.keep[i];                              // dense: no holes
             end
         end
     end

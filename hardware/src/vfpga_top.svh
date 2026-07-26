@@ -346,6 +346,15 @@ logic                        iqr_idx_ready;
 logic                        iqr_idx_last;
 logic [63:0]                 iqr_idx_beats;
 
+// Step-2 WIDE flag output: 32 outlier bits per cycle from the core, packed into 512-bit words by
+// IqrWideFlagPack. This is the step-2 speedup (RESULTS.md 9.21) -- pass 2 emits ~32 flags/cycle.
+localparam int IQR_FLAGW_LANES = (DATABEAT_SIZE*8) / 16;   // 512/16 = 32
+logic [IQR_FLAGW_LANES - 1:0] iqr_flagw_data;
+logic [IQR_FLAGW_LANES - 1:0] iqr_flagw_keep;
+logic                        iqr_flagw_valid;
+logic                        iqr_flagw_ready;
+logic                        iqr_flagw_last;
+
 ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_feed_in();
 IqrHistogramFeed #(
     .value_t(data64_t),
@@ -448,7 +457,7 @@ ndata_i #(data64_t, IQR_NUM_ELEMENTS) iqr_flags_nd();
 IQR_detection #(
     .value_t(data64_t),
     .NUM_ELEMENTS(IQR_NUM_ELEMENTS),
-    .NUM_BINS(1024),
+    .NUM_BINS(4096),
     .COUNT_WIDTH(32)
 ) inst_iqr_detection (
     .clk(clk),
@@ -475,6 +484,13 @@ IQR_detection #(
     .o_idx_last(iqr_idx_last),
     .o_idx_beats(iqr_idx_beats),
 
+    // Step-2 wide flag output (index mode): 32 flags/cycle, packed by IqrWideFlagPack below.
+    .o_flagw_data(iqr_flagw_data),
+    .o_flagw_keep(iqr_flagw_keep),
+    .o_flagw_valid(iqr_flagw_valid),
+    .i_flagw_ready(iqr_flagw_ready),
+    .o_flagw_last(iqr_flagw_last),
+
     .in(iqr_in),
     .out(iqr_flags_nd)
 );
@@ -490,6 +506,31 @@ FlagBitPacker #(
 
     .in(iqr_flags_nd),
     .out(iqr_packed)
+);
+
+// Step-2 WIDE packer: 32 flag bits/cycle -> 512-bit words, element e at bit e (same layout as
+// FlagBitPacker), so the host reads the bitmask identically. Only fed in index mode.
+logic [DATABEAT_SIZE*8 - 1:0] iqr_wpacked_data;
+logic                        iqr_wpacked_valid;
+logic                        iqr_wpacked_ready;
+logic                        iqr_wpacked_last;
+IqrWideFlagPack #(
+    .NUM_LANES(IQR_FLAGW_LANES),
+    .OUT_W(DATABEAT_SIZE*8)
+) inst_iqr_wide_packer (
+    .clk(clk),
+    .rst_n(rst_n),
+    .i_restart(iqr_clear_req),   // per-column clear: drop residual acc/flush state so a new column's
+                                 // first word cannot inherit the previous column's bits (§9.23 leak fix)
+    .i_flags(iqr_flagw_data),
+    .i_keep(iqr_flagw_keep),
+    .i_valid(iqr_flagw_valid),
+    .o_ready(iqr_flagw_ready),
+    .i_last(iqr_flagw_last),
+    .o_data(iqr_wpacked_data),
+    .o_valid(iqr_wpacked_valid),
+    .o_ready_in(iqr_wpacked_ready),
+    .o_last(iqr_wpacked_last)
 );
 
 // Profile the packed-flag output stream (back-pressure from the output writer / host DMA).
@@ -514,15 +555,29 @@ ndata_i #(data8_t, DATABEAT_SIZE) iqr_bytes_out();
 logic iqr_idx_take;
 assign iqr_idx_take = iqr_idx_mode && iqr_idx_valid;
 
-assign iqr_bytes_out.data  = iqr_idx_take ? iqr_idx_data  : iqr_packed.data;
-assign iqr_bytes_out.last  = iqr_idx_take ? iqr_idx_last  : iqr_packed.last;
-assign iqr_bytes_out.valid = iqr_idx_take ? 1'b1          : iqr_packed.valid;
-assign iqr_idx_ready       = iqr_idx_take ? iqr_bytes_out.ready : 1'b0;
-assign iqr_packed.ready    = iqr_idx_take ? 1'b0          : iqr_bytes_out.ready;
+// Pass-2 flag source: in index mode the WIDE packer (512-bit words, always full), else the 8-wide
+// FlagBitPacker. iqr_idx_mode is a per-query constant, so exactly one of these is ever active, and
+// the pass-1 index stream (iqr_idx_take) takes priority within index mode -- the two are disjoint in
+// time (indices during HISTOGRAM, flags during FLAG). Steering on valid, not state, keeps each
+// packer's tail flush safe.
+wire                        flag2_valid = iqr_idx_mode ? iqr_wpacked_valid : iqr_packed.valid;
+wire                        flag2_last  = iqr_idx_mode ? iqr_wpacked_last  : iqr_packed.last;
+
+assign iqr_bytes_out.data  = iqr_idx_take ? iqr_idx_data
+                           : (iqr_idx_mode ? iqr_wpacked_data : iqr_packed.data);
+assign iqr_bytes_out.last  = iqr_idx_take ? iqr_idx_last  : flag2_last;
+assign iqr_bytes_out.valid = iqr_idx_take ? 1'b1          : flag2_valid;
+
+assign iqr_idx_ready     = iqr_idx_take ? iqr_bytes_out.ready : 1'b0;
+// Wide packer drains only in index mode when the index stream is not being routed.
+assign iqr_wpacked_ready = (!iqr_idx_take &&  iqr_idx_mode) ? iqr_bytes_out.ready : 1'b0;
+assign iqr_packed.ready  = (!iqr_idx_take && !iqr_idx_mode) ? iqr_bytes_out.ready : 1'b0;
+
 for (genvar K = 0; K < IQR_NUM_ELEMENTS; K++) begin : g_iqr_keep_out
-    // Index beats are always full words (the packer zero-pads the tail; the host masks it off
-    // against the element count), so keep is all ones for them.
-    assign iqr_bytes_out.keep[K * 8 +: 8] = iqr_idx_take ? 8'hFF : {8{iqr_packed.keep[K]}};
+    // Index beats and wide-packed words are always full 512-bit words (tail zero-padded, host masks
+    // against N), so keep is all ones; only the 8-wide value packer carries a per-lane keep.
+    assign iqr_bytes_out.keep[K * 8 +: 8] =
+        (iqr_idx_take || iqr_idx_mode) ? 8'hFF : {8{iqr_packed.keep[K]}};
 end
 
 NDataToAXI #(data8_t, DATABEAT_SIZE) inst_iqr_ndata_to_axi (
