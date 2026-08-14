@@ -1,5 +1,49 @@
 # RESUME DOC — IQR FPGA vs CPU (updated 2026-08-08: **WNS ARC DONE at −0.518 ns, HBM REMOVED, PRODUCTION = `build-29/bitstreams/cyt_top_b29_po.bit`** (4/4 silicon gates). Focus has MOVED to **microbenchmarks → `micro_bench.md`** (Test 1 size sweep, Test 2 cardinality sweep both complete). Next: Test 3.)
 
+> 💾 **BACKUP / RECOVERY (2026-08-14) — read this FIRST if the cluster home directory was wiped.**
+>
+> `meminyaksi` has **READ-only** on `celeris-labs/oasis` and `celeris-labs/celeris`, so `git push
+> origin` fails 403. Everything is mirrored to two **private** repos instead, each wired as a
+> `backup` remote beside `origin`:
+>
+> | repo | what it is | files |
+> |---|---|--:|
+> | `meminyaksi/celeris-backup` → `~/celeris`, branch `feature/mehmet` | the **FPGA hardware** project: RTL operators, unit tests | 703 |
+> | `meminyaksi/oasis-iqr-backup` → `~/oasis`, branch `feature/iqr-integration` | the **DuckDB extension** project: host SW, benchmarks, paper, bitstream | 302 |
+>
+> **Both are required.** oasis contains celeris as a submodule but pins it at `c317559`, while
+> `~/celeris` is 4 commits beyond that — restoring oasis alone gives you an older hardware tree.
+>
+> ```bash
+> git clone -b feature/mehmet           https://github.com/meminyaksi/celeris-backup.git   ~/celeris
+> git clone -b feature/iqr-integration  https://github.com/meminyaksi/oasis-iqr-backup.git ~/oasis
+> cd ~/oasis && git submodule update --init --recursive && git lfs pull
+> ```
+>
+> Then follow **`patches/RESTORE.md`**: re-apply the two submodule patches (the `SSI_SpreadSLLs`
+> override lives in third-party `fpgasystems/Coyote` and CANNOT be committed anywhere reachable),
+> regenerate the datasets with `bench/gen_*.sh`, and rebuild `~/opt`.
+>
+> **The VSCode workspace is saved too**: open `oasis/software/celeris-oasis.code-workspace` — it
+> points at `../../celeris` and `..`, so cloning both side by side reproduces the exact tree.
+>
+> **Rescued from `.gitignore` and now tracked** (these were one wipe from gone): `hardware/pnr/` —
+> the four P&R sweep harnesses that drove the whole timing arc, plus build-29's WNS/utilisation/
+> directive evidence; `report_2807_*.log` + `bench/e2e_sweep_*.log` — the raw runs behind the
+> paper's numbers; celeris `hardware/pnr-evidence/`. The 43 MB production bitstream is in the oasis
+> backup **via git-LFS** (that commit is marked to drop before any upstream push).
+>
+> ⚠️ **`git add <dir>` silently skips ignored contents.** It bit twice here: `build*` matches
+> *filenames*, so `hardware/pnr/evidence/build-29-*.txt` vanished from a directory that had just
+> been staged, and `*.log` dropped the run logs. **Verify with `git ls-files <dir>`, not
+> `git status`.**
+>
+> Recovery was **verified by performing it**: fresh clone → all docs present, bitstream
+> md5-identical, `bench/paper_figs.py` regenerated every figure with no datasets on disk.
+>
+> ➡️ **When Jonas grants Write**, the work moves upstream in one command per repo:
+> `git push origin feature/mehmet` and `git push origin feature/iqr-integration`.
+
 **Read this first after a compact.** Three companion docs, each with a distinct job:
 - **`micro_bench.md`** — ⬅️ **CURRENT WORK.** Controlled synthetic sweeps, one variable at a time.
 - **`report_2807.md`** — the 7 REAL datasets, all END-TO-END/consume (numbers from build-23).
