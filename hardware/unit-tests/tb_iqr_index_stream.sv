@@ -19,11 +19,11 @@ module tb_iqr_index_stream;
 
     localparam int VALUE_WIDTH  = 64;
     localparam int NUM_ELEMENTS = 8;
-    localparam int IDX_BITS     = 16;
-    localparam int IDX_W        = 14;
+    localparam int IDX_BITS     = 32;   // build-24 re-widen: was 16
+    localparam int IDX_W        = 16;   // was 14 (covers 4096-bin fence indices)
     localparam int FIDX_W       = 20;
     localparam int OUT_W        = 512;
-    localparam int IDX_PER_BEAT = OUT_W / IDX_BITS;    // 32
+    localparam int IDX_PER_BEAT = OUT_W / IDX_BITS;    // 512/32 = 16
     localparam int FENCE_WIDTH  = VALUE_WIDTH + 3;
     localparam int CLK_HALF     = 2;
     localparam int MAX_N        = 600;

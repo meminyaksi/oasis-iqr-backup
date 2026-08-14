@@ -17,10 +17,27 @@ option(ENABLE_RDMA "Enable RDMA stack" ON)
 set(N_REGIONS 1)
 set(EN_STRM 1)
 
-# Enable card-memory (HBM) streams so the IQR passes can read the decoded column from HBM instead
-# of re-DMAing it from the host each pass. Adds axis_card_recv/send to the vFPGA + the HBM DMA path
-# to the shell (and the EN_MEM-gated card model to the co-sim). N_CARD_AXI defaults to 1.
-set(EN_MEM 1)
+# Card-memory (HBM) streams DISABLED. The IQR datapath never used HBM -- the vFPGA tied the card
+# interfaces off (the card read path was a dead end, RESULTS.md 9.17) -- so this removes ~40,010 LUTs
+# and ~67,194 FFs of dead silicon (build-27 553,061 LUTs -> build-26 513,051).
+#
+# HISTORY, so nobody re-runs the old experiment and draws the old conclusion: removing HBM under
+# `place_design -directive SSI_BalanceSLRs` made WNS WORSE by 0.66-0.68 ns (build-23 -1.879 vs
+# build-25 -2.562; build-27 -1.496 vs build-26 -2.154). The controller was acting as an accidental
+# FLOORPLAN ANCHOR pinning a block in SLR0; without it BalanceSLRs scattered the four ~77k-LUT
+# ColumnChunkDecoders across SLR boundaries (worst path crossed 4). That penalty was measured ONLY
+# under BalanceSLRs. Forcing `SSI_SpreadSLLs` instead (see pnr_shell.tcl.in) anchors the floorplan
+# DELIBERATELY -- it allocates extra area to high-connectivity regions, which is what the decoders
+# actually needed -- and is worth +0.338 ns on its own. So the anchor hack is no longer needed.
+#
+# ⚠️ BUILD WITH `OASIS_PLACE_DIRECTIVE=SSI_SpreadSLLs`. Without it the ML predictor picks BalanceSLRs
+# and this HBM-out config re-measures the old, wrong ~-2.15 answer.
+#
+# N_CARD_AXI stays 1: it is Coyote's minimum, because the generated wrapper declares
+# [N_CARD_AXI-1:0] ranges and 0 makes that [-1:0] (Synth 8-2908, "range width must be a positive
+# integer"). The vfpga_top.svh card tie-offs are `ifdef EN_MEM`-guarded (EN_MEM is #defined only when
+# nonzero, lynx_pkg_tmplt), so at EN_MEM=0 they compile out along with the vFPGA's card ports.
+set(EN_MEM 0)
 set(N_CARD_AXI 1)
 
 if(ENABLE_RDMA)

@@ -29,13 +29,15 @@
  * report them as INSIDE the fence and silently miss outliers. Hence `o_exact` -- "d is an exact
  * multiple of 2**s" -- which distinguishes d == g from d just above it.
  *
- * TRAP 2 -- the width is 14 bits, not 13. In HALF-bins the fence indices span
- *     f/(W/2) = 2*q1_bin - 3*(q3_bin-q1_bin)  >= -3069
- *     g/(W/2) = 2*q3_bin + 3*(q3_bin-q1_bin)  <=  5115      (q1_bin,q3_bin in [0,1023])
- * so the index must reach +5115 and -3069. 13-bit signed (+-4096) does NOT cover +5115.
- * IDX_W = 14 (+-8192) covers both with margin, and saturating there is safe precisely because every
- * reachable fence index is strictly inside it: a saturated index still compares on the correct side.
- * Get this width wrong and far-out outliers are missed silently -- gate on ov_drift.
+ * TRAP 2 -- the width tracks NUM_BINS. In HALF-bins the fence indices span
+ *     f/(W/2) = 2*q1_bin - 3*(q3_bin-q1_bin)  >= -3*(NUM_BINS-1)
+ *     g/(W/2) = 2*q3_bin + 3*(q3_bin-q1_bin)  <=  5*(NUM_BINS-1)   (q1_bin,q3_bin in [0,NUM_BINS-1])
+ * At 1024 bins that is +5115/-3069 (13-bit signed +-4096 does NOT cover +5115; IDX_W=14 does). At
+ * 4096 bins it is ~+20475/-12285, which IDX_W=14 (+-8191) would SATURATE and silently miss -- so the
+ * design re-widened to IDX_W = 16 (+-32768), which covers 4096 with margin. Saturating is safe
+ * precisely because every reachable fence index is strictly inside the range: a saturated data index
+ * still compares on the correct side. Get this width wrong and far-out outliers are missed silently
+ * -- gate on ov_drift. (>4096 bins would exceed +-32768 again; widen further or refuse in the host.)
  *
  * bin_shift == 0 (bin width 1) is the degenerate case: there is no half-bin, s = 0 and the index IS
  * d itself, so the compare is trivially exact.
@@ -48,7 +50,7 @@
 // -------------------------------------------------------------------------------------------------
 module IqrIndexEncode #(
     parameter int VALUE_WIDTH = 64,
-    parameter int IDX_W       = 14         // signed; see TRAP 2 above before changing
+    parameter int IDX_W       = 16         // signed; see TRAP 2 above before changing (16 covers 4096 bins)
 ) (
     input  logic [VALUE_WIDTH - 1:0]                 i_value,
     input  logic [VALUE_WIDTH - 1:0]                 i_bin_min,
@@ -144,7 +146,7 @@ endmodule
 // compares against the raw value with two narrow compares plus the exact-bit correction.
 // -------------------------------------------------------------------------------------------------
 module IqrIndexCompare #(
-    parameter int IDX_W  = 14,
+    parameter int IDX_W  = 16,
     parameter int FIDX_W = 20
 ) (
     input  logic signed [IDX_W - 1:0]   i_idx,

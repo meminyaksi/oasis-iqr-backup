@@ -3,11 +3,11 @@
 /**
  * Equivalence testbench for the pass-2 bin-index encoding.
  *
- * THE ONE QUESTION THIS ANSWERS: does comparing a 14-bit half-bin index against index-space fences
+ * THE ONE QUESTION THIS ANSWERS: does comparing a 16-bit half-bin index against index-space fences
  * give the SAME outlier bit as comparing the raw 64-bit value against the value-space fences, for
- * every value and every reachable window/quartile combination?
+ * every value and every reachable window/quartile combination (now at NUM_BINS=4096)?
  *
- * If yes, pass 2 can ship ~4x less data with no change in results, and the documented correctness
+ * If yes, pass 2 can ship ~2x less data with no change in results, and the documented correctness
  * numbers (taxi_d1 1247, taxi_d3 162, ov_drift 200 ...) stay valid. If no -- even for one input --
  * the whole optimisation is invalid, because a wrong flag still yields a plausible outlier COUNT and
  * would not be caught downstream.
@@ -25,14 +25,14 @@
  *   - values far outside the window in both directions (the saturation case)
  *   - bin_shift = 0 (no half-bin exists) and large bin_shift
  *   - q1_bin == q3_bin (IQR = 0, degenerate fences)
- *   - q1_bin/q3_bin at the extremes, where the fence index reaches +5115 / -3069 and would overflow
- *     a 13-bit encoding
+ *   - q1_bin/q3_bin at the extremes, where at 4096 bins the fence index reaches ~+20475 / -12285 and
+ *     would overflow a 14-bit encoding (the reason for the IDX_W 14->16 re-widen)
  */
 module tb_iqr_index;
 
     localparam int VALUE_WIDTH = 64;
-    localparam int NUM_BINS    = 1024;
-    localparam int IDX_W       = 14;
+    localparam int NUM_BINS    = 4096;   // build-24 re-widen: was 1024
+    localparam int IDX_W       = 16;     // was 14; +-32768 covers the 4096-bin fence indices (~+20475)
     localparam int FIDX_W      = 20;
     localparam int FENCE_WIDTH = VALUE_WIDTH + 3;
 
@@ -151,9 +151,10 @@ module tb_iqr_index;
         // bin_shift = 0: no half-bin exists, index == d.
         sweep_window(0,           0, 100, 900, 0);
         sweep_window(-5000,       0, 100, 900, 1);
-        // Quartiles at the extremes: fence index reaches ~+5115 / ~-3069, which overflows 13 bits.
-        sweep_window(0,           4,   0, 1023, 0);
-        sweep_window(0,           4, 1023, 1023, 0);
+        // Quartiles at the extremes: at 4096 bins the fence index reaches ~+20475 / ~-12285, which
+        // IDX_W=14 (+-8191) would saturate -- these are the cases that prove IDX_W=16 is wide enough.
+        sweep_window(0,           4,   0, NUM_BINS-1, 0);
+        sweep_window(0,           4, NUM_BINS-1, NUM_BINS-1, 0);
         sweep_window(0,           4,   0,    0, 0);
         // Degenerate IQR (q1 == q3) -> both fences equal -> only exact hits are inside.
         sweep_window(1000,        3, 500,  500, 0);

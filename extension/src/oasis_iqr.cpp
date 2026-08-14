@@ -288,7 +288,11 @@ size_t window_groups() {
 //   sf10     60.0M   0.85x -> 1.06x   won
 //
 // This is the same fixed-cost-vs-scaling-benefit arithmetic that keeps OASIS_IQR_OVERLAP off
-// (§9.15.1). 10M sits in the measured gap between extprice (lost) and taxi_d3 (won).
+// (§9.15.1). RAISED 10M -> 30M (build-21, 2026-07-27): once the ragged stitch let taxi_d3/d4 actually
+// fuse, medians showed fusion is a wall-clock LOSS at their sizes (op 36->43 / 54->62 ms) though a
+// CPU-seconds win (~2x). It only wins latency at sf10 scale (60M, §9.19). 30M keeps taxi_d3 (13M) and
+// taxi_d4 (20M) on the latency-optimal memcpy path while sf10+ still fuses. Fusion is verified per-row
+// exact for taxi when it does engage (obstacle-1 fixed) -- so a >30M taxi-shaped column fuses correctly.
 size_t fuse_min_rows() {
     static const size_t n = [] {
         const char *e = std::getenv("OASIS_IQR_FUSE_MIN_ROWS");
@@ -298,7 +302,7 @@ size_t fuse_min_rows() {
                 return static_cast<size_t>(v);
             }
         }
-        return static_cast<size_t>(10000000);
+        return static_cast<size_t>(30000000);
     }();
     return n;
 }
@@ -333,10 +337,14 @@ bool force_stream() {
 // force_stream(), which only preserves the count. Off by default until validated on silicon (the byte-
 // alignment of each chunk in the packed stream, which the stitch assumes, holds iff consecutive stream
 // transfers are beat-aligned; confirm with the taxi 3-way correctness test before making it default).
+// DEFAULT-ON (build-21, 2026-07-27): the host-side ragged stitch (repack_ragged_flags) is proven
+// per-row exact on taxi_d3/d4 (net_diff == per_row_mismatch: 104/104 and 0/0). So a >30M taxi-shaped
+// (odd-row-group) column fuses correctly instead of falling to memcpy. Set OASIS_IQR_STREAM_RAGGED=0
+// to force the old memcpy fallback. (No effect at default settings until FUSE is enabled and rows>30M.)
 bool stream_ragged_enabled() {
     static const bool on = [] {
         const char *e = std::getenv("OASIS_IQR_STREAM_RAGGED");
-        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+        return !e || !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
     }();
     return on;
 }
@@ -347,10 +355,13 @@ bool stream_ragged_enabled() {
 // sample (taxi_d3's count is bistable 1296479<->1328108 across group counts). Basing the width on the
 // IQR -- the quantity actually being resolved, from the densest/most stable percentiles -- keeps the
 // bins fine and stable. Off by default until validated against the trusted window path.
+// DEFAULT-ON (build-21, 2026-07-27): validated to fix taxi_d3 (31,496 -> 104) and taxi_d4 (-> exact) at
+// 4096 bins with no regression on d1/d2/tpch/extprice/sf10, and overlap 200/200 on ov_uniform/ov_drift.
+// Set OASIS_IQR_WINDOW_IQR=0 to fall back to the old p1/p99 span.
 bool window_iqr_rule() {
     static const bool on = [] {
         const char *e = std::getenv("OASIS_IQR_WINDOW_IQR");
-        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T');
+        return !e || !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
     }();
     return on;
 }
@@ -1122,6 +1133,24 @@ void RunHeavyPhase(ClientContext &context, const IqrFlagsBindData &bind, IqrFlag
                                      : runner.finish_overlapped(inputs));
     double           iqr_ms = ms_since(t_iqr);
     gstate.flags           = res.flags;
+
+    // OASIS_IQR_DUMP_FLAGS=/path: write the raw flag bitmask to disk for OFFLINE per-row validation of
+    // the fused/streaming path (which cannot be materialized in SQL without deadlocking the no-timeout
+    // receiver). Layout: uint64 N (little-endian), then ceil(N/8) mask bytes, 1 bit/row, LSB-first.
+    if (const char *dump = std::getenv("OASIS_IQR_DUMP_FLAGS")) {
+        if (dump[0] && gstate.flags && gstate.flags->ptr) {
+            if (std::FILE *fp = std::fopen(dump, "wb")) {
+                uint64_t nn = n;
+                std::fwrite(&nn, sizeof(nn), 1, fp);
+                std::fwrite(gstate.flags->ptr, 1, (n + 7) / 8, fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[iqr] dumped %zu flag bits (%zu bytes) to %s\n",
+                             n, (n + 7) / 8, dump);
+            } else {
+                std::fprintf(stderr, "[iqr] OASIS_IQR_DUMP_FLAGS: could not open %s for writing\n", dump);
+            }
+        }
+    }
 
     if (timing_enabled()) {
         std::fprintf(stderr,

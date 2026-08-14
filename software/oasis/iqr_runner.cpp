@@ -44,6 +44,17 @@ size_t IqrRunner::count_elements(const std::vector<InputChunk> &inputs) {
     return total;
 }
 
+// Size the window from the sample's interquartile spread instead of p1/p99. DEFAULT-ON (build-21):
+// mirrors window_iqr_rule() in oasis_iqr.cpp so the memcpy and fused paths agree. OASIS_IQR_WINDOW_IQR=0
+// falls back to p1/p99.
+static bool window_iqr_rule() {
+    static const bool on = [] {
+        const char *e = std::getenv("OASIS_IQR_WINDOW_IQR");
+        return !e || !(e[0] == '0' || e[0] == 'f' || e[0] == 'F' || e[0] == 'n' || e[0] == 'N');
+    }();
+    return on;
+}
+
 void IqrRunner::derive_window(const std::vector<InputChunk> &inputs) {
     // Stride-sample the column (cheap; only sizes the bins -- the FPGA still histograms every row).
     // Robust percentiles, not min/max, so a stray outlier cannot blow up the bin width.
@@ -92,8 +103,23 @@ void IqrRunner::derive_window(const std::vector<InputChunk> &inputs) {
 
     std::sort(sample.begin(), sample.end());
     size_t  m  = sample.size();
-    int64_t lo = sample[m * 1 / 100];                   // ~1st percentile
-    int64_t hi = sample[std::min(m - 1, m * 99 / 100)]; // ~99th percentile
+
+    // Window span rule. Default: robust [p1, p99]. With OASIS_IQR_WINDOW_IQR: [Q1-2*IQR, Q3+2*IQR],
+    // which ties bin width to the IQR and places the fence far more precisely on tail-heavy columns
+    // (taxi_d3: p1/p99 @4096 bins undercounts by ~31k; the IQR window lands it at ~104). Mirrors
+    // WindowFromSample() in oasis_iqr.cpp so the memcpy and fused paths derive an identical window.
+    int64_t lo, hi;
+    bool    used_iqr = false;
+    if (window_iqr_rule()) {
+        int64_t q1  = sample[m / 4];
+        int64_t q3  = sample[std::min(m - 1, m * 3 / 4)];
+        int64_t iqr = q3 - q1;
+        if (iqr > 0) { lo = q1 - 2 * iqr; hi = q3 + 2 * iqr; used_iqr = true; }
+    }
+    if (!used_iqr) {
+        lo = sample[m * 1 / 100];                     // ~1st percentile
+        hi = sample[std::min(m - 1, m * 99 / 100)];   // ~99th percentile
+    }
     int64_t range = hi - lo;
 
     if (range <= 0) {
@@ -173,9 +199,10 @@ void IqrRunner::clear_histogram_fenced() {
 }
 
 size_t IqrRunner::index_bytes_for(size_t n) {
-    // 32 indices per 512-bit beat, padded to a whole beat. The device zero-fills the tail and masks
-    // it against hist_expected, so the padding never reaches a flag.
-    constexpr size_t IDX_PER_BEAT = 32;
+    // 16 indices per 512-bit beat, padded to a whole beat. The device zero-fills the tail and masks
+    // it against hist_expected, so the padding never reaches a flag. (Re-widened 32 -> 16 for 4096
+    // bins: IDX_BITS moved 16 -> 32 in IQR_detection.sv, so 512/32 = 16 indices per beat.)
+    constexpr size_t IDX_PER_BEAT = 16;
     constexpr size_t BEAT_BYTES   = 64;
     return ((n + IDX_PER_BEAT - 1) / IDX_PER_BEAT) * BEAT_BYTES;
 }

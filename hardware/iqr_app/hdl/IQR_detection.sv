@@ -12,7 +12,13 @@ module IQR_detection #(
     parameter type value_t,
     parameter      NUM_ELEMENTS,
     parameter      NUM_BINS    = 16,         // generic bin count
-    parameter      COUNT_WIDTH = 32          // width of each bin counter
+    parameter      COUNT_WIDTH = 32,         // width of each bin counter
+    // Compile-time index-mode (step-2 packed-index pass 2) enable. DEFAULT OFF. Index mode was
+    // retired to reclaim timing: its IqrIndexPack 512-bit packer was the `idx_pack` critical-path
+    // cluster (WNS). With EN_INDEX=0 the IqrIndex* instances below are NOT generated and every
+    // i_idx_mode branch folds to the value path, so the synthesized design is value-only. The
+    // i_idx_mode/i_expected/o_idx_*/o_flagw_* ports are retained (CSR + host unchanged) but ignored.
+    parameter bit  EN_INDEX    = 1'b0
 ) (
     input logic clk,
     input logic rst_n,
@@ -83,10 +89,10 @@ module IQR_detection #(
     // packs them with IqrWideFlagPack (32 bits/beat). This is the step-2 speedup: ~4x the flag
     // throughput, so pass 2 finally runs faster and not just with less traffic (RESULTS.md 9.21).
     // Idle when i_idx_mode is low (the value path uses `out`).
-    // Lane count = beat bits / IDX_BITS = 512/16 = 32 (IDX_BITS is a localparam declared below, so
-    // the wire-format 16 is written literally here).
-    output logic [$bits(value_t)*NUM_ELEMENTS/16 - 1:0] o_flagw_data,
-    output logic [$bits(value_t)*NUM_ELEMENTS/16 - 1:0] o_flagw_keep,
+    // Lane count = beat bits / IDX_BITS = 512/32 = 16 (IDX_BITS is a localparam declared below, so
+    // the wire-format 32 is written literally here).
+    output logic [$bits(value_t)*NUM_ELEMENTS/32 - 1:0] o_flagw_data,
+    output logic [$bits(value_t)*NUM_ELEMENTS/32 - 1:0] o_flagw_keep,
     output logic                                  o_flagw_valid,
     input  logic                                  i_flagw_ready,
     output logic                                  o_flagw_last,
@@ -100,23 +106,26 @@ module IQR_detection #(
     localparam int VALUE_WIDTH   = $bits(value_t);
     localparam int BIN_IDX_WIDTH = (NUM_BINS > 1) ? $clog2(NUM_BINS) : 1;
 
-    // Step 2 wire format, fixed by hardware/src/hdl/iqr_index.sv: 16 bits per element =
-    // 14-bit signed half-bin index + an `exact` bit. 14 is not negotiable -- 13 loses outliers
-    // (tb_iqr_index: 844 mismatches). FIDX_W is the wider space the fences live in.
+    // Step 2 wire format, fixed by hardware/src/hdl/iqr_index.sv: IDX_BITS bits per element =
+    // a signed half-bin index (IDX_W bits) + an `exact` bit, the rest reserved. FIDX_W is the wider
+    // space the fences live in.
     //
-    // WIDTH IS ONLY EXACT FOR NUM_BINS <= 1024. TRAP 2 in iqr_index.sv bounds the reachable fence
-    // index at ~5*(NUM_BINS-1): +5115 at 1024 bins (fits IDX_W=14, +-8191), but ~+20475 at 4096 bins
-    // -- which a 14-bit index SATURATES, silently missing far outliers. The value/histogram path
-    // (what ships) does NOT use these encoders, so 4096 bins are safe there; index mode is refused at
-    // >1024 bins in the host (IqrRunner::enable_index_pass2). Re-widen IDX_W->16 / IDX_BITS->32 (and
-    // the /16 sites: o_flagw_data, IQR_FLAGW_LANES, host IDX_PER_BEAT) before enabling it at 4096.
-    localparam int IDX_BITS = 16;
-    localparam int IDX_W    = 14;
+    // RE-WIDENED FOR 4096 BINS (build-24). TRAP 2 in iqr_index.sv bounds the reachable fence index at
+    // ~5*(NUM_BINS-1): +5115 at 1024 bins (fit IDX_W=14, +-8191), but ~+20475 at 4096 bins -- which a
+    // 14-bit index would SATURATE, silently missing far outliers. IDX_W=16 (+-32768) covers +20475 with
+    // margin, so saturation stays safe (a saturated data index is still beyond every reachable fence).
+    // IDX_W=16 + the exact bit no longer fits a 16-bit slot, so IDX_BITS goes to 32 (the next
+    // beat-aligned width): 512/32 = 16 indices/beat, i.e. pass 2 moves 2x fewer beats than the value
+    // path instead of 4x -- still a win. The three former /16 sites moved to /32 with it: o_flagw_data/
+    // o_flagw_keep below, IQR_FLAGW_LANES in vfpga_top.svh, and host IDX_PER_BEAT in iqr_runner.cpp.
+    // The host guard (IqrRunner::enable_index_pass2) now permits up to 4096 bins.
+    localparam int IDX_BITS = 32;
+    localparam int IDX_W    = 16;
     localparam int FIDX_W   = 20;
 
     // Step-2 wide flag consumer signals (instance further below). Declared here because the FLAG-state
     // FSM references idxf_valid/idxf_last for its index-mode exit.
-    localparam int IDXF_LANES = (VALUE_WIDTH*NUM_ELEMENTS) / IDX_BITS;   // 32
+    localparam int IDXF_LANES = (VALUE_WIDTH*NUM_ELEMENTS) / IDX_BITS;   // 512/32 = 16
     logic                     idxf_in_valid, idxf_in_ready;
     logic [IDXF_LANES - 1:0]  idxf_flags, idxf_keep;
     logic                     idxf_valid, idxf_last;
@@ -131,6 +140,11 @@ module IQR_detection #(
 
     // Pass selector for a fused top (see the port comment).
     assign o_hist_active = (state == HISTOGRAM);
+
+    // Effective index-mode select: forced low (constant-folded) when EN_INDEX=0, so the whole index
+    // datapath below is trimmed and the value path is bit-identical to a no-index build. All the
+    // former `i_idx_mode` uses reference this instead.
+    wire idx_mode = EN_INDEX ? i_idx_mode : 1'b0;
 
     // Quartile search status
     logic q1_found;
@@ -240,29 +254,35 @@ module IQR_detection #(
     // [0, NUM_BINS-1], which would collapse every below-window value onto bin 0 and lose the
     // information the fence compare needs.
     logic [NUM_ELEMENTS*IDX_BITS - 1:0] idx_packed_in;
-    for (genvar I = 0; I < NUM_ELEMENTS; I++) begin : g_idx_enc
-        logic signed [IDX_W - 1:0] e_idx;
-        logic                      e_exact;
-        IqrIndexEncode #(.VALUE_WIDTH(VALUE_WIDTH), .IDX_W(IDX_W)) inst_enc (
-            .i_value(in.data[I]), .i_bin_min(bin_min), .i_bin_shift(bin_shift),
-            .i_is_signed(is_signed), .o_idx(e_idx), .o_exact(e_exact)
+    if (EN_INDEX) begin : g_idx_enc
+        for (genvar I = 0; I < NUM_ELEMENTS; I++) begin : g_lane
+            logic signed [IDX_W - 1:0] e_idx;
+            logic                      e_exact;
+            IqrIndexEncode #(.VALUE_WIDTH(VALUE_WIDTH), .IDX_W(IDX_W)) inst_enc (
+                .i_value(in.data[I]), .i_bin_min(bin_min), .i_bin_shift(bin_shift),
+                .i_is_signed(is_signed), .o_idx(e_idx), .o_exact(e_exact)
+            );
+            assign idx_packed_in[I*IDX_BITS +: IDX_BITS] =
+                {{(IDX_BITS - IDX_W - 1){1'b0}}, e_exact, e_idx};
+        end
+        IqrFenceIndex #(
+            .VALUE_WIDTH(VALUE_WIDTH), .FENCE_WIDTH(VALUE_WIDTH + 3), .FIDX_W(FIDX_W)
+        ) inst_lo_fidx (
+            .i_fence(lower_fence), .i_bin_min(bin_min), .i_bin_shift(bin_shift),
+            .i_is_signed(is_signed), .o_fidx(lo_fidx_c)
         );
-        assign idx_packed_in[I*IDX_BITS +: IDX_BITS] =
-            {{(IDX_BITS - IDX_W - 1){1'b0}}, e_exact, e_idx};
+        IqrFenceIndex #(
+            .VALUE_WIDTH(VALUE_WIDTH), .FENCE_WIDTH(VALUE_WIDTH + 3), .FIDX_W(FIDX_W)
+        ) inst_hi_fidx (
+            .i_fence(upper_fence), .i_bin_min(bin_min), .i_bin_shift(bin_shift),
+            .i_is_signed(is_signed), .o_fidx(hi_fidx_c)
+        );
+    end else begin : g_no_idx_enc
+        // Index mode compiled out: park the encoder/fence outputs so nothing downstream is undriven.
+        assign idx_packed_in = '0;
+        assign lo_fidx_c     = '0;
+        assign hi_fidx_c     = '0;
     end
-
-    IqrFenceIndex #(
-        .VALUE_WIDTH(VALUE_WIDTH), .FENCE_WIDTH(VALUE_WIDTH + 3), .FIDX_W(FIDX_W)
-    ) inst_lo_fidx (
-        .i_fence(lower_fence), .i_bin_min(bin_min), .i_bin_shift(bin_shift),
-        .i_is_signed(is_signed), .o_fidx(lo_fidx_c)
-    );
-    IqrFenceIndex #(
-        .VALUE_WIDTH(VALUE_WIDTH), .FENCE_WIDTH(VALUE_WIDTH + 3), .FIDX_W(FIDX_W)
-    ) inst_hi_fidx (
-        .i_fence(upper_fence), .i_bin_min(bin_min), .i_bin_shift(bin_shift),
-        .i_is_signed(is_signed), .o_fidx(hi_fidx_c)
-    );
 
     logic idx_pack_ready;   // instance is below, next to last_seen
 
@@ -518,17 +538,43 @@ module IQR_detection #(
     // accepted/committed/flushes/collisions are each Σ over the NUM_ELEMENTS banks. accepted counts
     // input beats per bank (mirrors committed's structure so the two can only diverge on a real
     // coalescing drop, not a counting artifact).
-    logic [63:0] accepted_sum, committed_sum, flushes_sum, collisions_sum;
-    always_comb begin
-        accepted_sum   = '0;
-        committed_sum  = '0;
-        flushes_sum    = '0;
-        collisions_sum = '0;
-        for (int k = 0; k < NUM_ELEMENTS; k++) begin
-            accepted_sum   = accepted_sum   + bank_accepted[k];
-            committed_sum  = committed_sum  + bank_committed[k];
-            flushes_sum    = flushes_sum    + bank_flushes[k];
-            collisions_sum = collisions_sum + bank_collisions[k];
+    //
+    // The reduction is PIPELINED into a registered 8->4->2->1 adder tree (mirrors the scan-merge
+    // pipeline below). These four sums feed ONLY the host CSR readback (dbg_*), which is sampled
+    // after a run finishes, so the 3-cycle latency is functionally invisible -- and it keeps the
+    // physically-scattered per-bank diag counters off the long combinational route into the config
+    // read register that was the build-27 critical path (WNS -1.496, 15 levels, 76% route). A plain
+    // always_comb Σ pulls all 8 banks to one endpoint in a single cycle. (Assumes NUM_ELEMENTS == 8,
+    // the production geometry -- same assumption as the scan pipeline below.)
+    logic [63:0] acc_r1 [4], com_r1 [4], flu_r1 [4], col_r1 [4];   // stage 1: 8 banks -> 4 partials
+    logic [63:0] acc_r2 [2], com_r2 [2], flu_r2 [2], col_r2 [2];   // stage 2: 4 -> 2
+    logic [63:0] accepted_sum, committed_sum, flushes_sum, collisions_sum;  // stage 3: 2 -> 1
+    always_ff @(posedge clk) begin
+        if (reset_synced == 1'b0) begin
+            for (int i = 0; i < 4; i++) begin
+                acc_r1[i] <= '0; com_r1[i] <= '0; flu_r1[i] <= '0; col_r1[i] <= '0;
+            end
+            for (int i = 0; i < 2; i++) begin
+                acc_r2[i] <= '0; com_r2[i] <= '0; flu_r2[i] <= '0; col_r2[i] <= '0;
+            end
+            accepted_sum <= '0; committed_sum <= '0; flushes_sum <= '0; collisions_sum <= '0;
+        end else begin
+            for (int i = 0; i < 4; i++) begin   // stage 1: pair the 8 banks
+                acc_r1[i] <= bank_accepted[2*i]   + bank_accepted[2*i + 1];
+                com_r1[i] <= bank_committed[2*i]  + bank_committed[2*i + 1];
+                flu_r1[i] <= bank_flushes[2*i]    + bank_flushes[2*i + 1];
+                col_r1[i] <= bank_collisions[2*i] + bank_collisions[2*i + 1];
+            end
+            for (int i = 0; i < 2; i++) begin   // stage 2: pair the 4 partials
+                acc_r2[i] <= acc_r1[2*i] + acc_r1[2*i + 1];
+                com_r2[i] <= com_r1[2*i] + com_r1[2*i + 1];
+                flu_r2[i] <= flu_r1[2*i] + flu_r1[2*i + 1];
+                col_r2[i] <= col_r1[2*i] + col_r1[2*i + 1];
+            end
+            accepted_sum   <= acc_r2[0] + acc_r2[1];   // stage 3: final Σ
+            committed_sum  <= com_r2[0] + com_r2[1];
+            flushes_sum    <= flu_r2[0] + flu_r2[1];
+            collisions_sum <= col_r2[0] + col_r2[1];
         end
     end
     assign dbg_accepted   = accepted_sum;
@@ -568,24 +614,34 @@ module IQR_detection #(
     // -- Control FSM ----------------------------------------------------------
     logic       last_seen;
 
-    IqrIndexPack #(
-        .NUM_ELEMENTS(NUM_ELEMENTS), .IDX_BITS(IDX_BITS), .OUT_W(VALUE_WIDTH*NUM_ELEMENTS)
-    ) inst_idx_pack (
-        .clk(clk), .rst_n(rst_n),
-        .i_data(idx_packed_in),
-        .i_keep(in.keep),
-        .i_valid(accept),
-        .o_ready(idx_pack_ready),
-        // Flush at the end of pass 1: last_seen is held through the drain, and the packer latches
-        // the request once and clears it after emitting, so this cannot double-emit.
-        .i_flush((state == HISTOGRAM) && last_seen),
-        .i_restart(clear_req),
-        // So the final full beat carries o_last when the column is an exact multiple of 32 elements
-        // (no flush beat). Without it the host's index drain hangs -- the ov_uniform silicon failure.
-        .i_expected(i_expected),
-        .o_data(o_idx_data), .o_valid(o_idx_valid), .o_ready_in(i_idx_ready), .o_last(o_idx_last),
-        .o_beats(o_idx_beats)
-    );
+    if (EN_INDEX) begin : g_idx_pack
+        IqrIndexPack #(
+            .NUM_ELEMENTS(NUM_ELEMENTS), .IDX_BITS(IDX_BITS), .OUT_W(VALUE_WIDTH*NUM_ELEMENTS)
+        ) inst_idx_pack (
+            .clk(clk), .rst_n(rst_n),
+            .i_data(idx_packed_in),
+            .i_keep(in.keep),
+            .i_valid(accept),
+            .o_ready(idx_pack_ready),
+            // Flush at the end of pass 1: last_seen is held through the drain, and the packer latches
+            // the request once and clears it after emitting, so this cannot double-emit.
+            .i_flush((state == HISTOGRAM) && last_seen),
+            .i_restart(clear_req),
+            // So the final full beat carries o_last when the column is an exact multiple of 32 elements
+            // (no flush beat). Without it the host's index drain hangs -- the ov_uniform silicon failure.
+            .i_expected(i_expected),
+            .o_data(o_idx_data), .o_valid(o_idx_valid), .o_ready_in(i_idx_ready), .o_last(o_idx_last),
+            .o_beats(o_idx_beats)
+        );
+    end else begin : g_no_idx_pack
+        // Index mode compiled out: the pass-1 index stream never fires; always-ready so the
+        // HISTOGRAM in.ready term folds cleanly (idx_mode is 0 anyway, so it is not even consulted).
+        assign idx_pack_ready = 1'b1;
+        assign o_idx_data     = '0;
+        assign o_idx_valid    = 1'b0;
+        assign o_idx_last     = 1'b0;
+        assign o_idx_beats    = '0;
+    end
     logic [3:0] drain_cnt;
 
     // Drain timing. DRAIN_START set on the last beat; flush_final fires DRAIN_START-2
@@ -765,12 +821,12 @@ module IQR_detection #(
                     // actually transferred (in.ready == out.ready here).
                     //
                     // Index mode finishes on the WIDE flag output's last: the value `out` is idle in
-                    // index mode, and one input index beat is consumed the same cycle its 32 flags are
+                    // index mode, and one input index beat is consumed the same cycle its 16 flags are
                     // handed to the wide packer, so idxf_last on an accepted wide beat is the column's
                     // end. (The wide packer's own tail flush drains afterwards, steered on valid in the
                     // top -- see vfpga_top.)
-                    if (i_idx_mode ? (idxf_valid && i_flagw_ready && idxf_last)
-                                   : (in.valid && in.ready && in.last)) begin
+                    if (idx_mode ? (idxf_valid && i_flagw_ready && idxf_last)
+                                  : (in.valid && in.ready && in.last)) begin
                         state      <= HISTOGRAM;
                         clearing   <= 1'b1;        // re-clear banks for next dataset
                         clear_addr <= '0;
@@ -781,30 +837,41 @@ module IQR_detection #(
     end
 
     // -- Step 2: pass-2 index consumer (WIDE) --------------------------------------------------
-    // Active only in FLAG and only in index mode. It takes one 512-bit beat of 32 indices, compares
-    // them all in one cycle, and emits all 32 outlier bits as one wide flag beat on o_flagw_* (packed
-    // by IqrWideFlagPack in the top). This is the step-2 speedup: the value path's `out` is left idle
-    // in index mode, and pass 2 produces ~32 flags/cycle instead of 8.
-    logic [VALUE_WIDTH*NUM_ELEMENTS - 1:0] in_flat;
-    always_comb for (int i = 0; i < NUM_ELEMENTS; i++) in_flat[i*VALUE_WIDTH +: VALUE_WIDTH] = in.data[i];
+    // Active only in FLAG and only in index mode. It takes one 512-bit beat of 16 indices (32-bit
+    // packing for 4096 bins), compares them all in one cycle, and emits all 16 outlier bits as one wide
+    // flag beat on o_flagw_* (packed by IqrWideFlagPack in the top). This is the step-2 speedup: the
+    // value path's `out` is left idle in index mode, and pass 2 produces ~16 flags/cycle instead of 8.
+    if (EN_INDEX) begin : g_idx_flag
+        logic [VALUE_WIDTH*NUM_ELEMENTS - 1:0] in_flat;
+        always_comb for (int i = 0; i < NUM_ELEMENTS; i++) in_flat[i*VALUE_WIDTH +: VALUE_WIDTH] = in.data[i];
 
-    wire idx_flag_active = i_idx_mode && (state == FLAG);
-    assign idxf_in_valid = idx_flag_active && in.valid;
+        wire idx_flag_active = idx_mode && (state == FLAG);
+        assign idxf_in_valid = idx_flag_active && in.valid;
 
-    IqrIndexFlag #(
-        .IDX_BITS(IDX_BITS), .IDX_W(IDX_W), .FIDX_W(FIDX_W),
-        .IN_W(VALUE_WIDTH*NUM_ELEMENTS)
-    ) inst_idx_flag (
-        .clk(clk), .rst_n(rst_n),
-        .i_enable(idx_flag_active),
-        .i_expected(i_expected),
-        // Re-arm on the host clear pulse, the same fence that re-arms pass 1.
-        .i_restart(clear_req),
-        .i_lo_fidx(lo_fidx_r), .i_hi_fidx(hi_fidx_r),
-        .i_data(in_flat), .i_valid(idxf_in_valid), .o_ready(idxf_in_ready),
-        .o_flags(idxf_flags), .o_keep(idxf_keep), .o_valid(idxf_valid),
-        .o_ready_in(i_flagw_ready), .o_last(idxf_last)
-    );
+        IqrIndexFlag #(
+            .IDX_BITS(IDX_BITS), .IDX_W(IDX_W), .FIDX_W(FIDX_W),
+            .IN_W(VALUE_WIDTH*NUM_ELEMENTS)
+        ) inst_idx_flag (
+            .clk(clk), .rst_n(rst_n),
+            .i_enable(idx_flag_active),
+            .i_expected(i_expected),
+            // Re-arm on the host clear pulse, the same fence that re-arms pass 1.
+            .i_restart(clear_req),
+            .i_lo_fidx(lo_fidx_r), .i_hi_fidx(hi_fidx_r),
+            .i_data(in_flat), .i_valid(idxf_in_valid), .o_ready(idxf_in_ready),
+            .o_flags(idxf_flags), .o_keep(idxf_keep), .o_valid(idxf_valid),
+            .o_ready_in(i_flagw_ready), .o_last(idxf_last)
+        );
+    end else begin : g_no_idx_flag
+        // Index mode compiled out: pass-2 consumer absent; tie its signals so the FLAG-state
+        // exit, in.ready mux, and o_flagw_* all see a quiescent index path (idx_mode is 0).
+        assign idxf_in_valid = 1'b0;
+        assign idxf_in_ready = 1'b0;
+        assign idxf_flags    = '0;
+        assign idxf_keep     = '0;
+        assign idxf_valid    = 1'b0;
+        assign idxf_last     = 1'b0;
+    end
 
     // Drive the wide flag output straight from the consumer (the top packs it).
     assign o_flagw_data  = idxf_flags;
@@ -820,8 +887,8 @@ module IQR_detection #(
     always_comb begin
         case (state)
             HISTOGRAM: in.ready = (!clearing) && (!last_seen)
-                                  && ((!i_idx_mode) || idx_pack_ready);
-            FLAG:      in.ready = i_idx_mode ? idxf_in_ready : out.ready;
+                                  && ((!idx_mode) || idx_pack_ready);
+            FLAG:      in.ready = idx_mode ? idxf_in_ready : out.ready;
             default:   in.ready = 1'b0;     // QUARTILES
         endcase
     end
@@ -845,7 +912,7 @@ module IQR_detection #(
 
         // Only the VALUE path drives `out`. In index mode the flags leave on the wide o_flagw_*
         // stream (packed by IqrWideFlagPack in the top), so `out` stays idle.
-        if ((state == FLAG) && !i_idx_mode) begin
+        if ((state == FLAG) && !idx_mode) begin
             out.valid = in.valid;
             out.last  = in.last;
             for (int i = 0; i < NUM_ELEMENTS; i++) begin

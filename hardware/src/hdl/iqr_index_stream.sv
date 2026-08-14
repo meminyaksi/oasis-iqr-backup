@@ -3,23 +3,24 @@
 `include "libstf_macros.svh"
 
 /**
- * The two ends of IQR step 2: turning pass 2 from a 64-bit value re-read into a 16-bit index
+ * The two ends of IQR step 2: turning pass 2 from a 64-bit value re-read into a packed index
  * re-read. Both modules are self-contained so they can be simulated without the IQR core.
  *
- * The wire format is fixed by iqr_index.sv: 16 bits per element = a 14-bit signed half-bin index
- * plus an `exact` bit, proven bit-identical to the value compare over 204884 combinations
- * (tb_iqr_index). At 512 bits per beat that is IDX_PER_BEAT = 32 elements, against 8 values per beat
- * today -- so pass 2 moves 4x fewer beats, which is the whole point.
+ * The wire format is fixed by iqr_index.sv: IDX_BITS bits per element = a signed half-bin index
+ * (IDX_W bits) plus an `exact` bit, the rest reserved; proven bit-identical to the value compare
+ * (tb_iqr_index). Re-widened for 4096 bins (build-24): IDX_W 14->16, IDX_BITS 16->32, so at 512 bits
+ * per beat that is IDX_PER_BEAT = 16 elements, against 8 values per beat -- pass 2 moves 2x fewer
+ * beats (was 4x at IDX_BITS=16), still the whole point. The defaults below track the canonical 32/16.
  *
  * WHY TWO MODULES AND NOT ONE WIDER PORT. Only the pass-2 INPUT gets wider. The flag OUTPUT keeps
- * its existing 8-lane shape and simply runs 4 beats per input beat, which means FlagBitPacker and
- * everything downstream of it are untouched. That was the cheapest place to put the width change.
+ * its per-lane shape and simply runs multiple beats per input beat, so everything downstream is
+ * untouched. That was the cheapest place to put the width change.
  */
 
 // -------------------------------------------------------------------------------------------------
-// IqrIndexPack -- pass 1 side. Takes NUM_ELEMENTS encoded indices per beat and gathers GATHER=4 of
-// them into one 512-bit output beat of IDX_PER_BEAT indices, for the host to store and hand back as
-// pass 2's input.
+// IqrIndexPack -- pass 1 side. Takes NUM_ELEMENTS encoded indices per beat and gathers GATHER
+// (= OUT_W/(NUM_ELEMENTS*IDX_BITS), = 2 at IDX_BITS=32) of them into one 512-bit output beat of
+// IDX_PER_BEAT indices, for the host to store and hand back as pass 2's input.
 //
 // The tail is zero-padded rather than length-tracked: the host knows the element count N and the
 // consumer masks the tail off against it (see IqrIndexFlag), so a partial final beat needs no
@@ -27,7 +28,7 @@
 // -------------------------------------------------------------------------------------------------
 module IqrIndexPack #(
     parameter int NUM_ELEMENTS = 8,
-    parameter int IDX_BITS     = 16,
+    parameter int IDX_BITS     = 32,
     parameter int OUT_W        = 512
 ) (
     input logic clk,
@@ -63,10 +64,10 @@ module IqrIndexPack #(
 
 `RESET_RESYNC
 
-    localparam int IN_BITS      = NUM_ELEMENTS * IDX_BITS;      // 128
-    localparam int GATHER       = OUT_W / IN_BITS;              // 4
+    localparam int IN_BITS      = NUM_ELEMENTS * IDX_BITS;      // 8*32 = 256
+    localparam int GATHER       = OUT_W / IN_BITS;              // 512/256 = 2
     localparam int GCNT_W       = $clog2(GATHER + 1);
-    localparam int IDX_PER_BEAT = OUT_W / IDX_BITS;             // 32
+    localparam int IDX_PER_BEAT = OUT_W / IDX_BITS;             // 512/32 = 16
 
     // Total beats this column will produce = ceil(i_expected / IDX_PER_BEAT). Used to mark o_last on
     // the final full beat (the flush path handles the partial-tail case on its own).
@@ -166,15 +167,16 @@ endmodule
 
 
 // -------------------------------------------------------------------------------------------------
-// IqrIndexFlag -- pass 2 side. Consumes one 512-bit beat of LANES=IN_W/IDX_BITS indices, compares
-// every one against the index-space fences IN PARALLEL, and emits ALL of them as one wide flag beat.
+// IqrIndexFlag -- pass 2 side. Consumes one 512-bit beat of LANES=IN_W/IDX_BITS indices (16 at
+// IDX_BITS=32), compares every one against the index-space fences IN PARALLEL, and emits ALL of them
+// as one wide flag beat.
 //
-// WHY WIDE (the step-2 speedup). The compares were always parallel; the earlier version then threw
-// that away by serialising 32 ready flags into 4 sub-beats of 8, so pass 2 produced only ~8
-// flags/cycle -- the same rate as the value path, which is why step 2 moved 4x fewer bytes yet ran no
-// faster on silicon (build-19, RESULTS.md 9.21). Emitting all 32 in one cycle lets pass 2 consume one
-// 512-bit index beat every cycle: 32 elements/cycle at PCIe rate, ~4x the flag throughput. The output
-// is packed by IqrWideFlagPack (32 bits/beat) instead of the 8-wide FlagBitPacker.
+// WHY WIDE (the step-2 speedup). The compares were always parallel; an earlier version threw that away
+// by serialising the ready flags into sub-beats of 8, so pass 2 produced only ~8 flags/cycle -- the
+// same rate as the value path, which is why step 2 moved fewer bytes yet ran no faster on silicon
+// (build-19, RESULTS.md 9.21). Emitting all LANES in one cycle lets pass 2 consume one 512-bit index
+// beat every cycle: LANES elements/cycle at PCIe rate. The output is packed by IqrWideFlagPack
+// (LANES bits/beat) instead of the 8-wide FlagBitPacker.
 //
 // Zero-buffer passthrough: the compare is combinational, so o_valid follows i_valid and o_ready
 // follows o_ready_in, exactly like the value path's FLAG output. `emitted` (elements handed out so
@@ -182,8 +184,8 @@ endmodule
 // beat carrying element N-1.
 // -------------------------------------------------------------------------------------------------
 module IqrIndexFlag #(
-    parameter int IDX_BITS = 16,
-    parameter int IDX_W    = 14,
+    parameter int IDX_BITS = 32,
+    parameter int IDX_W    = 16,
     parameter int FIDX_W   = 20,
     parameter int IN_W     = 512
 ) (
@@ -210,7 +212,7 @@ module IqrIndexFlag #(
 
 `RESET_RESYNC
 
-    localparam int LANES = IN_W / IDX_BITS;   // 32
+    localparam int LANES = IN_W / IDX_BITS;   // 512/32 = 16
 
     // -- Combinational compare of all LANES indices in the incoming beat --------------------------
     logic [LANES - 1:0] beat_outlier;
@@ -257,7 +259,8 @@ endmodule
 // -------------------------------------------------------------------------------------------------
 // IqrWideFlagPack -- packs NUM_LANES flag bits per beat into OUT_W-bit words (element e -> bit e),
 // the same layout FlagBitPacker produces, so the host reads the bitmask identically. It is the wide
-// twin of FlagBitPacker: 32 bits/beat instead of 8, filling a 512-bit word in SLOTS=16 beats.
+// twin of FlagBitPacker: NUM_LANES bits/beat instead of 8 (16 at IDX_BITS=32), filling a 512-bit word
+// in SLOTS = OUT_W/NUM_LANES beats (32 at NUM_LANES=16).
 //
 // Structure is copied verbatim from FlagBitPacker (a FIXED right-shift with insertion at the top --
 // pure wiring, no barrel-shifter), including the partial-final-word flush that shifts zeros until the
@@ -265,7 +268,7 @@ endmodule
 // for the full rationale.
 // -------------------------------------------------------------------------------------------------
 module IqrWideFlagPack #(
-    parameter int NUM_LANES = 32,
+    parameter int NUM_LANES = 16,
     parameter int OUT_W     = 512
 ) (
     input logic clk,
@@ -289,7 +292,7 @@ module IqrWideFlagPack #(
 
 `RESET_RESYNC
 
-    localparam int SLOTS = OUT_W / NUM_LANES;   // 16
+    localparam int SLOTS = OUT_W / NUM_LANES;   // 512/16 = 32
     localparam int CNT_W = $clog2(SLOTS + 1);
 
     logic [OUT_W - 1:0] acc;

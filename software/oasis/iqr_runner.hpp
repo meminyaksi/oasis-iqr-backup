@@ -158,8 +158,9 @@ class IqrRunner {
      * ---- Step 2: bin-index pass 2 -------------------------------------------------------------
      * Pass 2 does nothing per element but compare it against two constants, yet it re-reads the
      * whole 64-bit column: 8 bytes moved per 1 bit produced. With this on, HISTOGRAM additionally
-     * emits a packed 16-bit-per-element index stream (14-bit signed half-bin index + an `exact`
-     * bit), the host catches it, and pass 2 re-reads THAT -- 4x fewer bytes.
+     * emits a packed 32-bit-per-element index stream (16-bit signed half-bin index + an `exact`
+     * bit; re-widened from 16-bit/14-bit for 4096 bins), the host catches it, and pass 2 re-reads
+     * THAT -- 2x fewer bytes (was 4x at 16-bit packing).
      *
      * The results are bit-identical, not approximate: Q1/Q3 are bin lower edges, so 1.5*IQR is an
      * exact multiple of half a bin and both fences land on half-bin boundaries. Proven in
@@ -175,18 +176,18 @@ class IqrRunner {
      * would not catch it. Off by default.
      */
     void enable_index_pass2(bool on) {
-        // Index mode's wire format is a 16-bit word: a 14-bit signed half-bin index (IDX_W=14) plus
-        // an `exact` bit. TRAP 2 (iqr_index.sv) proves 14 bits cover the reachable fence indices ONLY
-        // at NUM_BINS<=1024 (they reach +5115/-3069). At 4096 bins the fence indices reach ~+20475,
-        // which a 14-bit index (+-8191) SATURATES -- silently reporting far outliers as inside. The
-        // re-widen (IDX_W 14->16, IDX_BITS 16->32, host IDX_PER_BEAT, the o_flagw_data /16 sites) is
-        // deferred with index mode itself (shelved, RESULTS.md 9.23). Refuse it here rather than ship
-        // silently-wrong flags.
-        if (on && NUM_BINS > 1024) {
+        // Index mode's wire format is a 32-bit word: a 16-bit signed half-bin index (IDX_W=16) plus
+        // an `exact` bit, the rest reserved. TRAP 2 (iqr_index.sv) bounds the reachable fence indices
+        // at ~5*(NUM_BINS-1): +5115/-3069 at 1024 bins, ~+20475/-12285 at 4096 bins. IDX_W=16
+        // (+-32768) covers 4096 with margin, so saturation stays safe. The re-widen (IDX_W 14->16,
+        // IDX_BITS 16->32, host IDX_PER_BEAT 32->16, the o_flagw_data /16->/32 sites) landed for
+        // build-24. Beyond 4096 bins the fence indices would exceed +-32768 again -- refuse rather than
+        // ship silently-wrong flags.
+        if (on && NUM_BINS > 4096) {
             throw std::runtime_error(
-                "IqrRunner: index-mode pass 2 is only bit-exact for NUM_BINS<=1024; this bitstream is "
-                "built for " + std::to_string(NUM_BINS) + " bins. Re-widen IDX_W/IDX_BITS before "
-                "enabling index mode at >1024 bins.");
+                "IqrRunner: index-mode pass 2 is only bit-exact for NUM_BINS<=4096 (IDX_W=16); this "
+                "bitstream is built for " + std::to_string(NUM_BINS) + " bins. Re-widen IDX_W/IDX_BITS "
+                "before enabling index mode at >4096 bins.");
         }
         idx_mode_ = on;
     }
