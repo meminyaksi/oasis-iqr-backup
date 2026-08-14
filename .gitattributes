@@ -1,1 +1,2 @@
 hardware/build-29/bitstreams/cyt_top_b29_po.bit filter=lfs diff=lfs merge=lfs -text
+hardware/build-28/bitstreams/cyt_top_ssi_spreadslls.bit filter=lfs diff=lfs merge=lfs -text
