@@ -1,0 +1,35 @@
+SKEW SWEEP (Test 5) -- mean of last 3 of 7 runs (no median/spread)
+arms=['fpga', 'cpp']  cpp=iqr_cpu_flags_groupby()  threads=32  fusion=policy (6,000,000 rows)
+datasets: /home/myaksi/datasets/skewsweep
+all six files: 20M rows, 1,020,000 distinct, PLAIN/uncompressed 8.00 B/row, ~579 bins/IQR.
+ONLY the distribution shape moves.
+
+   a     skew  kurtosis bins/IQR |  FPGA op   CPU op   ratio |    F dec  F pass |     expected  FPGA-exp  CPU-exp
+----------------------------------------------------------------------------------------------------------------------------------
+   0      0.0      -1.2   579.6 |     55.7    117.7   2.11x |     35.6    12.8 |       20,000        +0       +0
+   4    1.144    0.2827   580.6 |     55.0    119.7   2.18x |     36.0    12.8 |      517,902    -1,898       +0
+   8   1.9649     3.213   581.7 |     56.5    125.1   2.21x |     37.3    12.8 |    2,278,000    +3,657       +0
+  12   2.5661    6.3915   581.7 |     57.6    119.4   2.07x |     37.8    12.8 |    2,731,586      -280       +0
+  16   3.0443     9.569   581.2 |     56.4    117.2   2.08x |     37.1    12.8 |    2,699,758      +520       +0
+  20    3.445   12.6934   580.5 |     55.2    120.4   2.18x |     34.8    12.8 |    2,466,052    +2,038       +0
+
+==================================================================================================================================
+INTERNAL CHECK  `passes` spread 0.3%  -> FLAT (as required)
+SPEED           skewness 0.00 -> 3.44:  FPGA op 0.99x (spread 4.8%)   CPU op 1.02x (spread 6.7%)   decode 0.98x
+                speedup 2.11x -> 2.18x
+
+ACCURACY (FPGA vs SQL-exact, computed by the generator with the baseline's own rule):
+    skew  0.00  gate=EXACT  expected     20,000  FPGA +0 (EXACT)
+    skew  1.14  gate=MIXED  expected    517,902  FPGA -1,898 (0.3665% of flagged)
+    skew  1.96  gate=MIXED  expected  2,278,000  FPGA +3,657 (0.1605% of flagged)
+    skew  2.57  gate=MIXED  expected  2,731,586  FPGA -280 (0.0103% of flagged)
+    skew  3.04  gate=MIXED  expected  2,699,758  FPGA +520 (0.0193% of flagged)
+    skew  3.44  gate=MIXED  expected  2,466,052  FPGA +2,038 (0.0826% of flagged)
+    worst relative error: 0.3665% at skewness 1.14
+==================================================================================================================================
+`passes` is the internal check (identical decoded volume). `F dec` is the shared decoder.
+FPGA-exp / CPU-exp are SIGNED deviations from the SQL-exact expected count: the CPU column
+must be 0 everywhere -- if it is not, the disagreement is a quantile DEFINITION mismatch
+and the FPGA column cannot be read as quantisation error until that is resolved.
+
+csv: bench/skew_sweep.csv

@@ -13,6 +13,11 @@ halves of the joint paper. **Test 2 (cardinality) is withdrawn**: it is IQR-spec
 quartiles make the CPU baseline pay for distinct values. It is retained below as the reason encoding
 and byte volume must be pinned in any sweep that varies the data.
 
+**Test 5 (skew) is a CONTROL, not a fourth panel.** Tests 1/3/4 all ran on uniform synthetic data,
+which invites the objection *"real data is skewed, so your numbers do not transfer."* Test 5 closes
+that objection with a measured invariance statement and costs two sentences of prose, not a figure —
+flat lines make a weak panel. It is the control that licenses the other three.
+
 ---
 
 ## Test 1 — SIZE SWEEP (1M → 100M rows), fusion OFF vs ON
@@ -986,3 +991,228 @@ python3 bench/codec_sweep.py --csv bench/codec_sweep.csv
 The harness prints the `passes`-flatness internal check per level and refuses to report a fit if only
 one cardinality level is present (the design would be rank-deficient). `FORCE=1` regenerates existing
 files; partial writes land as `*.partial` and are never mistaken for complete ones.
+
+---
+
+## Test 5 — DISTRIBUTION SHAPE / SKEW (20M rows fixed, skewness 0.00 → 3.44)
+
+> ✅ **This is a ROBUSTNESS CONTROL, not a paper panel.** Both arms are flat, so there is no curve to
+> plot. Its job is to defend Tests 1/3/4, all of which ran on uniform data. Report it as prose plus
+> the small table in §5 below.
+
+**Date:** 2026-08-14 · **Node:** alveo-u55c-07 · **Harness:** `bench/gen_skew_sweep.py`,
+`bench/skew_sweep.py` · **Raw:** `bench/skew_sweep.csv` (run 1), `bench/skew_sweep_rep2.csv` (run 2)
+
+Same protocol as Tests 1/3/4 — **7 runs in one DuckDB session, arithmetic mean of the last 3, no
+median, no spread** — reused verbatim from `size_sweep.run_arm`. Fused by policy (20M > the 6M
+crossover), `threads=32`, CPU arm `iqr_cpu_flags_groupby()`. The card was programmed with
+`build-29/bitstreams/cyt_top_b29_po.bit` at the start of this session; the sysfs provenance line was
+not captured in the pasted log, so treat provenance as presumed rather than confirmed.
+
+### What varies, and what had to be pinned to let it vary alone
+
+The axis is the **shape of the value distribution**: Fisher skewness 0.00 → 3.44, excess kurtosis
+−1.2 → 12.7. Everything else is held fixed by construction:
+
+| property | value | how |
+|---|---|---|
+| rows | 20,000,000 | same `i`-range at every point |
+| cardinality | **1,020,000 distinct EXACTLY** | `r = (i·PERM) mod N` is a bijection; folding `mod CARD` gives every level exactly `N/CARD = 20` rows. Not `hash()` — hash leaves coupon-collector holes and the distinct count would drift with the sweep |
+| frequency profile | perfectly flat over levels | consequence of the above ⇒ the skew lives entirely in the value **spacing**, i.e. this is a genuine sample from a continuous right-skewed law quantised to CARD levels, not a frequency-imbalance artefact |
+| bytes/row | **exactly 8.00** | PLAIN (`DICTIONARY_SIZE_LIMIT 0`) + UNCOMPRESSED. All six files are byte-identical in size (160,021,337 B), which is itself the proof |
+| row groups | 163, min 93,440, all `%8 == 0` | streaming/fusion is never rejected |
+| **bins per IQR** | **~579 at every point** | ⬅️ the new one — see below |
+
+Value construction: `V(level) = level + round(9e6 · w(u))`, `u = (level+1)/CARD`, with
+`w(u) = u` at `a=0` and `w(u) = (e^{a·u} − 1)/(e^a − 1)` otherwise. The `+ level` term is what makes
+`V` strictly increasing and therefore injective, so cardinality survives the warp. `a` is the knob;
+**measured skewness is the reported axis**.
+
+### ⚠️ Two confounds this generator exists to kill
+
+**1. The power-of-two bin width.** `derive_window` (`iqr_runner.cpp:107`) sets the histogram window to
+`[Q1−2·IQR, Q3+2·IQR]` — exactly **5·IQR** — then rounds the bin width **up to a power of two**
+(`iqr_runner.cpp:130`, because the hardware shifts rather than divides). Writing `x = 5·IQR/4096`:
+
+```
+bins_per_IQR = (4096/5) · x / 2^ceil(log2 x)        and  x / 2^ceil(log2 x) ∈ (0.5, 1]
+             ⇒ sawtooths over (409.6, 819.2]
+```
+
+Skew moves the IQR continuously, so a naive sweep walks straight through those octave boundaries and
+produces a **2× accuracy sawtooth that has nothing to do with distribution shape**. Every point is
+therefore scaled by an integer multiplier chosen so `bins_per_IQR` lands on **579 ± 0.4%** — the
+*geometric middle* of the range, deliberately **not** the top: at 819.2 the quantity `5·IQR/4096` is
+exactly a power of two, so half of all perturbations tip it into the next octave and halve the
+resolution. That matters precisely because the fused window comes from a stride sample whose Q3 error
+**grows with skew** — the swept axis is what would push a cliff-edge point over.
+
+**2. Outlier placement collapsing onto whole levels.** `N = 20,000,000 = 1000 × 20,000`, so selecting
+outliers with `i % 1000 == 0` makes `(i·PERM) mod N` a multiple of 1000, and folding `mod CARD` leaves
+**only multiples of 1000** — 1,000 whole levels (all 20 rows each), which then vanish from the base.
+The distinct count still read a plausible 1,000,000 (999,000 base + 1,000 outlier), which is how it
+nearly passed. Same low-bit-structure trap as the Test 2 v1 generator. Fixed by selecting on the
+permuted index instead: `r % 50 == 0 AND r < CARD` takes **one row from each of 20,000 levels** spaced
+50 apart, so the base keeps all 1,000,000 levels and the file holds exactly 1,020,000 distinct values.
+
+### Generated datasets — ALL GATES PASS
+
+| a | skewness | kurtosis | mult | bins/IQR | B/row | distinct | min_grp %8 | natural outliers | expected flags | gate |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|:--|
+| 0 | 0.000 | −1.200 | 1943 | 579.6 | 8.00 | 1,020,000 | 0 | 0 | 20,000 | EXACT |
+| 4 | 1.144 | 0.283 | 2843 | 580.6 | 8.00 | 1,020,000 | 0 | 497,902 | 517,902 | MIXED |
+| 8 | 1.965 | 3.213 | 179 | 581.7 | 8.00 | 1,020,000 | 0 | 2,258,000 | 2,278,000 | MIXED |
+| 12 | 2.566 | 6.392 | 641 | 581.7 | 8.00 | 1,020,000 | 0 | 2,711,586 | 2,731,586 | MIXED |
+| 16 | 3.044 | 9.569 | 3653 | 581.2 | 8.00 | 1,020,000 | 0 | 2,679,758 | 2,699,758 | MIXED |
+| 20 | 3.445 | 12.693 | 1083 | 580.5 | 8.00 | 1,020,000 | 0 | 2,446,052 | 2,466,052 | MIXED |
+
+`a=0` reports skewness 0.0 and excess kurtosis **−1.2**, the exact theoretical value for a uniform
+distribution — a free confirmation that the construction is what it claims to be. Total disk 740 MB.
+
+**Only the uniform point keeps a purely analytic gate.** Any right-skewed distribution has mass beyond
+`Q3 + 1.5·IQR` — that is a property of IQR on heavy tails, not a flaw. For the `MIXED` points the
+generator computes the expected count **from the written file using the SQL baseline's own
+discrete-quantile rule** (`min v such that 4·cumcount ≥ total`), so the harness gate is three-way:
+FPGA vs CPU vs expected. A CPU deviation would be a *definition* mismatch; an FPGA-only deviation is
+*quantisation*. The CPU column read `+0` at all 6 points in both runs, so the FPGA column is
+attributable.
+
+### Results — two independent runs, same node, same session state
+
+| | | run 1 | | | run 2 | | | pooled | |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| **skew** | **FPGA** | **CPU** | **ratio** | **FPGA** | **CPU** | **ratio** | **FPGA** | **CPU** | **ratio** |
+| 0.00 | 55.7 | 117.7 | 2.11× | 53.4 | 118.2 | 2.21× | 54.55 | 117.95 | 2.16× |
+| 1.14 | 55.0 | 119.7 | 2.18× | 55.3 | 123.0 | 2.22× | 55.15 | 121.35 | 2.20× |
+| 1.96 | 56.5 | 125.1 | 2.21× | 55.5 | 116.3 | 2.10× | 56.00 | 120.70 | 2.16× |
+| 2.57 | 57.6 | 119.4 | 2.07× | 53.8 | 115.0 | 2.14× | 55.70 | 117.20 | 2.10× |
+| 3.04 | 56.4 | 117.2 | 2.08× | 54.2 | 121.9 | 2.25× | 55.30 | 119.55 | 2.16× |
+| 3.44 | 55.2 | 120.4 | 2.18× | 55.9 | 125.7 | 2.25× | 55.55 | 123.05 | 2.22× |
+
+`F passes` was **12.8 ms at all 12 measurements** (spread 0.3% / 0.2%) — the internal check.
+`F decode` pooled 34.85 → 36.70 ms.
+
+---
+
+## Analysis (Test 5)
+
+### 1. One run could not have established this — the repeat is the result
+
+Within a single run the FPGA spread across skewness is 4.7–4.8%, which is *above* this project's
+documented 1–3% run-to-run variation. On one run alone, "flat" would have been an eyeball claim.
+
+The repeat settles it, because **the same-point repeat difference is LARGER than the across-skew
+spread**:
+
+| | max repeat |Δ| on one point | across-skew spread within a run |
+|---|--:|--:|
+| FPGA op | **6.6%** (a=12: 57.6 → 53.8) | 4.7–4.8% |
+| CPU op | **7.0%** (a=8: 125.1 → 116.3) | 6.7–9.3% |
+
+And the **rank order completely reshuffled**: `a=12` was the slowest point in run 1 and the
+second-fastest in run 2; `a=8` was the slowest CPU point in run 1 and the fastest in run 2. A real
+effect does not permute its own ordering between sessions.
+
+Pooling the two runs halves the residual: FPGA spread **2.66%**, i.e. back inside the documented
+noise band. Least-squares against skewness gives a slope of **0.26 ms per unit skewness = 0.91 ms
+(1.6%) over the entire range** — far below the ±3.8 ms observed on a single repeated point, and not
+monotone (the pooled series rises then falls). There is no trend to report.
+
+### 2. The measured statement
+
+> Over Fisher skewness **0.00 → 3.44** and excess kurtosis **−1.2 → 12.7**, with rows, cardinality,
+> frequency profile, encoding, byte volume, row-group geometry and quantisation resolution all held
+> fixed, FPGA operator time varies by **2.7%** and the speedup stays in **2.10–2.22×** (mean 2.17×).
+
+Both arms are flat, and for different reasons worth stating: the FPGA histograms every row identically
+regardless of where the values sit, while the CPU's `GROUP BY` performs N probes over a
+fixed-size table regardless of value spacing. Once bytes and cardinality are pinned, **neither arm has
+a mechanism for shape to act on.** That is why this is a control and not a panel.
+
+### 3. Accuracy is deterministic — which is a stronger result than "small"
+
+The FPGA's deviation from exact was **bit-identical across the two independent sessions**:
+
+| skewness | expected | FPGA − expected | of flagged | of all rows |
+|--:|--:|--:|--:|--:|
+| 0.00 | 20,000 | **0** | exact | exact |
+| 1.14 | 517,902 | −1,898 | 0.367% | 0.009% |
+| 1.96 | 2,278,000 | +3,657 | 0.161% | **0.018%** |
+| 2.57 | 2,731,586 | −280 | 0.010% | 0.001% |
+| 3.04 | 2,699,758 | +520 | 0.019% | 0.003% |
+| 3.44 | 2,466,052 | +2,038 | 0.083% | 0.010% |
+
+Three things follow:
+
+* **It does not grow with skew** — non-monotone, and the largest error is at the *second-lowest*
+  skewness. Confirms the pre-registered prediction: the window is IQR-anchored, so resolution per IQR
+  is scale-free, and a heavier tail puts *lower* density at the fence.
+* **It is deterministic, not flaky.** Two sessions, 14 iterations per point, identical counts to the
+  row. On a bitstream with **1 ps of hold margin** whose historical failure signature was *wandering*
+  counts, reproducing the exact same numbers is direct evidence that these deviations are pure
+  quantisation and the silicon is sound. `!FPGA-WANDERS` never fired.
+* **The `a=0` point is exactly 0**, confirming the planted-outlier gate still works: outliers in an
+  empty gap far outside the fence are quantisation-proof, as in Tests 1/3/4.
+
+### 4. Cross-test consistency
+
+`a=0` (20M rows, PLAIN, uncompressed, 8.00 B/row) is configuration-identical to Test 4's
+`hi/plain/uncompressed`, measured on the same node in a different session:
+
+| | Test 4 | Test 5 (pooled) | Δ |
+|---|--:|--:|--:|
+| FPGA op | 55.4 | 54.55 | 1.5% |
+| CPU op | 116.5 | 117.95 | 1.2% |
+
+### 5. What to put in the paper
+
+Two sentences and, if space allows, this table:
+
+| skewness | 0.00 | 1.14 | 1.96 | 2.57 | 3.04 | 3.44 |
+|---|--:|--:|--:|--:|--:|--:|
+| FPGA operator (ms) | 54.6 | 55.2 | 56.0 | 55.7 | 55.3 | 55.6 |
+| speedup | 2.16× | 2.20× | 2.16× | 2.10× | 2.16× | 2.22× |
+
+Lead with **invariance**, not correctness: *"the speedup is invariant to distribution shape, so the
+uniform-data results of §Tests 1/3/4 transfer to skewed real-world columns."* Neutralise the accuracy
+question in a single clause — *"flag counts agree with exact arithmetic to within 0.02% of rows at
+every point"* — rather than giving it a subsection. Omitting it entirely would be worse: this is an
+approximate-quantile design and a reviewer will ask.
+
+## Consequences / open items (Test 5)
+
+1. **Skew is not a performance axis.** With bytes and cardinality pinned there is no mechanism. Any
+   real-world "skewed data behaves differently" effect must flow through **encoding/compression**
+   (Test 4) or **cardinality** (Test 2), not through shape. This test is what licenses that claim.
+2. **This transfers to the z-score operator unchanged as a control** — and the same datasets are
+   valid for it, since the planted outliers sit far outside `mean ± kσ` for k ≥ 2 (see
+   `microbench_roadmap.md` §2.2 for the arithmetic).
+3. **The one skew figure with an actual trend is a JOINT one, and it is not about speed:** `mean ± kσ`
+   is not robust, so under right-skew the mean and σ inflate and z-score's flag count drifts with the
+   tail while quartile-based IQR does not. On identical data the two operators diverge as skewness
+   grows. That is a *semantics* figure answering "why does this system offer both operators" — pure
+   SQL over the six files already on disk, no card and no dependency on the companion codebase.
+   **Not yet measured.**
+4. **Not run:** `--no-fuse` (value path) and `--sample 65536` (which would separate window-sampling
+   error from bin-quantisation error). Neither is needed for the invariance claim; both are one
+   command if a reviewer pushes on the accuracy mechanism.
+
+## Reproduce (Test 5)
+
+```bash
+cd ~/oasis
+python3 bench/gen_skew_sweep.py --dry-run     # plan only: quartiles, multipliers, fences. No files.
+python3 bench/gen_skew_sweep.py               # 6 files, 740 MB. STOP if any gate fails.
+python3 bench/gen_skew_sweep.py verify        # re-print manifest + gates
+
+python3 bench/skew_sweep.py --csv bench/skew_sweep.csv
+python3 bench/skew_sweep.py --csv bench/skew_sweep_rep2.csv   # THE REPEAT -- required, see §1
+```
+
+⚠️ **Run it twice.** A single run cannot separate the 4.8% across-skew spread from 6.6% repeat noise,
+and the invariance claim is exactly the claim that needs that separation.
+
+Generation deliberately uses the **stock python `duckdb` module**, not the extension-linked binary:
+it is pure SQL and never touches the FPGA, while the extension binary aborts on any node without
+1 GiB huge pages. The module is 1.5.4, the same version the codec sweep was characterised against, so
+the parquet writer — and therefore the encoding gates — behave identically.
