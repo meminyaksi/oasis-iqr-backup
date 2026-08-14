@@ -1,0 +1,77 @@
+OASIS report analysis
+Build:   build-29  (/home/myaksi/oasis/hardware/build-29)
+Host:    hacc-build-02.inf.ethz.ch
+Run at:  2026-08-07 05:53:01
+
+==================== TIMING ====================
+Status: TIMING NOT MET
+WNS (worst slack):    -0.553 ns
+Failing paths:        1000 (of 21640 reported)
+
+Biggest clusters of failing paths (destination with last 2 levels stripped),
+with per-cluster averages over its paths:
+  paths  levels   fanout  logic/route  cluster
+     79     7.0       52     14%/86%  inst_shell/inst_dynamic/inst_user_wrapper_0/inst_user_c0_0/genblk1[2].inst_column_chunk_decoder/inst_profile_in
+     68     2.2       85     26%/74%  inst_shell/inst_dynamic/inst_user_wrapper_0/inst_user_c0_0/genblk1[2].inst_column_chunk_decoder/inst_typed_dictionary/inst_dictionary/inst_duplicate
+     48    12.1       88     28%/72%  inst_shell/inst_dynamic/inst_user_wrapper_0/inst_user_c0_0/genblk1[0].inst_column_chunk_decoder/inst_hybrid_page_decoder/inst_run_decoder
+     41     1.1      234      5%/95%  inst_shell/inst_dynamic/inst_user_wrapper_0/inst_local_credits_host_rd/genblk2[2].inst_dq_reg/inst_reg_slice/inst/axisc_register_slice_0
+     36     7.2      213     16%/84%  inst_shell/inst_dynamic/inst_user_wrapper_0/inst_user_c0_0/inst_iqr_detection
+
+================= UTILIZATION ==================
+Device: xcu55c-fsvh2892-2L-e
+
+Total resource utilization (cyt_top):  (device: xcu55c / Alveo U55C)
+  Rsrc           Used      Avail    Util%
+  LUTs         513383    1303680    39.4%
+  FFs          699857    2607360    26.8%
+  BRAM          306.5       2016    15.2%   (RAMB36: 251, RAMB18: 111)
+  URAM            309        960    32.2%
+  DSPs              0       9024     0.0%
+
+Major modules within inst_user_c0_0 (kept only if LUTs >= 500 and FFs >= 500):
+  +------------------------------------------------+-----------+-----------+---------+--------+
+  | Module                                         |      LUTs |       FFs |    BRAM |   URAM |
+  +------------------------------------------------+-----------+-----------+---------+--------+
+  |   genblk1[0].inst_column_chunk_decoder         |     77023 |    119299 |      16 |     66 |
+  |     inst_decompressor                          |      4495 |      5125 |       0 |      2 |
+  |     inst_hybrid_page_decoder                   |     16120 |      4200 |       6 |      0 |
+  |     inst_normalize_until_out                   |      3964 |      4727 |       0 |      0 |
+  |     inst_page_header_parser                    |      5488 |      4199 |       0 |      0 |
+  |     inst_plain_in_skid_buffer                  |      1864 |      1161 |       0 |      0 |
+  |     inst_plain_stripped_skid_buffer            |       584 |      1159 |       0 |      0 |
+  |     inst_strip_levels                          |      1472 |      2950 |       0 |      0 |
+  |     inst_typed_dictionary                      |     42608 |     94453 |      10 |     64 |
+  |   genblk1[1].inst_column_chunk_decoder         |     76380 |    119309 |      16 |     66 |
+  |     inst_decompressor                          |      4517 |      5127 |       0 |      2 |
+  |     inst_hybrid_page_decoder                   |     15419 |      4180 |       6 |      0 |
+  |     inst_normalize_until_out                   |      3921 |      4739 |       0 |      0 |
+  |     inst_page_header_parser                    |      5491 |      4199 |       0 |      0 |
+  |     inst_plain_in_skid_buffer                  |      1864 |      1156 |       0 |      0 |
+  |     inst_strip_levels                          |      1481 |      2955 |       0 |      0 |
+  |     inst_typed_dictionary                      |     42662 |     94469 |      10 |     64 |
+  |   genblk1[2].inst_column_chunk_decoder         |     77598 |    119349 |      16 |     66 |
+  |     inst_decompressor                          |      6306 |      5125 |       0 |      2 |
+  |     inst_hybrid_page_decoder                   |     14571 |      4174 |       6 |      0 |
+  |     inst_normalize_until_out                   |      3925 |      4731 |       0 |      0 |
+  |     inst_page_header_parser                    |      5487 |      4207 |       0 |      0 |
+  |     inst_plain_in_skid_buffer                  |      1865 |      1158 |       0 |      0 |
+  |     inst_strip_levels                          |      1484 |      2955 |       0 |      0 |
+  |     inst_typed_dictionary                      |     42900 |     94513 |      10 |     64 |
+  |   genblk1[3].inst_column_chunk_decoder         |     77037 |    119296 |      16 |     66 |
+  |     inst_decompressor                          |      4485 |      5125 |       0 |      2 |
+  |     inst_hybrid_page_decoder                   |     16130 |      4202 |       6 |      0 |
+  |     inst_normalize_until_out                   |      3905 |      4726 |       0 |      0 |
+  |     inst_page_header_parser                    |      5498 |      4199 |       0 |      0 |
+  |     inst_plain_in_skid_buffer                  |      1864 |      1161 |       0 |      0 |
+  |     inst_plain_stripped_skid_buffer            |       584 |      1156 |       0 |      0 |
+  |     inst_strip_levels                          |      1472 |      2950 |       0 |      0 |
+  |     inst_typed_dictionary                      |     42632 |     94452 |      10 |     64 |
+  |   inst_iqr_detection                           |     56534 |      7910 |       0 |      0 |
+  |   inst_iqr_histogram_feed                      |      1971 |      4242 |       0 |      0 |
+  |   inst_output_writer                           |      3477 |      8162 |     2.5 |     45 |
+  |     genblk1[0].inst_stream_writer              |       666 |      1523 |     0.5 |      9 |
+  |     genblk1[1].inst_stream_writer              |       673 |      1520 |     0.5 |      9 |
+  |     genblk1[2].inst_stream_writer              |       668 |      1523 |     0.5 |      9 |
+  |     genblk1[3].inst_stream_writer              |       670 |      1518 |     0.5 |      9 |
+  |     genblk1[4].inst_stream_writer              |       595 |      1460 |     0.5 |      9 |
+  +------------------------------------------------+-----------+-----------+---------+--------+

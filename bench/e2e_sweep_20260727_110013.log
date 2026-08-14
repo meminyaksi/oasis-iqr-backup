@@ -1,0 +1,84 @@
+build-21 e2e sweep -- Mon Jul 27 11:00:13 CEST 2026  node=alveo-u55c-07.inf.ethz.ch  N=15  index=OFF
+======================================================================
+CONSUME (operator-isolated)
+======================================================================
+C++ baseline arm: iqr_cpu_flags_groupby()   (--cpp-impl groupby)
+running taxi_d1 ...
+running tpch_qty ...
+running taxi_d2 ...
+running extprice ...
+running taxi_d3 ...
+running taxi_d4 ...
+running sf10 ...
+
+=== END-TO-END, median of 15 warm runs (s), spread = (max-min)/median ===
+dataset       rows |     FPGA   ±%      C++   ±%      SQL   ±% |  FPGA/C++  C++/SQL
+taxi_d1       3.0M |    0.014   21    0.017   18    0.025   12 |     1.21x    1.47x
+tpch_qty      6.0M |    0.021   14    0.032   22    0.031   13 |     1.52x    0.97x
+taxi_d2       6.0M |    0.022    9    0.033   15    0.035   17 |     1.50x    1.06x
+extprice      6.0M |    0.054    4    0.090   14    0.101   15 |     1.67x    1.12x
+taxi_d3      13.1M |    0.043    5    0.057    7    0.058   16 |     1.33x    1.02x
+taxi_d4      20.3M |    0.063    5    0.078   17    0.081   14 |     1.24x    1.04x
+sf10         60.0M |    0.449    1    0.333   10    0.490   11 |     0.74x    1.47x
+
+=== OPERATOR ONLY (heavy, ms) -- DuckDB emit tax excluded ===
+dataset    |  FPGA op   ±%   C++ op   ±% |  FPGA/C++ |   tax F  tax C  tax%
+taxi_d1    |     10.6   16     13.6   15 |     1.28x |     3.4    3.4   24%
+tpch_qty   |     16.9    6     27.9   23 |     1.65x |     4.1    4.1   19%
+taxi_d2    |     17.6    7     28.5   17 |     1.62x |     4.4    4.5   20%
+extprice   |     49.0    1     85.5   14 |     1.74x |     5.0    4.5    9%
+taxi_d3    |     36.5    3     50.9   10 |     1.39x |     6.5    6.1   15%
+taxi_d4    |     54.4    3     72.1   19 |     1.32x |     8.6    5.9   14%
+sf10       |    436.2    1    321.5   10 |     0.74x |    12.8   11.5    3%
+
+=== CPU-SECONDS (user, median) ===
+dataset    |     FPGA     C++      SQL |  C++/FPGA SQL/FPGA
+taxi_d1    |    0.038   0.138    0.312 |     3.65x    8.26x
+tpch_qty   |    0.060   0.191    0.521 |     3.19x    8.69x
+taxi_d2    |    0.076   0.214    0.549 |     2.82x    7.23x
+extprice   |    0.069   0.543    1.706 |     7.87x   24.71x
+taxi_d3    |    0.175   0.492    1.100 |     2.80x    6.27x
+taxi_d4    |    0.266   0.722    1.611 |     2.72x    6.06x
+sf10       |    0.688   2.718   10.948 |     3.95x   15.92x
+
+======================================================================
+CREATE TABLE (realistic e2e)
+======================================================================
+C++ baseline arm: iqr_cpu_flags_groupby()   (--cpp-impl groupby)
+running taxi_d1 ...
+running tpch_qty ...
+running taxi_d2 ...
+running extprice ...
+running taxi_d3 ...
+running taxi_d4 ...
+running sf10 ...
+
+=== END-TO-END, median of 15 warm runs (s), spread = (max-min)/median ===
+dataset       rows |     FPGA   ±%      C++   ±%      SQL   ±% |  FPGA/C++  C++/SQL
+taxi_d1       3.0M |    0.034   15    0.036   25    0.054   19 |     1.06x    1.50x
+tpch_qty      6.0M |    0.061   13    0.072   18    0.086   22 |     1.18x    1.19x
+taxi_d2       6.0M |    0.063   13    0.079   27    0.093   10 |     1.25x    1.18x
+extprice      6.0M |    0.093   10    0.132   15    0.153   12 |     1.42x    1.16x
+taxi_d3      13.1M |    0.129   10    0.160   31    0.184   15 |     1.24x    1.15x
+taxi_d4      20.3M |    0.200    9    0.258   15    0.269   22 |     1.29x    1.04x
+sf10         60.0M |    0.864    5    0.742    8    1.069   10 |     0.86x    1.44x
+
+=== OPERATOR ONLY (heavy, ms) -- DuckDB emit tax excluded ===
+dataset    |  FPGA op   ±%   C++ op   ±% |  FPGA/C++ |   tax F  tax C  tax%
+taxi_d1    |     10.9   15     13.4   21 |     1.23x |    23.1   22.6   68%
+tpch_qty   |     17.3    8     26.8   18 |     1.55x |    43.7   45.2   72%
+taxi_d2    |     18.3    3     29.2   25 |     1.59x |    44.7   49.8   71%
+extprice   |     49.8    3     83.5    9 |     1.68x |    43.2   48.5   46%
+taxi_d3    |     37.2    3     52.8   29 |     1.42x |    91.8  107.2   71%
+taxi_d4    |     56.1    4     77.3   16 |     1.38x |   143.9  180.7   72%
+sf10       |    437.1    1    325.6   11 |     0.74x |   426.9  416.4   49%
+
+=== CPU-SECONDS (user, median) ===
+dataset    |     FPGA     C++      SQL |  C++/FPGA SQL/FPGA
+taxi_d1    |    0.031   0.141    0.310 |     4.55x   10.03x
+tpch_qty   |    0.063   0.219    0.499 |     3.46x    7.89x
+taxi_d2    |    0.065   0.228    0.533 |     3.51x    8.19x
+extprice   |    0.066   0.535    1.728 |     8.10x   26.12x
+taxi_d3    |    0.165   0.490    1.059 |     2.96x    6.40x
+taxi_d4    |    0.265   0.693    1.584 |     2.61x    5.98x
+sf10       |    0.793   2.881   10.932 |     3.64x   13.79x

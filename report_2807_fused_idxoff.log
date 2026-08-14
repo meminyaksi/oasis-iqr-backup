@@ -1,0 +1,38 @@
+C++ baseline arm: iqr_cpu_flags_groupby()   (--cpp-impl groupby)
+running taxi_d1 ...
+running tpch_qty ...
+running taxi_d2 ...
+running extprice ...
+running taxi_d3 ...
+running taxi_d4 ...
+running sf10 ...
+
+=== END-TO-END, median of 15 warm runs (s), spread = (max-min)/median ===
+dataset       rows |     FPGA   ±%      C++   ±%      SQL   ±% |  FPGA/C++  C++/SQL
+taxi_d1       3.0M |    0.014   21    0.017   18    0.025    8 |     1.21x    1.47x
+tpch_qty      6.0M |    0.018   11    0.032   28    0.030   10 |     1.78x    0.94x
+taxi_d2       6.0M |    0.018   11    0.033   21    0.036   11 |     1.83x    1.09x
+extprice      6.0M |    0.027    7    0.089   13    0.101    9 |     3.30x    1.13x
+taxi_d3      13.1M |    0.045    9    0.056   16    0.058   14 |     1.24x    1.04x
+taxi_d4      20.3M |    0.060   12    0.078   18    0.079   10 |     1.30x    1.01x
+sf10         60.0M |    0.149    3    0.331   12    0.477    9 |     2.22x    1.44x
+
+=== OPERATOR ONLY (heavy, ms) -- DuckDB emit tax excluded ===
+dataset    |  FPGA op   ±%   C++ op   ±% |  FPGA/C++ |   tax F  tax C  tax%
+taxi_d1    |     10.3   11     13.1   24 |     1.28x |     3.7    3.9   27%
+tpch_qty   |     13.7    8     28.4   31 |     2.07x |     4.3    3.6   24%
+taxi_d2    |     14.0    8     28.9   22 |     2.07x |     4.0    4.1   22%
+extprice   |     22.4    6     84.9   14 |     3.78x |     4.6    4.1   17%
+taxi_d3    |     40.0    8     50.4   17 |     1.26x |     5.0    5.6   11%
+taxi_d4    |     53.4   10     72.4   17 |     1.36x |     6.6    5.6   11%
+sf10       |    136.5    2    319.1   13 |     2.34x |    12.5   11.9    8%
+
+=== CPU-SECONDS (user, median) ===
+dataset    |     FPGA     C++      SQL |  C++/FPGA SQL/FPGA
+taxi_d1    |    0.031   0.150    0.322 |     4.76x   10.25x
+tpch_qty   |    0.048   0.207    0.521 |     4.27x   10.76x
+taxi_d2    |    0.053   0.229    0.552 |     4.28x   10.32x
+extprice   |    0.054   0.546    1.700 |    10.09x   31.41x
+taxi_d3    |    0.098   0.497    1.110 |     5.06x   11.28x
+taxi_d4    |    0.143   0.734    1.628 |     5.13x   11.37x
+sf10       |    0.280   2.743   11.048 |     9.79x   39.43x

@@ -1,0 +1,14 @@
+C++ baseline arm: iqr_cpu_flags_groupby()   (--cpp-impl groupby)
+running sf10 ...
+
+=== END-TO-END, median of 15 warm runs (s), spread = (max-min)/median ===
+dataset       rows |     FPGA   ±%      C++   ±%      SQL   ±% |  FPGA/C++  C++/SQL
+sf10         60.0M |    0.150    4    0.332   11    0.478   10 |     2.21x    1.44x
+
+=== OPERATOR ONLY (heavy, ms) -- DuckDB emit tax excluded ===
+dataset    |  FPGA op   ±%   C++ op   ±% |  FPGA/C++ |   tax F  tax C  tax%
+sf10       |    137.8    4    321.5   10 |     2.33x |    12.2   10.5    8%
+
+=== CPU-SECONDS (user, median) ===
+dataset    |     FPGA     C++      SQL |  C++/FPGA SQL/FPGA
+sf10       |    0.277   2.727   11.063 |     9.84x   39.91x
