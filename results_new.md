@@ -428,3 +428,120 @@ bench/methods_ab.sh taxi_d1 sf10          # or list all 7 datasets; REPS=5 for s
   land; Coyote has no inter-process reset and a hard kill can wedge the card (reprogram/reboot). Use
   `timeout`, and kill the runner *script* first (loops respawn a duckdb per dataset).
 - **Huge pages** are cleared by every reprogram: `echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`.
+
+---
+
+## 11. build-21 (4096-bin) ON SILICON — 2026-07-27 (node alveo-u55c-07)
+
+First 4096-bin bitstream on hardware. Delivered the taxi accuracy fix and proved obstacle-1 per-row —
+but was **accidentally synthesized with 1 decode lane instead of 4** (the `--decoders 4` flag was
+omitted, so CMake defaulted to 1), which regressed decode-bound datasets. The value-path speedup below
+is therefore the **1-decoder floor**; build-23 (4 lanes, same 4096 RTL) is expected to restore it.
+
+### 11a. Taxi accuracy FIXED — 4096 bins + IQR-window rule (`correctness_3way.sh flags`, memcpy, defaults)
+
+`fpga_vs_cpp` (per-row disagreements vs C++-exact; `cpp_vs_oracle = 0` on all):
+
+| dataset | build-20 (1024) | 4096 + p1/p99 | **4096 + IQR window (shipped)** |
+|---|--:|--:|--:|
+| taxi_d1 | 1247 | 0 | **0** |
+| taxi_d2 | 2877 | 115 | **0** |
+| taxi_d3 | 162 | 31,496 | **104** (0.0008%) |
+| taxi_d4 | 54,921 | 46,860 | **0** exact |
+| tpch_qty / extprice / sf10 | 0 | 0 | **0** |
+
+The lever was **not** bin count — 4096 alone on the old p1/p99 window *regressed* taxi_d3 to 31,496. The
+fix was porting the `WINDOW_IQR` span `[Q1−2·IQR, Q3+2·IQR]` into `IqrRunner::derive_window` (the memcpy
+window). Overlap gate `bench/overlap_ab.sh accuracy` = **200/200** on ov_uniform + ov_drift.
+
+### 11b. Obstacle-1 (ragged stitch) FIXED and PER-ROW PROVEN
+
+With `STREAM_RAGGED`, taxi_d3/d4 fuse (`sink=stream pass1=fused`, no deadlock). A net-count match can't
+prove per-row (a bit-shift mislabel is count-preserving), so we dumped the fused bitmask
+(`OASIS_IQR_DUMP_FLAGS`) and diffed it row-by-row (`bench/fused_perrow.sh` + `compare_dumped_flags.py`):
+
+| dataset | net_diff | per_row_mismatch | verdict |
+|---|--:|--:|---|
+| taxi_d3 | 104 | 104 | zero swaps — all 104 are at-fence binning |
+| taxi_d4 | 0 | 0 | bit-exact with the exact CPU |
+
+`net_diff == per_row_mismatch` exactly ⇒ the host repack (`repack_ragged_flags`) labels every row
+correctly. Obstacle-1 is done.
+
+### 11c. ⭐ e2e SWEEP — build-21, **1 DECODE LANE** (the baseline to compare build-23 against)
+
+`bench/e2e_sweep.sh`, medians of 15, index OFF, C++ arm = `iqr_cpu_flags_groupby` (SQL-exact). **These
+are the numbers to re-run on build-23 (4 lanes) and compare** — decode-bound rows (extprice, sf10)
+should improve most; taxi and tpch_qty barely.
+
+**CONSUME (operator-isolated)**
+
+| dataset | rows | FPGA e2e | C++ e2e | FPGA/C++ | FPGA op ms | C++ op ms | op ratio | CPU-s C++/FPGA |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| taxi_d1 | 3.0M | 0.014 | 0.017 | 1.21× | 10.6 | 13.6 | 1.28× | 3.65× |
+| tpch_qty | 6.0M | 0.021 | 0.032 | 1.52× | 16.9 | 27.9 | 1.65× | 3.19× |
+| taxi_d2 | 6.0M | 0.022 | 0.033 | 1.50× | 17.6 | 28.5 | 1.62× | 2.82× |
+| extprice | 6.0M | 0.054 | 0.090 | 1.67× | **49.0** | 85.5 | 1.74× | 7.87× |
+| taxi_d3 | 13.1M | 0.043 | 0.057 | 1.33× | 36.5 | 50.9 | 1.39× | 2.80× |
+| taxi_d4 | 20.3M | 0.063 | 0.078 | 1.24× | 54.4 | 72.1 | 1.32× | 2.72× |
+| **sf10** | 60.0M | 0.449 | 0.333 | **0.74×** | **436.2** | 321.5 | **0.74×** | 3.95× |
+
+**CREATE TABLE (realistic e2e, includes the append tax)**
+
+| dataset | rows | FPGA e2e | C++ e2e | FPGA/C++ | FPGA op ms | C++ op ms | op ratio | CPU-s C++/FPGA |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| taxi_d1 | 3.0M | 0.034 | 0.036 | 1.06× | 10.9 | 13.4 | 1.23× | 4.55× |
+| tpch_qty | 6.0M | 0.061 | 0.072 | 1.18× | 17.3 | 26.8 | 1.55× | 3.46× |
+| taxi_d2 | 6.0M | 0.063 | 0.079 | 1.25× | 18.3 | 29.2 | 1.59× | 3.51× |
+| extprice | 6.0M | 0.093 | 0.132 | 1.42× | 49.8 | 83.5 | 1.68× | 8.10× |
+| taxi_d3 | 13.1M | 0.129 | 0.160 | 1.24× | 37.2 | 52.8 | 1.42× | 2.96× |
+| taxi_d4 | 20.3M | 0.200 | 0.258 | 1.29× | 56.1 | 77.3 | 1.38× | 2.61× |
+| **sf10** | 60.0M | 0.864 | 0.742 | **0.86×** | **437.1** | 325.6 | **0.74×** | 3.64× |
+
+**With 1 lane the FPGA still wins 6/7 on the operator; only sf10 LOSES (0.74×) — and CPU-seconds stays a
+win on all 7 (2.6–8.1×).** So even the crippled build beats the CPU on host efficiency everywhere.
+
+### 11d. Root cause of the sf10/extprice slowdown: 1 vs 4 decode lanes (CONFIRMED)
+
+`N_DECODERS` defaults to 1 in CMake; build-20 CMakeCache = `4`, build-21 = `1`. Decoder resources:
+build-20 = 4 lanes / 307,988 LUTs, build-21 = 1 lane / 76,417 LUTs. Phase breakdown proves decode is the
+whole regression (`OASIS_IQR_TIMING=1`, sf10, memcpy):
+
+```
+build-21 (1 lane): decode 360.66 ms (fpga_wait 246.14 | fetch 48.03 | submit 25.51 | copy 36.25)
+                   iqr 77.43 (passes 76.79)   heavy 438.12
+build-20 (4 lane): decode ~92 ms                (§4)          passes ~38 (fused)   heavy ~137
+```
+
+`fpga_wait 246 ms` = the host idle, waiting on the single decoder (decode-lane starvation). Decode alone
+went ~92 → 360 ms (~3.9×); `passes`/`win_derive` are unchanged (PCIe-bound, lane-independent). **Fix:
+build-23 = same 4096 RTL with `scripts/synthesize.sh --no-rdma --decoders 4`** (running on hacc-build-02,
+~9h). Expect sf10 `decode` → ~90–110 ms, `heavy` → ~170 ms (memcpy) / ~137 (fused), sf10 back to a win.
+
+### 11e. Fusion: wall-clock LOSS at taxi sizes, CPU-seconds WIN (fuse_min_rows raised 10M→30M)
+
+Once the ragged stitch let taxi fuse, medians showed (1-lane build, `--cpp-impl groupby`): memcpy op
+36.1/54.1 ms (FPGA/C++ **1.43×/1.33×**) vs fused 43/62 ms (1.19×/1.16×) — fusion is **+7 ms op** but
+**CPU-seconds ~2.7× → ~4.9×**. Dropping `WINDOW_FPGA` doesn't recover latency (it's fusion overhead, not
+the window pass) and hurts CPU-s. So fusion only wins wall-clock at sf10 scale (§5/§9.19). **`fuse_min_rows`
+raised 10M → 30M** so taxi_d3 (13M) / taxi_d4 (20M) stay on the latency-optimal memcpy path; sf10 and any
+>30M taxi-shaped column still fuse, proven per-row exact.
+
+### 11f. Index mode — RTL healthy, sim-proven (5/5 TBs), still guarded off at 4096
+
+All index-mode testbenches pass; the two leak TBs go red→green (the §8 defect signature):
+`run_index_tb` (index≡value, 0 err), `run_idx_mode_tb` (7 scenarios, 0 err), `run_index_stream_tb`
+(`o_last` drain, 7 scenarios, 0 err), `run_indexflag_last_tb` (RESTART=0 LEAK 128 → RESTART=1 CLEAN),
+`run_wide_pack_reset_tb` (`i_restart`, RESTART=0 LEAK 192 → RESTART=1 CLEAN). The `i_restart` fix rides
+build-21/23 but **dormant** — index mode's 14-bit index saturates at 4096 bins (fence indices ~+20475 vs
+±8191), so `enable_index_pass2` throws. Enabling it at 4096 needs the re-widen (`IDX_W` 14→16, `IDX_BITS`
+16→32, three `/16` sites) → a build-24 after build-23 validates. Documented index speedup (build-20, 1024
+bins): pass 2 **38.41 → 9.69 ms (3.96×)**, sf10 heavy 139 → 110 (−21%).
+
+### 11g. Shipping defaults flipped ON (build-21) + new tooling
+
+`OASIS_IQR_WINDOW_IQR` (memcpy + fused window rule), `OASIS_IQR_STREAM_RAGGED` (host stitch),
+`fuse_min_rows=30M` — all env-overridable with `=0`. Index mode stays OFF (guarded). New:
+`bench/fused_perrow.sh`, `bench/compare_dumped_flags.py`, `bench/e2e_sweep.sh`, `OASIS_IQR_DUMP_FLAGS`.
+Host rebuilt (software → install → shell). RTL 4096 change committed `2fbea51`; the default flips +
+`derive_window` IQR rule + the tooling are uncommitted at time of writing.

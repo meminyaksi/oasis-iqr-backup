@@ -1,7 +1,454 @@
-# RESUME DOC — IQR FPGA vs CPU (updated 2026-07-26: 4096-bin change + obstacle-1 host stitch IMPLEMENTED, offline-verified, NOT yet on silicon/hardware)
+# RESUME DOC — IQR FPGA vs CPU (updated 2026-08-08: **WNS ARC DONE at −0.518 ns, HBM REMOVED, PRODUCTION = `build-29/bitstreams/cyt_top_b29_po.bit`** (4/4 silicon gates). Focus has MOVED to **microbenchmarks → `micro_bench.md`** (Test 1 size sweep, Test 2 cardinality sweep both complete). Next: Test 3.)
 
-**Read this first after a compact.** Authoritative numbers: `bench/RESULTS.md` §9. This session's full
-write-up is **`results_new.md`** (§1–10, root to repo). This file is state + next actions.
+**Read this first after a compact.** Three companion docs, each with a distinct job:
+- **`micro_bench.md`** — ⬅️ **CURRENT WORK.** Controlled synthetic sweeps, one variable at a time.
+- **`report_2807.md`** — the 7 REAL datasets, all END-TO-END/consume (numbers from build-23).
+- `bench/RESULTS.md` §9 — authoritative historical numbers. `results_new.md` §11 — prior session.
+
+This file is state + next actions.
+
+> 🔬 **NEWEST (2026-08-08). TWO THINGS HAPPENED: the WNS arc FINISHED at −0.518 with HBM finally
+> removed, and the work moved to MICROBENCHMARKS (`micro_bench.md`). Read that file before proposing a
+> new test.**
+>
+> ## A. Hardware: production is now `build-29` + phys_opt ladder, **WNS −0.518 ns**, HBM OUT
+>
+> **USE `hardware/build-29/bitstreams/cyt_top_b29_po.bit`.** Validated 4/4 on silicon
+> (correctness 0/0/104/0/0/0/0 · overlap 200/200 both sets · value-path perf within noise of build-23 ·
+> fused sf10 count=0, heavy 138.6 ms). Fallback chain: `build-29/cyt_top.bit` (−0.553) →
+> `build-28/cyt_top_ssi_spreadslls.bit` (−0.657) → `build-28/cyt_top.bit` (−0.995) → build-23 (−1.879).
+>
+> **Full arc −1.879 → −0.518 = +1.361 ns**, performance unchanged throughout. What each lever gave:
+>
+> | change | gain | note |
+> |---|---|---|
+> | index mode retired (`EN_INDEX=0`) | +0.383 | `idx_pack` cluster deleted |
+> | diag reduction pipelined (8→4→2→1) | +0.501 | 683 LUTs; latency-insensitive CSR readback |
+> | **`place_design -directive SSI_SpreadSLLs`** | **+0.338** | P&R only. ML had picked `SSI_BalanceSLRs` (balances CELLS, blind to crossings) |
+> | **HBM removed (`EN_MEM=0`)** | **+0.104** | −40k LUTs / −66k FFs; 42.5% → **39.4%** LUT |
+> | phys_opt `AggressiveFanoutOpt` + `AlternateReplication` | +0.035 | post-route ladder, hold-checked |
+>
+> **⚠️ TWO THINGS THAT MUST NOT BE LOST:**
+> 1. **`OASIS_PLACE_DIRECTIVE=SSI_SpreadSLLs` must be exported for EVERY future build.** The override
+>    lives in `parcore/libstf/coyote/scripts/impl/pnr_shell.tcl.in` (a *generated* file — build dirs
+>    regenerate it, so editing `build-NN/pnr_shell.tcl` does nothing). Without the env var the ML
+>    predictor picks `BalanceSLRs` again and HBM-out re-measures the OLD WRONG ~−2.15 answer.
+>    Verify ~2 h in: `grep -m1 "OASIS: place_design" hardware/build-NN/bitgen.log`.
+> 2. **HBM removal was only safe BECAUSE of SpreadSLLs.** Under `BalanceSLRs` removing HBM cost
+>    0.66–0.68 ns twice (it was an accidental floorplan anchor). Do not re-test HBM under BalanceSLRs
+>    and conclude anything.
+>
+> **⚠️ HOLD MARGIN IS 1 ps.** `WHS +0.001` (was +0.004). Replication eats hold. Precedent: the
+> `IqrWideFlagPack` forwarding regs sat at **+0.021** and lost ~10% of histogram counts on silicon while
+> being bit-exact in sim. So if anything ever looks flaky, **suspect hold, not setup**, and re-run —
+> the historical signature was *wandering* results across runs, not a clean failure.
+>
+> **Timing is now a FLAT WALL and directives are EXHAUSTED.** 11 P&R runs across all three axes bought
+> +0.021 in total beyond SpreadSLLs. `SSI_HighUtilSLRs` is UNROUTABLE (14,525 unrouted signals, 5 h
+> wasted). Both route directives tried were WORSE. The only lever left that can reach −0.5 is
+> **`EN_UCLK=1` + `UCLK_F=225`** (+0.444 ns of period, arithmetic not luck) — ⚠️ `EN_UCLK` and `UCLK_F`
+> MUST move together: `user_clk_tmplt.txt` constrains the user region from `uclk_p` unconditionally, so
+> `UCLK_F=225` with `EN_UCLK=0` relaxes the CONSTRAINT while the hardware still runs at 250 MHz = a
+> beautiful report and a broken bitstream. Use 225 not 200 (measured `eff` is 12.49 GB/s; 200 MHz gives
+> only 12.8). **Not needed — the design is correct and fast as-is.**
+>
+> Harnesses that now exist: `hardware/build-28/pnr_reseed.tcl` (place-directive sweep),
+> `build-28/route_sweep.tcl` (route sweep from a fixed placement),
+> `build-29/physopt_iterate.tcl` (post-route ladder, re-opens best checkpoint per attempt, REJECTS any
+> directive that breaks hold, writes the bitstream as soon as anything improves),
+> `build-28/reseed/status.sh` (multi-run status; filters Vivado echoing the .tcl source).
+>
+> ## B. Microbenchmarks — `micro_bench.md`, the CURRENT thread
+>
+> **NEW MEASUREMENT PROTOCOL (supersedes medians+spread for microbenchmarks, user's instruction):**
+> **run 7 times in ONE DuckDB session, report the arithmetic MEAN OF THE LAST 3. No median. No spread.**
+> First 4 iterations are warm-up (kills the §9.18 allocator-pooling bimodality).
+>
+> **CPU arm is `iqr_cpu_flags_groupby()` ONLY. NEVER use or report `--cpp-impl zoom`** — user's explicit
+> instruction; `card_sweep.py` no longer accepts it.
+>
+> Harnesses: `bench/gen_size_sweep.sh` + `bench/size_sweep.py`, `bench/gen_card_sweep.sh` +
+> `bench/card_sweep.py` (imports `size_sweep.run_arm`, so the protocol is shared, and `medians.py` for
+> the arm definitions). Every sweep SELF-CHECKS: outliers are placed in an empty value gap far outside
+> the fence, so expected flags is exact and quantisation-proof, and all 7 iterations are verified.
+>
+> **Test 1 — size sweep 1M→100M, fusion off vs on.** Everything affine in N:
+> `value ≈ 3.1 ms + 3.34 ms/Mrow` · `fused ≈ 9.5 + 2.20` · `CPU ≈ 56.5 + 3.93`.
+> - FPGA wins at EVERY size (this **corrects** §2's old "crossover at 10M, FPGA loses above 13M" — that
+>   was an artefact of 7 datasets differing in encoding AND cardinality AND size).
+> - **Fusion costs +6.4 ms fixed, saves 1.14 ms/Mrow ⇒ break-even 5.6M predicted / 6M measured.**
+>   `passes` halves EXACTLY (127.17 → 63.80 ms at 100M = 1.993×) — two streamed passes become one.
+> - Fusion changes the ASYMPTOTE: marginal advantage 1.18× → 1.79×, so speedup plateaus at ~2× instead
+>   of decaying to 1.3×. **Fusion is what makes the FPGA advantage durable at scale.**
+> - Fusion halves host CPU-seconds and wins at EVERY size — at 1M it is 1.51× WORSE on wall-clock but
+>   2.99× BETTER on CPU-seconds. **So the wall-clock and CPU-seconds crossovers differ; an auto-fusion
+>   policy must CHOOSE which metric it optimises.**
+>
+> **Test 2 — cardinality sweep, 10M rows fixed, 10 → 10M distinct.** Took THREE generator attempts;
+> the first two produced plausible-but-wrong trends and are documented as superseded in `micro_bench.md`:
+> v1 `level*(RANGE/CARD)` left low-bit structure that imbalanced the CPU's RADIX aggregation and
+> manufactured a fake monotonic decline; v2 fixed that with a multiplicative permutation but encoding
+> and bytes/row still moved with cardinality. **v3 pins both** (`DICTIONARY_SIZE_LIMIT 0` forces PLAIN
+> everywhere; `COMPRESSION UNCOMPRESSED` pins bytes/row at exactly 8.00), which makes **the FPGA arm's
+> flatness an internal check on the sweep itself**.
+> - **FPGA is INDIFFERENT to cardinality** — flat 31.0–32.9 ms over six decades (uncompressed control).
+> - **CPU is O(rows) + O(distinct); the knee is at C ≈ 1% of N** — 1.00× at 10k, 1.14× at 100k,
+>   2.25× at 1M, **8.28×** at all-distinct. GROUP BY always does N probes; cardinality only adds
+>   per-distinct-value table + sort work.
+> - **Speedup runs 1.4× → 11.7×** on one bitstream, same row count. The arms differ in COMPLEXITY, not
+>   in constants — the strongest single result so far.
+> - Compression: a 4.2× byte reduction buys only ~21% of operator time ⇒ the FPGA has a large
+>   byte-independent floor (~24 ms at 10M rows). **Quote the SNAPPY table** (realistic); uncompressed is
+>   the isolation control.
+> - `distinct~` ≠ `card` by design: outlier rows add their own levels, and coupon-collector coverage
+>   caps the top point at `1−e⁻¹` ≈ 63%.
+>
+> **Datasets on disk:** `~/datasets/sizesweep` (1.5 GB) · `~/datasets/cardsweep10m` (uncompressed) ·
+> `~/datasets/cardsweep10m_snappy` · plus superseded `cardsweep`, `cardsweep_scatter` (v1/v2, can delete).
+>
+> ## C. ➡️ NEXT: Test 3, and two open threads
+>
+> 1. **Test 3 = distribution shape and/or ragged row groups.** Neither Test 1 nor Test 2 explains the
+>    real-dataset residual: Test 1's size model predicts the two PLAIN high-card real datasets almost
+>    exactly (extprice 0.99×, sf10 0.90×) but OVER-predicts every dictionary-encoded one by 1.29–2.54×
+>    (taxi_d1 3.48 predicted vs 1.37 measured). Test 2 shows the FPGA gets *faster* on low-byte data, so
+>    encoding/cardinality runs the WRONG WAY to explain it. Remaining suspects: **tail-heavy
+>    distribution** (every synthetic set so far is uniform) and **odd row groups** needing the host
+>    ragged stitch (taxi has 51449/124849). Expect the distribution sweep to show FPGA-flat — that is
+>    the data-obliviousness claim and the natural joint panel with the friend's z-score operator.
+> 2. **Auto-fusion policy.** Shipped `fuse_min_rows()` is **30M** (`extension/src/oasis_iqr.cpp:296`,
+>    env `OASIS_IQR_FUSE_MIN_ROWS`); measured crossover is **6M** on clean high-card data. Do NOT just
+>    lower the constant — 30M was set from taxi, where fusion LOST wall-clock at 13M and 20M because of
+>    the ragged stitch + tail-heavy window. Measure taxi's own crossover first, then make the policy a
+>    function of shape. `FooterFacts` (`oasis_iqr.cpp:560`) exposes only `rows` and `stream_ok` today; it
+>    already walks every group's `num_values`, so adding a ragged flag + bytes/row is cheap.
+> 3. **Encoding test is now possible at FIXED cardinality.** `DICTIONARY_SIZE_LIMIT` forces the writer
+>    both ways (verified: `0` → PLAIN at card=1k; `10 MB` → dictionary at card=100k; `50 MB` →
+>    dictionary at card=1M, which makes the file BIGGER at 8.91 B/row). DuckDB's default flips
+>    dictionary→PLAIN at a ~128 KB dictionary page ≈ 20–30k distinct per row group (measured).
+>
+> **UNCOMMITTED (nothing committed across this whole arc — commit was offered repeatedly, never done):**
+> `hardware/CMakeLists.txt` (EN_MEM→0 + rationale), `hardware/src/vfpga_top.svh`,
+> `hardware/iqr_app/hdl/IQR_detection.sv` (EN_INDEX + diag pipeline),
+> `parcore/libstf/coyote/scripts/impl/pnr_shell.tcl.in` (**the directive override — most important to
+> keep**), the 4 P&R harnesses, `bench/{gen_,}size_sweep.*`, `bench/{gen_,}card_sweep.*`,
+> `bench/reseed/status.sh`, `micro_bench.md`, and the sweep CSVs. Plus prior-session uncommitted:
+> index re-widen, `report_2807.md`, bench logs.
+>
+> ⚠️ **Bitstream provenance for the microbenchmarks is UNVERIFIED** — the flash command was never
+> captured before those runs. Presumed `build-29/cyt_top_b29_po.bit`. Confirm with
+> `cat /sys/kernel/coyote_sysfs_0/cyt_attr_cnfg | grep "enabled memory"` → **0** = build-29 (HBM out),
+> **1** = a build-28 bitstream. Correctness stands either way; only timing attribution changes.
+
+> 🥇 **NEWEST (2026-08-06). THE PLACER WAS OPTIMIZING THE WRONG THING. `place_design -directive
+> SSI_SpreadSLLs` takes build-28 from −0.995 → **−0.657 ns** (+0.338) with NO RTL change, NO HBM change
+> and NO Pblocks — P&R only, resumed from `shell_opted.dcp`. PRODUCTION =
+> `hardware/build-28/bitstreams/cyt_top_ssi_spreadslls.bit`, VALIDATED 4/4 ON SILICON.**
+>
+> **1. The directive sweep (P&R-only, ~4 h each, 3 run in parallel on hacc-build-02).**
+> Harness: `hardware/build-28/pnr_reseed.tcl` (tagged checkpoints/reports/bitstream, never clobbers the
+> originals; needs `export TERM=xterm` for base.tcl's `tput` colors; run each from its OWN cwd so
+> `vivado.jou/log` don't collide; `-tclargs <DIRECTIVE> <maxThreads>`).
+>
+> | place directive | WNS | note |
+> |---|---|---|
+> | `SSI_BalanceSLRs` | −0.995 | build-28 default — **ML-auto-picked**, `Place 30-1947` |
+> | `SSI_BalanceSLLs` | −0.997 | byte-identical SLL table → placed the same, no gain |
+> | **`SSI_SpreadSLLs`** | **−0.657** | ✅ **WINNER**, TNS −63k→**−22k**, failing endpoints 209k→**111k** |
+> | `SSI_HighUtilSLRs` | ❌ FAILED | unroutable after 5 h10: `Route 35-162` 14,525 signals unrouted, 16,688 node overlaps |
+>
+> **2. WHY (and my first hypothesis was WRONG — don't repeat it).** I predicted SLL *column congestion*:
+> build-28's route log shows `Estimated SLL Demand Per Column` with **column 12 at 1793/1440 = 125%** while
+> overall SLL use is only 32–35%. **That was NOT the lever.** The winner has column 12 at **142%** and MORE
+> total SLL demand (18,923 vs 15,592) — more crossings, worse column, 0.338 ns BETTER. What actually
+> changed is the route/logic split on the critical path: build-28 was 28.7% logic / **71.3% route** with
+> 8× CARRY8 (`histogram_feed`→`iqr_detection`, crossing SLR 1→2 on a **1.390 ns** net); SpreadSLLs is
+> 47.8% logic / **52.2% route**, 4× CARRY8, worst path now INSIDE one decoder. `SSI_SpreadSLLs`
+> ("allocate extra area for regions of higher connectivity") gave the four ~77k-LUT decoders room to sit
+> compactly, so their INTERNAL paths stopped detouring. **Lesson: judge a placement by the route/logic
+> ratio on the critical path, not by aggregate crossing counts.**
+>
+> **3. The design needs SPACE, not density — proven both directions.** `SSI_HighUtilSLRs` ("place logic
+> closer together in each SLR") blew up into 14.5k unroutable signals; `SSI_SpreadSLLs` (spread) won.
+> Two opposite directives, unambiguous answer: this design is **connectivity/area-limited**. This is the
+> strongest argument yet for finally removing HBM (point 5).
+>
+> **4. ✅ 4/4 GATES PASS on `cyt_top_ssi_spreadslls.bit`** (node alveo-u55c-01, 2026-08-06). A re-placed
+> design does NOT inherit another build's validation — always re-run all four.
+> - Correctness: `fpga_vs_cpp` = **0/0/104/0/0/0/0** exact, `cpp_vs_sql` = 0 on all 7.
+> - Window/accuracy: **200/200** ov_uniform + ov_drift, serial + overlapped.
+> - Value path (`e2e_sweep.sh`): sf10 **199.5** ms (b28 200.9, b23 200.0), extprice **23.0 → 3.67×**,
+>   taxi_d2 1.78×, sf10 1.59×, CPU-seconds 2.8–8.5×. All 7 within noise of build-23/28.
+> - Fused: `pass1=fused`, **count = 0**, `heavy` **139.08** ms (b28 139.42, b23 137), `passes` 38.42,
+>   `decode` 92.15 / `fpga_wait` 33.05, **eff 12.49 GB/s**, INPUT `stalled=0.0%`.
+>
+> **5. ➡️ NEXT.** (a) Two untested "spread"-family variants — **`SSI_SpreadLogic_high`** and
+> **`SSI_SpreadLogic_Explore`** — are free (P&R only, ~4 h, no RTL/HBM) and in the proven-correct
+> direction; watch for `Route 35-162` and kill early rather than waiting 5 h for a HighUtilSLRs-style
+> failure. (b) **Then the clean HBM-out build** (`EN_MEM 0`, `N_CARD_AXI 1`) with the winning directive
+> **FORCED** in `pnr_shell.tcl` — ⚠️ **the override is mandatory**, otherwise the ML predictor picks
+> `SSI_BalanceSLRs` again and you re-measure the OLD, WRONG HBM-out answer (the −0.66 ns penalty in the
+> 2026-08-05 banner's 2×2 was measured ONLY under `SSI_BalanceSLRs`, so it is no longer decisive).
+> (c) **Expectation-setting:** the wall is now FLATTER THAN EVER — top 10 clusters span **0.004 ns**
+> (−0.653…−0.657), 5 of them decoder-internal at **47.8% logic**. Logic depth is becoming the floor and
+> placement cannot fix logic depth, so HBM-out plausibly reaches ~−0.4/−0.5, but not 0 without pipelining
+> inside the parcore decoder or lowering the clock (`EN_UCLK`, 2026-08-05 banner point 7).
+>
+> 🏆 **PREVIOUS (2026-08-05). WNS ARC: `build-28` = WNS −0.995 ns
+> (build-23 was −1.879 → **+0.884 ns**), and it is VALIDATED ON SILICON on all four gates with
+> performance IDENTICAL to build-23. ⚠️ **SUPERSEDED 2026-08-06 by the re-placed
+> `cyt_top_ssi_spreadslls.bit` at −0.657 (top banner); `cyt_top.bit` is the fallback, build-23 the
+> second fallback. Everything below about RTL/HBM/EN_UCLK still applies — only the placement changed.**
+>
+> **1. ✅ ALL FOUR GATES PASS (node alveo-u55c-01, 2026-08-05).** Do not re-litigate these.
+> - **Correctness** (`bench/sql/cpu_op_correctness.sql`): `fpga_vs_cpp` = **0 / 0 / 104 / 0 / 0 / 0 / 0**
+>   — EXACT match to the documented 4096-bin gate; `cpp_vs_sql` = 0 on all 7. Absolute counts reconcile
+>   against the old 1024-bin table (318801−1247, 628322−2877, 1328270−162, 2057243+54921).
+> - **Window/accuracy** (`bench/overlap_ab.sh accuracy`): **200/200** on ov_uniform AND ov_drift, both
+>   serial and overlapped (`pass1=overlapped` confirmed, so the guard did not silently reject).
+> - **Value-path perf** (`bench/e2e_sweep.sh`): every dataset within **±2%** of build-23 — taxi_d1 10.1,
+>   tpch_qty 16.4, taxi_d2 16.2, extprice 23.1, taxi_d3 33.5, taxi_d4 50.5, **sf10 200.9** (b23: 200.0).
+>   extprice **3.65×**, sf10 1.60×, CPU-seconds 2.9–7.6×.
+> - **Fused path** (the timing-stressing one — 4 decoder lanes driving the feed at full rate, which is
+>   where the worst path lives): `pass1=fused`, **count = 0 (CORRECT)**, `heavy` **139.4 ms** (b23: 137),
+>   `passes` 38.43, `decode` 92.36 / `fpga_wait` 31.79 (= build-20's best 4-decoder figures),
+>   **eff 12.49 GB/s**, INPUT `stalled=0.0%`.
+> ⚠️ **`e2e_sweep.sh:20` `unset`s `OASIS_IQR_FUSE`/`STREAM`/`WINDOW_FPGA` → it measures the VALUE path.**
+> sf10's 200.9 ms must be compared to build-23's **200.0** value path, NOT to the 137 ms fused number.
+> Misreading 200-vs-137 looks like a 47% regression that does not exist.
+>
+> **2. What actually bought the +0.884 ns (a clean 2×2 factorial, no interaction).**
+>
+> | | index **IN** | index **OUT** |
+> |---|---|---|
+> | **HBM IN** | −1.879 (b23) | −1.496 (b27) → **−0.995 (b28, +diag fix)** |
+> | **HBM OUT** | −2.562 (b25) | −2.154 (b26) |
+>
+> HBM-in is worth **+0.683 / +0.658 ns** (two independent paired tests, agreeing to 0.025 ns); index-out
+> is worth **+0.383 / +0.408 ns**. Independent and additive. Then the **diag-reduction pipeline** (point 3)
+> added **+0.501 ns** on top.
+>
+> **3. ✅ THE build-28 FIX: pipeline the `dbg_*` diagnostic reduction** (`IQR_detection.sv` ~line 537).
+> The flat `always_comb` Σ over the 8 per-bank `diag_*` counters into the config CSR was the build-27
+> critical path (−1.496, 15 levels, 76% route). Replaced with a **registered 8→4→2→1 adder tree** (mirrors
+> the scan-merge pipeline below it) for all four sums. These feed ONLY the host CSR readback, sampled after
+> a run, so the 3-cycle latency is invisible. **Cost: 683 LUTs. Gain: +0.501 ns WNS, TNS −159k→−63k (2.5×),
+> failing endpoints 322k→209k.** `inst_read_regs` fell from the #1 worst path to the #6 cluster. Sim PASS
+> (`run_fused_integration_tb`: diags settle to accepted=committed=96=N; `run_bins4096_tb` 0 errors).
+>
+> **4. ⚠️ THE WALL IS NOW FLAT — stop hunting single paths.** Top 12 failing clusters all sit between
+> **−0.971 and −0.995** (0.024 ns spread) across completely unrelated modules: `inst_iqr_detection` (53
+> paths), shell `inst_duplicator`/skid buffers, vhsnunzip `long_decoder`, `run_decoder` on decoders 0/1/3
+> (139+35+33), `inst_read_regs` (41), `output_writer` FIFOs, dictionary crossbar. That is a **global
+> routing/congestion limit**, not a dominant path — fixing the current worst path would buy **~0.008 ns**.
+> **949 of 1000 failing paths are entirely inside user logic**; LUT is only **42.5%**, so it is congestion
+> + SLR crossings, NOT capacity. (Calibration: the fix that bought +0.501 ns cost 683 LUTs. Area and WNS
+> are nearly decoupled in this design.)
+>
+> **5. The current worst path (−0.995), for the record.** `iqr_histogram_feed/sk_occ` → round-robin arbiter
+> → `keep` popcount → **`(fed + beat_elems) >= i_expected`** (a flat 64-bit add+compare = **8× CARRY8**) →
+> `out.last` → `iqr_detection` FSM next-state → **SLR crossing 1→2 (one net burning 1.390 ns)** →
+> `FSM_onehot_state_reg[0]/CE`. 17 levels, 71% route, +0.268 ns inter-SLR penalty. Feed placed at Y401
+> (SLR1), FSM reg at Y481 (SLR2). This is the `i_expected` end-of-dataset mechanism. **PROVEN BENIGN** by
+> the fused gate (count=0 under full 4-lane load). Cheap RTL fix IF another build ever happens (do NOT
+> spend a build on it alone): keep a **registered `remaining = i_expected − fed`** and compare
+> `beat_elems >= remaining[3:0]` — valid because `beat_elems ≤ 8` — which deletes all 8 CARRY8 levels.
+>
+> **6. ❌ DO NOT retry removing HBM.** Measured TWICE with proper pairing (point 2): it costs
+> **0.66–0.68 ns**. The mechanism is **floorplan anchoring** (the HBM controller pins a block in SLR0;
+> without it the placer scatters the four ~77k-LUT decoders across SLRs — build-26's worst path crossed
+> **4** boundaries inside one decoder), NOT area pressure. HBM costs 40,010 LUTs = **3.1% of the device**
+> at 42.5% utilization, so freeing it relieves nothing. Placement luck was ruled out by the reseed
+> (`-directive ExtraTimingOpt` → −2.582). The only viable version of the idea is "remove HBM AND explicitly
+> Pblock each decoder into one SLR" — upside bounded to ~0.1–0.2 ns, not worth 9 h.
+>
+> **7. ➡️ IF you ever need to actually MEET timing: `EN_UCLK=1` + `UCLK_F=200` (or 225).** This is the
+> right lever for a flat wall and it is **OPTIONAL** — build-28 is correct and fast as-is. Put the user
+> logic in its own slower clock domain: it targets exactly the right region (99.8% of failing paths are
+> user logic) and leaves the **locked 250 MHz static-layer checkpoint** untouched (lowering `ACLK_F`
+> needs `BUILD_STATIC=1`). Config lives in `parcore/libstf/coyote/cmake/FindCoyoteHW.cmake:191-194`
+> (`EN_UCLK` default 0, `UCLK_F` default 250). 200 MHz → period 4.0→5.0 ns = covers the whole −0.995 wall;
+> 225 MHz → +0.44 ns. **Throughput caveat now measured:** the fused run shows **eff 12.49 GB/s**, and
+> 512-bit @ 200 MHz = 12.8 GB/s — that is cutting it close, so **prefer 225 MHz (14.4 GB/s)**. Costs: CDC
+> FIFOs, new crossing paths, a config never yet built. **Pblocks are now LESS attractive than the old plan
+> assumed** — they would fix the decoder clusters but leave IQR, the shell converters, vhsnunzip and
+> output_writer all at −0.99.
+>
+> **Build inventory (WNS, config):** build-21 (1 dec, −0.355, report §4 1-lane) · build-23 (4 dec, HBM in,
+> index in, −1.879 — previous production, report_2807; known-good fallback) · build-24 (index re-widen,
+> −1.31, index mode BROKEN idx_pack) · build-25 (HBM out, index in, −2.562; reseed −2.582) · build-26 (HBM
+> out, index out, −2.154, 513k LUTs) · build-27 (HBM in, index out, −1.496, 553k LUTs) · **build-28 (HBM in,
+> index out, +diag pipeline, −0.995, 553,744 LUTs / 42.5% — PRODUCTION, silicon-validated 4/4 gates).**
+> All .bit present on disk.
+>
+> **UNCOMMITTED (nothing committed across this arc — commit was offered, not done):**
+> `hardware/CMakeLists.txt` (EN_MEM→1 + the anchor rationale comment), `hardware/src/vfpga_top.svh`
+> (`ifdef EN_MEM` card tie-offs + `IQR_EN_INDEX` gating + `iqr_idx_on` output steering),
+> `hardware/iqr_app/hdl/IQR_detection.sv` (`EN_INDEX` param + 3 gated index regions + the pipelined diag
+> reduction), `hardware/build-25/pnr_reseed.tcl` (new P&R reseed harness). Plus prior-session uncommitted:
+> index re-widen (RTL + host), `report_2807.md`, bench logs.
+
+> 🏁 **NEWEST (2026-08-04). WNS-FIX ARC on build-23. Two levers tried to beat build-23's WNS −1.879:
+> (A) remove the unused HBM stack, (B) remove index mode. Verdict: (A) BACKFIRED (HBM was a floorplan
+> anchor), (B) WORKED (+0.408 ns, index-mode logic gone, sim-proven). Net still short of build-23 because
+> the DECODERS straddle SLRs. Now rebuilding build-27 = HBM back IN + index OUT; Pblocks are the fallback.**
+>
+> **Baseline: build-23 = −1.879 ns**, worst path `iqr_histogram_feed → iqr_detection/idx_pack` (1 SLR
+> crossing). This is the design report_2807 was measured on — bit-exact value path, HBM in, index in
+> (index unused by the numbers). ⚠️ **SUPERSEDED 2026-08-05: use `build-28` (see the top banner);
+> build-23 is now only the known-good fallback.**
+>
+> **1. ⚠️ HBM removal BACKFIRED (EN_MEM 0 → build-25/26).** The HBM controller pins a block in SLR0 and
+> was acting as a FLOORPLAN ANCHOR; removing it un-anchored the placer → the four ColumnChunkDecoders
+> scattered across SLRs. **build-23 (HBM in) −1.879 → build-25 (HBM out) −2.562** (−0.68 ns), worst path
+> became decoder-INTERNAL crossing 2–4 SLR boundaries. Reseed (place `-directive ExtraTimingOpt`, P&R-only
+> from `shell_opted.dcp`) → **−2.582** = NOT placement luck, it's structural. Lesson: WNS here is dominated
+> by SLR crossings, NOT capacity (LUTs only ~40%); "lighter" ≠ better timing. **HBM kept IN going forward.**
+>
+> **2. ✅ Index mode RETIRED (RTL) + SIM-PROVEN.** Supersedes the old build-25 "pipeline `IqrIndexPack`"
+> plan — index mode is REMOVED, not fixed. Compile-time `parameter bit EN_INDEX=1'b0` in
+> `IQR_detection.sv` gates `IqrIndexEncode/IqrFenceIndex/IqrIndexPack/IqrIndexFlag` behind `generate if`
+> (else-branches tie off `o_idx_*`/`o_flagw_*`/fences/`idx_pack_ready`); `wire idx_mode = EN_INDEX &
+> i_idx_mode` folds every FSM/ready/out branch to the value path. `vfpga_top.svh`: `localparam
+> IQR_EN_INDEX=1'b0`, threads `.EN_INDEX`, gates `IqrWideFlagPack`, folds output steering via `iqr_idx_on`.
+> Value path BIT-IDENTICAL to build-23. **Sim PASS:** `run_fused_integration_tb` (96 flags match,
+> dbg_total==N, mux OK), `run_bins4096_tb` (300 outliers, 0 errors). `iqr_index*.sv` module files kept
+> (uninstantiated → not synthesized; their standalone unit TBs still pass; `tb_iqr_idx_mode` now obsolete).
+>
+> **3. build-26 (HBM out + index out): WNS −2.154.** Index removal recovered **+0.408 ns** (−2.562→−2.154)
+> and the `idx_pack` failing cluster is GONE. LUTs 565k→**513k**. BUT still 0.275 ns worse than build-23,
+> and **100% of top failing clusters are now DECODERS** (`inst_run_decoder` ×4 lanes + `inst_typed_dictionary`);
+> worst path crosses **4** SLR boundaries inside one decoder. So the decoders straddling SLRs are the sole
+> remaining obstacle.
+>
+> **4. ➡️ NOW BUILDING: build-27 = HBM back IN (EN_MEM 1) + index OUT.** Config in tree: `EN_MEM 1`,
+> `N_CARD_AXI 1`, `EN_INDEX 0`. THE BET: build-23's limiting −1.879 path WAS `histogram_feed→idx_pack`,
+> which is now deleted; restoring the HBM anchor + keeping index out should land **better than −1.879**,
+> possibly MEET timing, with zero floorplanning. `scripts/synthesize.sh --no-rdma --decoders 4 --cores 32`
+> (full ~9 h, netlist change). Check `analysis.txt` WNS + confirm no `idx_pack` and whether the worst path
+> is still a decoder SLR crossing.
+>
+> **5. FALLBACK if build-27 still short: Pblock the decoders per-SLR.** Pin each of the 4
+> `genblk1[N].inst_column_chunk_decoder` into a single SLR so no decoder-internal path crosses a boundary
+> (100% of failing paths are decoder-internal). P&R-from-linked ≈ 7 h. Reseed harness exists:
+> `hardware/build-25/pnr_reseed.tcl` (resumes `shell_opted.dcp`, varies place `-directive`, writes tagged
+> checkpoints/reports, prints WNS). Reference: pre-route phys_opt "Estimated Timing Summary" is UNRELIABLE
+> (±0.5–1.5 ns) — only trust POST-ROUTE WNS.
+>
+> **Build inventory (WNS, config):** build-21 (1 dec, −0.355, report §4 1-lane) · **build-23 (4 dec, HBM
+> in, index in, −1.879 — PRODUCTION, report_2807, bit-exact; USE THIS)** · build-24 (4 dec + index re-widen,
+> −1.31, index mode BROKEN idx_pack) · build-25 (HBM out, index in, −2.562; reseed −2.582) · build-26 (HBM
+> out, index out, −2.154, 513k LUTs) · build-27 (HBM in + index out, building/next). All .bit present on disk.
+>
+> **UNCOMMITTED this session:** `hardware/CMakeLists.txt` (EN_MEM→1, anchor comment), `vfpga_top.svh`
+> (`ifdef EN_MEM` card tie-offs + `IQR_EN_INDEX` gating), `IQR_detection.sv` (EN_INDEX param + 3 gated
+> regions). Plus prior-session uncommitted: index re-widen, report_2807.md, bench logs. Nothing committed.
+
+> 🏁 **NEWEST (2026-07-28, node alveo-u55c-07/-10). build-23 [4 decode lanes, 4096 bins] VALIDATED ON
+> SILICON — the 1-decoder regression is GONE. Index mode re-widened for 4096 and built (build-24): it's
+> FAST but WRONG on silicon — `idx_pack` misses timing → build-25 must pipeline it.**
+>
+> **1. build-23 = production bitstream.** `hardware/build-23/bitstreams/cyt_top.bit` (4 lanes, 4096).
+> Decoder fix confirmed: sf10 `decode` **360→126 ms**, `fpga_wait` **246→27 ms**. sf10 back to a win:
+> value path op **200 ms (1.58×)**, **fused op 137 ms (2.33× op / 2.26× e2e)**. Correctness gate clean
+> (taxi_d3=104, sf10=0). Full sweep (consume, geomean **1.67× e2e**, extprice **3.21×**) in report_2807.
+>
+> **2. Index re-widen DONE (RTL + host), committed to the working tree, NOT yet correct on silicon.**
+> `IDX_W` 14→16, `IDX_BITS` 16→32, `o_flagw_data`/`IQR_FLAGW_LANES` `/16`→`/32`, host `IDX_PER_BEAT`
+> 32→16, guard `NUM_BINS>1024`→`>4096` (`iqr_runner.hpp`). Sim-clean: `tb_iqr_index` (204,884 combos, 0
+> err at 4096/16), `tb_iqr_index_stream` (32/16), leak TB, `tb_iqr_bins4096`. **build-24** =
+> `hardware/build-24/bitstreams/cyt_top.bit` (4 lanes + re-widen, bitgen OK, WNS −1.31).
+>
+> **3. ⚠️ build-24 index mode: FAST but INCORRECT — `idx_pack` timing defect.** Index mode engages ONLY
+> on the FUSED path (`set_idx_mode` is in `begin_fused`), so on our datasets only sf10 fuses. Fused+idx
+> on sf10: **SPEED WORKS** — `passes` **38.4→19.2 ms (2×)**, heavy **140.9→122.3 (−13%)**, INPUT beats
+> halved (N/8→N/16). **BUT count = 9 (then stable 4) vs true 0** = spurious flags. Root cause found:
+> build-24 failing paths are `inst_iqr_detection/inst_idx_pack/iqr_idx_data[...]` (WNS ≈ −1.33 ns) — the
+> 32-bit packer's 512-bit shift/output register misses setup → corrupts indices. Deterministic within a
+> session, varies across (classic setup-timing signature). **taxi_d3/d4 HANG** the index drain (same
+> defect corrupts beat/`o_last` accounting on ragged chunks). Algorithm is sim-exact; this is pure
+> timing. **FIX = pipeline `IqrIndexPack`** (split the 512-bit `shift_in→o_data` into 2 hops; it runs in
+> pass 1, not throughput-critical, so +1 cycle is free) → **build-25**. Optionally drop `EN_MEM` (unused
+> HBM, 2 of build-23's top failing clusters) to relieve congestion.
+>
+> **4. Index-mode POTENTIAL (projected, build-24, forced fusion all sizes).** Only sf10 gains: e2e
+> **150→131 ms (−13%)**, FPGA/C++ **2.19→2.52×**; ≤13M flat (pass 2 too small a share). Numbers are
+> timing-only (counts wrong); taxi_d3/d4 unmeasurable (hang). In report_2807 §6, labeled projected.
+>
+> **5. `report_2807.md` is today's deliverable** (all END-TO-END, consume, NO materialization — the right
+> metric for the in-memory-array/filter use case; `CREATE TABLE` adds a ~70% single-threaded append tax
+> that dilutes ratios toward 1.0 and is NOT our use case). Sections: window background (scheme), §1 C++
+> vs SQL (geomean 1.16×), §2 FPGA vs C++ (1.67×), §3 fusion on/off + how-fusion-works, §4 decoder 1-vs-4
+> + per-dataset, §5 1-line SQL vs group-by (4.5×), §6 index potential, WNS-vs-decoders note, cardinality
+> + index-mode appendices. Cardinality measured: tpch_qty 50, taxi ~9–15k, extprice 934k, sf10 1.35M —
+> the high-card PLAIN columns (extprice/sf10) are decode-bound → gain most from lanes.
+>
+> **➡️ NEXT (in order):** (1) **build-25** = pipeline `IqrIndexPack` (RTL + re-run the 4 index TBs), then
+> synth on hacc-build-02 `--decoders 4` (~10–11 h), flash, re-test fused+idx correctness (sf10 count must
+> = 0) + speed (passes ~19 ms) + taxi_d3/d4 no-hang. (2) then index mode ships. **UNCOMMITTED:** index
+> re-widen (RTL + host), report_2807.md, all today's bench logs. Nothing committed this session.
+
+> 🏁 **NEWEST (2026-07-27, node alveo-u55c-07). build-21 (4096-bin) ON SILICON: taxi accuracy CLOSED,
+> obstacle-1 per-row proven, defaults flipped. ONE build mistake: it was synthesized with 1 decode lane
+> instead of 4 (regressed decode-bound sf10/extprice) → build-23 (4 lanes, same RTL) is rebuilding.**
+>
+> **build-21** = `hardware/build-21/bitstreams/cyt_top.bit` (WNS −0.355 ns; failing clusters are
+> `iqr_wide_packer`/`idx_pack` = index-mode logic, guarded OFF at 4096 — value path clean). LUTRAM
+> 10240→40960 confirms 4096 bins really synthesized (4×). ⚠️ **Built `--decoders 1` (CMake default) — a
+> flag omission, not a choice; build-20 used `--decoders 4`. See point 4.**
+>
+> **1. 4096 bins + IQR-window rule → taxi is now correct AND fast on the MEMCPY (shipping) path.**
+> `fpga_vs_cpp` (per-row vs C++-exact, `correctness_3way.sh flags`), memcpy path, DEFAULTS:
+> taxi_d1 **0**, taxi_d2 **0**, taxi_d3 **104** (0.0008%), taxi_d4 **0** exact, tpch/extprice/sf10 **0**.
+> vs build-20 (1024): 1247 / 2877 / 162 / 54921. **Every taxi set improved.** The lever was NOT bin count
+> — 4096 alone on the old p1/p99 window REGRESSED taxi_d3 to 31,496; the fix was porting the
+> `WINDOW_IQR` rule ([Q1−2·IQR, Q3+2·IQR]) into `IqrRunner::derive_window` (the memcpy window). Overlap
+> gate 200/200 on ov_uniform + ov_drift.
+>
+> **2. Obstacle-1 (ragged stitch) FIXED and PER-ROW PROVEN.** With `STREAM_RAGGED` taxi_d3/d4 fuse
+> (`sink=stream pass1=fused`, no deadlock). Per-row check (`bench/fused_perrow.sh` +
+> `bench/compare_dumped_flags.py`, via new `OASIS_IQR_DUMP_FLAGS`): `net_diff == per_row_mismatch`
+> exactly (d3 104/104, d4 0/0) → **zero row swaps**, no bit-shift mislabel. The repack is real.
+>
+> **3. Fusion is a wall-clock LOSS at taxi sizes, a CPU-seconds WIN.** medians (`--cpp-impl groupby`):
+> memcpy op 36.1/54.1 ms (FPGA/C++ **1.43×/1.33×**) vs fused 43/62 ms (1.19×/1.16×) — fusion +7 ms op,
+> but CPU-seconds C++/FPGA **2.7× → 4.9×**. Dropping WINDOW_FPGA doesn't recover latency (it's fusion
+> overhead, not the window pass) and hurts CPU-s. So: **taxi stays memcpy for latency; fusion only wins
+> wall-clock at sf10 scale (§9.19).** Therefore `fuse_min_rows` RAISED **10M → 30M** — taxi_d3/d4 stay
+> memcpy; sf10+ (and any >30M taxi-shaped column) fuses, and fusion is proven per-row exact when it does.
+>
+> **4. ⚠️ DECODER REGRESSION (the build mistake) — 1 lane vs build-20's 4.** e2e sweep (index OFF, 4096,
+> 1 lane) vs build-20 (4 lanes): decode-bound rows regressed hard — sf10 op **136 → 436 ms (0.74×, now
+> LOSES to CPU)**, extprice 21.7 → 49 ms; taxi/tpch_qty ~flat. `OASIS_IQR_TIMING` isolates it: sf10
+> `decode` **92 → 360 ms**, `fpga_wait` **31 → 246 ms** (host idle on the single decoder), `passes`/
+> `win_derive` unchanged. Confirmed structural: `N_DECODERS` CMake default = 1; build-20 cache = 4,
+> build-21 = 1; decoder LUTs 307,988 → 76,417. **Fix = rebuild same 4096 RTL with `--decoders 4`:**
+> **build-23** running on hacc-build-02 (`scripts/synthesize.sh --no-rdma --decoders 4`, full opt ~9h,
+> started ~11:12, ETA ~20:00). Expect sf10 `decode` → ~90–110, `heavy` → ~170 (memcpy)/~137 (fused),
+> sf10 back to a win. Even at 1 lane the FPGA still wins **6/7 operator** and **7/7 CPU-seconds**
+> (2.6–8.1×). Full 1-decoder tables (the compare-against baseline) in **results_new.md §11c**.
+>
+> **5. Index mode — RTL healthy (5/5 sim TBs), dormant at 4096.** Re-ran all index TBs: index≡value
+> (0 err), core match (7 scen), `o_last` drain (7 scen), and the two leak TBs go RED→GREEN (`i_restart`
+> `run_wide_pack_reset_tb` LEAK 192→CLEAN; `run_indexflag_last_tb` LEAK 128→CLEAN) — the §9.23 multi-query
+> defect fix is proven and rides build-21/23. Still guarded off at 4096 (14-bit index saturates: fence
+> idx ~+20475 vs ±8191). Speedup already measured (build-20/1024): pass 2 **38.41→9.69 ms (3.96×)**, sf10
+> heavy 139→110 (−21%). To run index live at 4096: re-widen (`IDX_W` 14→16, `IDX_BITS` 16→32, 3× `/16`
+> sites) → **build-24 after build-23 validates**. Do NOT revert to 1024 (throws away the taxi accuracy).
+>
+> **DEFAULTS FLIPPED ON (build-21):** `OASIS_IQR_WINDOW_IQR` (memcpy+fused window rule),
+> `OASIS_IQR_STREAM_RAGGED` (host stitch), `fuse_min_rows=30M`. All env-overridable (`=0` to disable).
+> Index mode still OFF (guarded — throws >1024 bins). New tooling: `bench/fused_perrow.sh`,
+> `bench/compare_dumped_flags.py`, `bench/e2e_sweep.sh`, `OASIS_IQR_DUMP_FLAGS`. **Host rebuilt
+> (software+install+shell).** Verify shipping default: `bench/correctness_3way.sh flags` NO env → d3 104.
+>
+> **➡️ NEXT (in order):** (1) build-23 finishes → `head -20 hardware/build-23/analysis.txt` (ship if
+> failing paths are index-mode `iqr_wide_packer`/`idx_pack`; worry only if value-path decoder/IQR).
+> (2) flash build-23 + hugepages, re-run `bench/e2e_sweep.sh` → confirm sf10 `decode` 360→~90–110 and
+> op back to a win (compare vs §11c 1-decoder table). (3) `bench/correctness_3way.sh flags` NO env → taxi
+> still correct. (4) then build-24 = index re-widen at 4096. **UNCOMMITTED:** default flips + derive_window
+> IQR rule (`oasis_iqr.cpp`, `iqr_runner.cpp`) + tooling + these docs; RTL 4096 is committed `2fbea51` on
+> `feature/iqr-integration`. Commit was offered, not yet done.
 
 > 🟢 **NEWEST (2026-07-26, later session). Implemented two changes the previous banner planned; both are
 > code-complete and offline-verified, NEITHER is on silicon/hardware yet. Nothing committed.**
@@ -57,14 +504,29 @@ write-up is **`results_new.md`** (§1–10, root to repo). This file is state + 
 > `cmake --install .`, THEN `cmake --build extension/build/release --target shell`. (Confirmed: a naive
 > syntax-check picked up the stale `~/opt` header until `-Isoftware` was put first.)
 >
-> **➡️ Next-bitstream is now smaller:** just the **4096-bin** RTL (+ keep IQR-window default). Obstacle-1
-> no longer needs a bitstream (host-side). Index-mode i_restart (prev banner) still pending if idx ships.
-> **Uncommitted this session:** `vfpga_top.svh`, `iqr_cosim_top.svh`, `IQR_detection.sv` (comment),
-> `iqr_runner.{hpp,cpp}`, `oasis_iqr.cpp`, `iqr_detection_test.py` (2 offline-verified methods),
-> `bench/repack_ragged_flags_test.cpp`, and the standalone 4096 TB `tb_iqr_bins4096.sv` +
-> `run_bins4096_tb.sh` + the card tie-off in `vfpga-tops/iqr_detection_test.sv`. NOTE: `build-sim` was
-> regenerated on-node (the old one was stale/broken); needs `source .../settings64.sh` + `TERM` set for
-> `setup_simulation.sh` to run (cmake FindVivado / a `tput` color proc both need them).
+> **➡️ Next-bitstream is now smaller:** just the **4096-bin** RTL. Obstacle-1 no longer needs a bitstream
+> (host-side). Index-mode **i_restart fix STILL RIDES this bitstream** (`IqrWideFlagPack.i_restart` +
+> its `vfpga_top.svh` wiring are untouched) — but **dormant**, since index mode is guarded off at 4096
+> bins (`enable_index_pass2` throws). It costs nothing and is ready if index mode is later re-widened.
+>
+> **🎯 taxi_d3 (and taxi_d4) fusion needs THREE INDEPENDENT pieces — miss any one and it's wrong:**
+> (1) **STREAM_RAGGED** host stitch → lets taxi's odd-sized row groups *stream* (the precondition to
+> fuse); without it taxi falls to memcpy and never fuses. (2) **4096 bins** → correct count at the fence
+> (kills the −31,791); a *resolution* fix. (3) **WINDOW_IQR** (`OASIS_IQR_WINDOW_IQR`, Q1..Q3 window) →
+> a *stable* fused window; the default p1/p99 sampled rule is **bistable** on tail-heavy taxi (count
+> flipped 1296479↔1328108). These are ORTHOGONAL: WINDOW_IQR alone stabilized taxi_d3 on the WRONG value
+> (fence miss still there); 4096 alone can't cure the bistability (it's p1/p99 power-of-2 rounding, not
+> bin count). **Fusion's window is sample-based** (it can't see the full column); the non-fused/memcpy
+> path uses the robust full-column `derive_window`, which is why taxi has been correct on memcpy and only
+> shows window trouble WHEN fused. Today only sf10 fuses (not tail-heavy → sampled window fine). **PLAN:
+> make BOTH `STREAM_RAGGED` and `WINDOW_IQR` default alongside the 4096 bitstream**, then validate taxi
+> fused with the 3-way test. (Currently both are env flags, default OFF.)
+>
+> **✅ COMMITTED (2fbea51 on `feature/iqr-integration`), tree clean.** The commit also carries prior
+> uncommitted work (i_restart TBs, correctness_3way/methods_ab/window benches, RESULTS/results_new docs).
+> NOTE: `build-sim` was regenerated on-node (old one stale/broken); `setup_simulation.sh` needs
+> `source /tools/Xilinx/Vivado/2024.2/settings64.sh` + `export TERM=xterm` (cmake FindVivado / a `tput`
+> color proc both fail without them).
 
 > ⚡ **NEWEST (2026-07-26, node alveo-u55c-07). Re-verified the study end to end and designed the next
 > bitstream. NOTHING NEW IS ON SILICON — all RTL work below is simulation/emulation-proven only, and the
@@ -700,7 +1162,7 @@ at ~92, so step 2 alone does not win outright on sf10 — the two together are w
 | `extension/src/oasis_iqr.cpp` | `DeriveWindowFromFpga` (§8.1b, `OASIS_IQR_WINDOW_FPGA=1`, off). CPU baseline = `SelectQuartiles`/`AdvanceRankQueries` (iterative histogram zoom, 4096 L1-resident bins) + `ComputeFlagMask`. |
 | **RESULTS.md §9.24** | **the CPU-baseline optimization ledger — all 16 steps, what each was worth, and the correctness backing. Read this when asked "is the baseline fair?".** |
 | `bench/micro/` | standalone CPU microbenchmarks, no DuckDB/FPGA. `groupby_ab` (serial-merge vs radix), `scatter_ab` (the scatter is already at 50 GB/s), `threads_ab` (spawn vs pool, 4.95 -> 0.61 ms), `bins_ab`/`build_bins_ab.sh` (histogram geometries), and three GATES: `groupby_exact` (120 trials), `sort_test` (180), `pool_test` (70). Regenerate the `*_core.inc` includes from `oasis_iqr.cpp` first. §9.25–§9.35. |
-| `bench/medians.py` flags | `--cpp-impl {groupby,zoom}` picks the CPU arm (groupby is the shipping one), `--stats` prints mean-vs-median with a FLIPS detector, `--drop K` discards leading iterations. |
+| `bench/medians.py` flags | `--cpp-impl {groupby,zoom}` picks the CPU arm — **use `groupby` ONLY; `zoom` is BANNED as of 2026-08-08 (top banner §B) and `card_sweep.py` rejects it**. `--stats` prints mean-vs-median with a FLIPS detector, `--drop K` discards leading iterations. |
 | `bench/measure_all.sh` | whole campaign in ~5 min. **Index mode is opt-in** (`IQR_MEASURE_IDX=1`) because it deadlocks the card; aborts if a duckdb is already running. |
 
 ## 10. Framing for the writeup

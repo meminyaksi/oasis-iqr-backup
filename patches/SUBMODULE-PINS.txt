@@ -1,0 +1,16 @@
+# Submodule chain — exact commits (captured 2026-08-14)
+
+oasis @ 2fbea51d9a56ec7e2de92bdd196eeba028cc3771 [feature/iqr-integration]
+   c31755909c3ab0583ec27aae28a6aacfad8a02cd celeris (heads/main-10-gc317559)
+   15d3f23bdf1f2cfdb73517d8a462fc2029d9e5cd extension/duckdb (heads/main-218-g15d3f23bdf)
+   344397bb848aac786d260daf396ad09fc6a1d21f extension/extension-ci-tools (remotes/origin/v1.5.2)
+   1b8da19f6188f1c9f6318d2cdf84bc72209c7921 parcore (heads/main-5-g1b8da19)
+
+parcore submodules:
+   163a6ce46505c81fcaa57d6c1830456337d9c377 libstf (heads/main-5-g163a6ce)
+   0fc61ddda9eee05d7b882dc0bb4e4b9e2ad8db3b vhsnunzip (heads/master)
+
+libstf submodules:
+   67fbf70b68480718ca97d69b985050a13e00742c coyote (v0.2.1-261-g67fbf70b)
+
+coyote HEAD: 67fbf70b68480718ca97d69b985050a13e00742c
