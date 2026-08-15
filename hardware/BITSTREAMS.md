@@ -46,6 +46,29 @@ Provenance of the two measurement documents, now that all three relevant bitstre
 `report_2807.md` (7 real datasets, end-to-end) is **build-23**; `micro_bench.md` (Tests 1–5) is
 **build-29**. Both are re-runnable from a fresh clone without a re-synthesis.
 
+## Re-synthesising
+
+All three stored bitstreams were built with the **same** configuration — confirmed from each build
+directory's own `CMakeCache.txt`, not from memory:
+
+```
+N_DECODERS = 4     EN_MEM = 0     EN_RDMA = 0     NUM_BINS = 4096     IQR_EN_INDEX = 0
+```
+
+```bash
+export OASIS_PLACE_DIRECTIVE=SSI_SpreadSLLs          # mandatory; see patches/RESTORE.md
+./scripts/synthesize.sh --no-rdma --device u55c --decoders 4
+grep -m1 "OASIS: place_design" hardware/build-NN/bitgen.log     # verify ~2 h in
+```
+
+⚠️ **`--decoders 4` is mandatory and the CMake default is 1.** build-21 was built at 1 solely because
+the flag was omitted, and sf10's decode phase went 92 → 360 ms (`fpga_wait` 31 → 246) — a nine-hour
+build discarded. `patches/RESTORE.md` carried this wrong (it said `--decoders 1`) until 2026-08-15.
+
+Re-synthesis additionally needs READ access to `celeris-labs/parcore` (the parquet-decoder RTL, pinned
+by SHA and not mirrored into the backup repos) and ~9–11 h on `hacc-build-02`. Never build on an
+alveo node.
+
 ## Flashing after a restore
 
 The programming script consumes exactly two files: a bitstream and the driver `.ko`. The driver is a

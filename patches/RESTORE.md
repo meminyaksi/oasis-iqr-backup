@@ -41,7 +41,11 @@ does nothing. Every future bitstream must be built with:
 
 ```bash
 export OASIS_PLACE_DIRECTIVE=SSI_SpreadSLLs
-./scripts/synthesize.sh --no-rdma --device u55c --decoders 1
+./scripts/synthesize.sh --no-rdma --device u55c --decoders 4
+# ^^ --decoders 4 IS MANDATORY. The CMake default is 1 (hardware/CMakeLists.txt), and build-21 was
+# once built at 1 purely because the flag was omitted: sf10 decode went 92 -> 360 ms and fpga_wait
+# 31 -> 246 ms, i.e. a 9-hour build thrown away. All three stored bitstreams (23/28/29) are
+# N_DECODERS=4, EN_MEM=0, EN_RDMA=0 -- confirmed from their own CMakeCache.txt.
 # verify ~2 h in:
 grep -m1 "OASIS: place_design" hardware/build-NN/bitgen.log
 ```
