@@ -1,4 +1,4 @@
-# RESUME DOC — IQR FPGA vs CPU (updated 2026-08-08: **WNS ARC DONE at −0.518 ns, HBM REMOVED, PRODUCTION = `build-29/bitstreams/cyt_top_b29_po.bit`** (4/4 silicon gates). Focus has MOVED to **microbenchmarks → `micro_bench.md`** (Test 1 size sweep, Test 2 cardinality sweep both complete). Next: Test 3.)
+# RESUME DOC — IQR FPGA vs CPU (updated 2026-08-15: **WNS ARC DONE at −0.518 ns, HBM REMOVED, PRODUCTION = `build-29/bitstreams/cyt_top_b29_po.bit`** (4/4 silicon gates). **THE BENCHMARK SUITE IS COMPLETE** — Tests 1/2/3/4/5 all measured, see `micro_bench.md`. Focus is now **the paper**: 3 panels (Tests 1, 3, 4), 1 table (Test 0 = `report_2807.md`), Test 5 as a robustness control, Test 2 withdrawn.)
 
 > 💾 **BACKUP / RECOVERY (2026-08-14) — read this FIRST if the cluster home directory was wiped.**
 >
@@ -15,6 +15,10 @@
 > `~/celeris` is 4 commits beyond that — restoring oasis alone gives you an older hardware tree.
 >
 > ```bash
+> # ⚠️ FIRST: the celeris-labs submodules use git@github.com: URLs and your SSH key is GONE after a
+> # wipe, so `git submodule update` fails. Rewrite to HTTPS once, globally, before cloning:
+> git config --global url."https://github.com/".insteadOf "git@github.com:"
+>
 > git clone -b feature/mehmet           https://github.com/meminyaksi/celeris-backup.git   ~/celeris
 > git clone -b feature/iqr-integration  https://github.com/meminyaksi/oasis-iqr-backup.git ~/oasis
 > cd ~/oasis && git submodule update --init --recursive && git lfs pull
@@ -22,7 +26,21 @@
 >
 > Then follow **`patches/RESTORE.md`**: re-apply the two submodule patches (the `SSI_SpreadSLLs`
 > override lives in third-party `fpgasystems/Coyote` and CANNOT be committed anywhere reachable),
-> regenerate the datasets with `bench/gen_*.sh`, and rebuild `~/opt`.
+> regenerate the datasets with `bench/gen_*.sh` + `bench/gen_skew_sweep.py`, and rebuild `~/opt`.
+>
+> **Bitstreams: THREE are stored via git-LFS** (~205 MB; index + md5s + flash recipe in
+> **`hardware/BITSTREAMS.md`**). `build-29/cyt_top_b29_po.bit` (−0.518, production, all of
+> `micro_bench.md`) · `build-28/cyt_top_ssi_spreadslls.bit` (−0.657, the other 4/4-validated
+> fallback) · `build-23/cyt_top.bit` (−1.879, **every number in `report_2807.md`**). So both
+> measurement documents are re-runnable from a fresh clone with no re-synthesis. The driver `.ko` is
+> deliberately NOT stored — it is vermagic-pinned and must be rebuilt per kernel anyway
+> (`cd parcore/libstf/coyote/driver && make`).
+>
+> ⚠️ **Rebuilding a BITSTREAM additionally needs READ access to `celeris-labs/{parcore,celeris}`** —
+> the parquet-decoder RTL lives in the `parcore` submodule, which is pinned by SHA and is not mirrored
+> into either backup repo. Our own RTL and host code IS fully mirrored (oasis: 22 `.sv` + 2 `.svh` +
+> 29 `.cpp` + 21 `.hpp`; celeris: 89 `.sv` + 3 `.svh` + 14 `.cpp` + 13 `.hpp`). If org access is ever
+> lost, `parcore` must be mirrored too or no new bitstream can be built.
 >
 > **The VSCode workspace is saved too**: open `oasis/software/celeris-oasis.code-workspace` — it
 > points at `../../celeris` and `..`, so cloning both side by side reproduces the exact tree.
@@ -43,6 +61,52 @@
 >
 > ➡️ **When Jonas grants Write**, the work moves upstream in one command per repo:
 > `git push origin feature/mehmet` and `git push origin feature/iqr-integration`.
+> ⚠️ Drop the three LFS bitstream commits first — fine in a private backup, not in a PR.
+>
+> 📘 **`GITHUB_BACKUP_GUIDE.md`** is this whole procedure written as a teachable document (for the
+> z-score colleague, or for setting this up again from scratch).
+
+> 🧪 **NEWEST (2026-08-15). THE BENCHMARK SUITE IS COMPLETE — 5 tests measured. Next work is the
+> PAPER, not more measurement.** Everything below is in **`micro_bench.md`**; the hand-off doc for the
+> z-score half is **`microbench_roadmap.md`**.
+>
+> | test | axis | verdict | in the paper as |
+> |---|---|---|---|
+> | **0** (`report_2807.md`) | 7 real datasets | FPGA/C++ geomean **1.67×**, C++/SQL 1.16× | a **table** |
+> | **1** | rows 1M→100M | fusion changes the SLOPE: +6.4 ms fixed, −1.14 ms/Mrow, break-even 6M; `passes` halves **exactly 1.993×** | **panel (a)** |
+> | 2 | cardinality 10→10M | 1.4×→11.7×, but **WITHDRAWN** — IQR-specific, a z-score baseline is O(rows) so both arms would be flat | ❌ cut |
+> | **3** | host threads 1→32 | FPGA **flat in both phases**; CPU@32 cores still **2.36× slower than FPGA@1 core**; 10.8× fewer CPU-seconds | **panel (b)** |
+> | **4** | 8 encodings of the SAME 20M numbers | pass 2 invariant at 12.8 ms everywhere; speedup **1.12×→2.47×** on identical data ⇒ quote the encoding with every number | **panel (c)** |
+> | **5** | skewness 0.00→3.44 | **both arms flat** — FPGA varies 2.7%, speedup 2.10–2.22×. A **control**, not a panel: it defends Tests 1/3/4 against "real data is skewed" | 2 sentences |
+>
+> **Test 5 needed TWO runs to be claimable** and this is the transferable methodology point: the
+> same-point repeat spread (6.6% FPGA / 7.0% CPU) turned out **LARGER** than the across-skew spread
+> (4.7–4.8%), and the rank order fully reshuffled between sessions. One run would have shown a 4.8%
+> spread sitting above the documented 1–3% noise band — i.e. an unfalsifiable "looks flat". Its
+> generator also kills two confounds worth knowing: **bin width is rounded UP to a power of two**, so
+> bins-per-IQR sawtooths over (409.6, 819.2] as the IQR moves (normalised to 579 via a per-point
+> integer multiplier, targeting the *geometric middle*, never the edge); and `i % 1000 == 0` selects
+> 1,000 **whole levels** rather than scattered rows because N = 1000 × 20,000, which silently deletes
+> them from the base while the distinct count still reads plausibly.
+>
+> **Accuracy result worth keeping:** FPGA-vs-exact deviations were **bit-identical across two
+> independent sessions** (+0, −1898, +3657, −280, +520, +2038), ≤0.02% of rows, non-monotone in skew.
+> On a bitstream with 1 ps of hold margin whose historical failure mode was *wandering* counts, that
+> reproducibility is direct evidence of quantisation rather than silicon flakiness.
+>
+> **Datasets on disk** (all regenerable, none in git): `~/datasets/sizesweep` 1.5 GB ·
+> `~/datasets/codecsweep` 1.04 GB · `~/datasets/skewsweep` 740 MB · `~/datasets/cardsweep10m{,_snappy}`
+> · the 7 real ones. **`bench/skew_sweep_manifest.csv`** preserves the skew set's characterisation
+> (skewness, kurtosis, multipliers, bins/IQR, fences, expected counts) since that is NOT regenerable
+> without the files.
+>
+> ➡️ **NEXT:** write the evaluation section. Nothing else needs measuring. Optional, in value order:
+> (1) the **joint semantics figure** — `mean ± kσ` is not robust, so under skew z-score's flag count
+> drifts while IQR's does not; on identical data the two operators diverge as skewness grows. That is
+> the "why does this system offer both operators" figure, it is pure SQL over `~/datasets/skewsweep`,
+> and it needs neither card nor the companion codebase. (2) ragged row-group geometry — the last
+> unexplained real-vs-synthetic residual, and the only remaining axis with a known *code-path*
+> mechanism. (3) `codec_sweep.py --no-fuse`; (4) what happens on ZSTD / DataPage-V2 input.
 
 **Read this first after a compact.** Three companion docs, each with a distinct job:
 - **`micro_bench.md`** — ⬅️ **CURRENT WORK.** Controlled synthetic sweeps, one variable at a time.
