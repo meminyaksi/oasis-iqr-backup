@@ -10,13 +10,24 @@ have, what you lost, and whether losing it matters.
 |---|---|--:|---|
 | `build-29/bitstreams/cyt_top_b29_po.bit` | `11e35b5d31309520855283075de5ee49` | **−0.518** | ⭐ **PRODUCTION.** build-29 + post-route phys_opt ladder. Validated **4/4 on silicon** |
 | `build-28/bitstreams/cyt_top_ssi_spreadslls.bit` | `f429afb3fd687bb73ebe396a44bda114` | −0.657 | **FALLBACK.** The only *other* bitstream validated 4/4 on silicon. Kept because production ships with 1 ps of hold margin |
+| `build-23/bitstreams/cyt_top.bit` | `a33161334b78a33055a9beb01e6708eb` | −1.879 | **REPRODUCIBILITY ANCHOR.** Every number in `report_2807.md` — the 7 real datasets, and therefore Test 0 of `microbench_roadmap.md` — was measured on this. Also the second fallback (4 decode lanes, 4096 bins, HBM in) |
 
-Both were built with **`OASIS_PLACE_DIRECTIVE=SSI_SpreadSLLs`** — see `patches/RESTORE.md`. Without
+build-28 and build-29 were built with **`OASIS_PLACE_DIRECTIVE=SSI_SpreadSLLs`** (build-23 predates
+the override) — see `patches/RESTORE.md`. Without
 that override Vivado's ML predictor picks `SSI_BalanceSLRs` and you get a different, worse design.
 
 ```bash
 # after a fresh clone the LFS smudge filter fetches these automatically; verify before flashing:
 md5sum hardware/build-29/bitstreams/cyt_top_b29_po.bit
+```
+
+💡 **Bandwidth.** These three total ~205 MB, and GitHub's free LFS tier allows 1 GB of downloads per
+month — so a full clone costs a fifth of the monthly quota. For a docs-or-code-only clone, skip them
+and fetch on demand:
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git clone -b feature/iqr-integration <url> ~/oasis
+cd ~/oasis && git lfs pull --include="hardware/build-29/bitstreams/cyt_top_b29_po.bit"
 ```
 
 ## NOT in git — regenerable only by overnight re-synthesis
@@ -28,13 +39,12 @@ would be ~1.3 GB and blow the quota. These are recorded rather than stored.
 |---|---|--:|---|
 | `build-29/bitstreams/cyt_top.bit` | `4d195dc0a1f3785903c7229ad3898de3` | −0.553 | build-29 before the phys_opt ladder |
 | `build-28/bitstreams/cyt_top.bit` | `46b6ab77a4fa2ca3fbea0a3ad027c7d0` | −0.995 | build-28 under the ML-chosen `SSI_BalanceSLRs` |
-| `build-23/bitstreams/cyt_top.bit` | `a33161334b78a33055a9beb01e6708eb` | −1.879 | the long-time production bitstream; all of `report_2807.md` was measured on it |
 | `build-2x/bitstreams/cyt_top_{extratimingopt,ssi_balanceslls,ssi_spreadlogic_high,altspreadlogic_high}.bit` | — | worse | P&R directive sweep arms; superseded, no reason to keep |
 | `*_pblock_inst_shell_partial.bit` | — | — | partial-reconfiguration variants; the full `cyt_top*.bit` is what `program_hacc_local.sh` consumes |
 
-⚠️ **`report_2807.md`'s numbers belong to build-23, which is NOT saved.** If those measurements ever
-need re-running, the bitstream must be rebuilt from the pinned source — or the report re-measured on
-build-29 and re-labelled. The microbenchmarks (`micro_bench.md`, Tests 1–5) are all on build-29.
+Provenance of the two measurement documents, now that all three relevant bitstreams are stored:
+`report_2807.md` (7 real datasets, end-to-end) is **build-23**; `micro_bench.md` (Tests 1–5) is
+**build-29**. Both are re-runnable from a fresh clone without a re-synthesis.
 
 ## Flashing after a restore
 
